@@ -1,7 +1,7 @@
 import json
 import sys
 import wave
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -203,6 +203,44 @@ def test_whisperx_uses_offline_sentence_tokenizer_when_punkt_is_missing():
         (0, 15),
         (16, 27),
     ]
+
+
+def test_standard_whisperx_installs_offline_sentence_tokenizer(monkeypatch, tmp_path):
+    whisperx_module = ModuleType("whisperx")
+    whisperx_module.__path__ = []  # type: ignore[attr-defined]
+    alignment_module = ModuleType("whisperx.alignment")
+    asr_module = ModuleType("whisperx.asr")
+    audio_module = ModuleType("whisperx.audio")
+    monkeypatch.setitem(__import__("sys").modules, "whisperx", whisperx_module)
+    monkeypatch.setitem(__import__("sys").modules, "whisperx.alignment", alignment_module)
+    monkeypatch.setitem(__import__("sys").modules, "whisperx.asr", asr_module)
+    monkeypatch.setitem(__import__("sys").modules, "whisperx.audio", audio_module)
+
+    calls = []
+    monkeypatch.setattr(
+        "subforge.core.asr.whisperx_asr._install_offline_sentence_tokenizer",
+        lambda module: calls.append(module),
+    )
+    asr_module.load_model = lambda *_args, **_kwargs: (  # type: ignore[attr-defined]
+        _ for _ in ()
+    ).throw(RuntimeError("stop after setup"))
+    audio_module.load_audio = lambda _path: None  # type: ignore[attr-defined]
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"audio")
+    asr = WhisperXASR.__new__(WhisperXASR)
+    asr.audio_input = str(audio_path)
+    asr.file_binary = None
+    asr.whisper_model = "tiny"
+    asr.transcribe_device = "cpu"
+    asr.align_device = "cpu"
+    asr.compute_type = "int8"
+    asr.language = "en"
+    asr.model_dir = str(tmp_path)
+
+    with pytest.raises(RuntimeError, match="stop after setup"):
+        asr._run_standard()
+
+    assert calls == [alignment_module]
 
 
 def test_whisperx_refines_word_edges_from_matching_character_timestamps():
@@ -452,6 +490,7 @@ def test_whisperx_alignment_falls_back_when_torch_cuda_is_unavailable(monkeypatc
     monkeypatch.setitem(sys.modules, "torch", torch)
 
     assert _normalize_align_device("cuda") == "cpu"
+    assert _normalize_align_device("auto") == "cpu"
 
 
 def test_whisperx_reuses_managed_faster_whisper_model(tmp_path, monkeypatch):
@@ -482,6 +521,17 @@ def test_whisperx_reuses_managed_faster_whisper_model(tmp_path, monkeypatch):
     assert asr.whisper_model == str(model_dir)
     assert asr.transcribe_device == "cpu"
     assert asr.align_device == "cpu"
+
+
+def test_whisperx_alignment_uses_cuda_when_torch_cuda_is_available(monkeypatch):
+    torch = SimpleNamespace(
+        version=SimpleNamespace(cuda="12.8"),
+        cuda=SimpleNamespace(is_available=lambda: True),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+    assert _normalize_align_device("cuda") == "cuda"
+    assert _normalize_align_device("auto") == "cuda"
 
 
 def test_whisperx_builds_alignment_segments_from_mlx_result():
@@ -683,6 +733,29 @@ def test_windows_whisperx_prefers_managed_faster_whisper_model(monkeypatch, tmp_
     asr = WhisperXASR(str(audio_path), whisper_model="large-v3", model_dir=str(tmp_path))
 
     assert asr.whisper_model == str(model_dir)
+
+
+def test_windows_whisperx_selects_transcription_and_alignment_devices_independently(
+    monkeypatch, tmp_path
+):
+    audio_path = tmp_path / "audio.wav"
+    audio_path.write_bytes(b"audio")
+    monkeypatch.setattr("subforge.core.asr.whisperx_asr.platform.system", lambda: "Windows")
+    monkeypatch.setattr("subforge.core.asr.whisperx_asr.platform.machine", lambda: "AMD64")
+    monkeypatch.setattr(
+        "subforge.core.asr.whisperx_asr.resolve_faster_whisper_runtime",
+        lambda _device, _compute: ("cuda", "float16"),
+    )
+    monkeypatch.setattr(
+        "subforge.core.asr.whisperx_asr._normalize_align_device",
+        lambda _device: "cpu",
+    )
+
+    asr = WhisperXASR(str(audio_path), device="auto", compute_type="default")
+
+    assert asr.transcribe_device == "cuda"
+    assert asr.align_device == "cpu"
+    assert asr.compute_type == "float16"
 
 
 @pytest.mark.parametrize(("uses_mlx", "method_name"), [(True, "mlx"), (False, "standard")])

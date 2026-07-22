@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from scripts import build_desktop
@@ -52,6 +54,29 @@ def test_macos_resign_clears_bundle_metadata_before_codesign(tmp_path, monkeypat
     assert commands[1][-1] == staged_app
     assert commands[2][-1] == staged_app
     assert app.exists()
+
+
+def test_windows_desktop_build_rejects_cpu_only_torch(monkeypatch):
+    monkeypatch.setattr(build_desktop.platform, "system", lambda: "Windows")
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "torch",
+        SimpleNamespace(version=SimpleNamespace(cuda=None)),
+    )
+
+    with pytest.raises(RuntimeError, match="CUDA-enabled PyTorch"):
+        build_desktop.verify_windows_torch_cuda_build()
+
+
+def test_windows_desktop_build_accepts_cuda_torch(monkeypatch):
+    monkeypatch.setattr(build_desktop.platform, "system", lambda: "Windows")
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "torch",
+        SimpleNamespace(__version__="2.8.0+cu128", version=SimpleNamespace(cuda="12.8")),
+    )
+
+    build_desktop.verify_windows_torch_cuda_build()
 
 
 def test_packaged_mlx_whisper_gets_numba_fallback(tmp_path):
