@@ -243,10 +243,24 @@ def test_subtitle_pipeline_cleans_chinese_translation_punctuation(tmp_path, monk
         )
     )
 
-    output = subtitle_path.with_stem("input_processed").read_text(encoding="utf-8")
+    output = subtitle_path.with_stem("input_bilingual").read_text(encoding="utf-8")
     assert created["target_language"] == "chinese"
     assert "你好 世界" in output
     assert "Hello, world." in output
+    original = subtitle_path.with_stem("input_original").read_text(encoding="utf-8")
+    translated = subtitle_path.with_stem("input_translated").read_text(encoding="utf-8")
+    assert "Hello, world." in original
+    assert "你好 世界" not in original
+    assert "你好 世界" in translated
+    assert "Hello, world." not in translated
+    completed = task_manager.get_task(task.id)
+    assert completed is not None
+    assert completed.result is not None
+    assert completed.result["subtitle_files"] == {
+        "original": str(subtitle_path.with_stem("input_original")),
+        "translated": str(subtitle_path.with_stem("input_translated")),
+        "bilingual": str(subtitle_path.with_stem("input_bilingual")),
+    }
 
 
 def test_subtitle_pipeline_hides_speaker_markers_in_final_output(tmp_path, monkeypatch):
@@ -381,7 +395,7 @@ def test_subtitle_pipeline_does_not_split_bilingual_cues_after_translation(
         )
     )
 
-    output_path = subtitle_path.with_stem("input_processed")
+    output_path = subtitle_path.with_stem("input_bilingual")
     output = output_path.read_text(encoding="utf-8")
     assert output.count(" --> ") == 1
     assert source in output

@@ -453,32 +453,50 @@ async def _run_subtitle(task_id: str, req: SubtitleRequest):
                 context.report(96, "Finalizing subtitle formatting...")
                 asr_data.replace_chinese_translation_punctuation()
 
-        # Save result
-        context.report(97, "Saving subtitle file...")
-        output_path = _result_path(
-            req.subtitle_file,
-            "_processed",
-            str(get_config_value("work_dir", "") or ""),
-        )
+        # Save all output layouts without discarding upstream task checkpoints.
+        context.report(97, "Saving subtitle files...")
+        configured_work_dir = str(get_config_value("work_dir", "") or "")
+        output_paths = {
+            "original": _result_path(
+                req.subtitle_file, "_original", configured_work_dir
+            ),
+            "translated": _result_path(
+                req.subtitle_file, "_translated", configured_work_dir
+            ),
+            "bilingual": _result_path(
+                req.subtitle_file, "_bilingual", configured_work_dir
+            ),
+        }
 
         from subforge.core.entities import SubtitleLayoutEnum
 
-        layout = SubtitleLayoutEnum.TRANSLATE_ON_TOP  # Chinese on top, English on bottom
         context.checkpoint()
-        await run_blocking(
-            lambda: asr_data.save(
-                str(output_path),
-                layout=layout,
+
+        def _save_completed_outputs() -> None:
+            asr_data.save(
+                str(output_paths["original"]),
+                layout=SubtitleLayoutEnum.ONLY_ORIGINAL,
                 speaker_style="none",
             )
-        )
+            asr_data.save(
+                str(output_paths["translated"]),
+                layout=SubtitleLayoutEnum.ONLY_TRANSLATE,
+                speaker_style="none",
+            )
+            asr_data.save(
+                str(output_paths["bilingual"]),
+                layout=SubtitleLayoutEnum.TRANSLATE_ON_TOP,
+                speaker_style="none",
+            )
+
+        await run_blocking(_save_completed_outputs)
 
         context.report(99, "Updating subtitle editor...")
         final_preview = subtitle_preview_segments(asr_data)
         context.publish_preview(
             final_preview,
-            subtitle_file=str(output_path),
-            message="Subtitle file saved",
+            subtitle_file=str(output_paths["bilingual"]),
+            message="Subtitle files saved",
         )
         final_preview_revision = task_manager.get_preview_revision(task_id)
         completion_message = "Done with processing warnings" if pipeline_warnings else "Done"
@@ -486,7 +504,10 @@ async def _run_subtitle(task_id: str, req: SubtitleRequest):
         task_manager.complete_task(
             task_id,
             {
-                "subtitle_file": str(output_path),
+                "subtitle_file": str(output_paths["bilingual"]),
+                "subtitle_files": {
+                    name: str(path) for name, path in output_paths.items()
+                },
                 "preview_revision": final_preview_revision,
                 "segments": final_preview,
                 "warnings": pipeline_warnings,

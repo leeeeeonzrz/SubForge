@@ -374,6 +374,16 @@ if __name__ == "__main__":
 
         run_packaged_mlx_whisper_worker()
 
+    def finish_packaged_check(exit_code: int) -> None:
+        """Exit frozen self-checks without waiting on third-party worker threads."""
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                if stream:
+                    stream.flush()
+            except Exception:
+                pass
+        os._exit(exit_code)
+
     if os.environ.get("SUBFORGE_CHECK_DENOISE") == "1":
         import traceback
 
@@ -400,11 +410,11 @@ if __name__ == "__main__":
                 print(f"DeepFilterNet3 inference: ok ({enhanced_file.stat().st_size} bytes)")
             except BaseException:
                 traceback.print_exc()
-                raise SystemExit(1)
+                finish_packaged_check(1)
             finally:
                 if enhanced_path:
                     Path(enhanced_path).unlink(missing_ok=True)
-        raise SystemExit(0 if available else 1)
+        finish_packaged_check(0 if available else 1)
     if os.environ.get("SUBFORGE_CHECK_FASTER_WHISPER") == "1":
         import traceback
 
@@ -425,10 +435,10 @@ if __name__ == "__main__":
                 raise RuntimeError("Packaged FasterWhisper VAD returned an invalid result")
             print(f"FasterWhisper import: ok ({device}/{compute_type})")
             print("FasterWhisper Silero VAD inference: ok")
-            raise SystemExit(0)
+            finish_packaged_check(0)
         except Exception:
             traceback.print_exc()
-            raise SystemExit(1)
+            finish_packaged_check(1)
     if os.environ.get("SUBFORGE_CHECK_WHISPERX") == "1":
         import traceback
 
@@ -443,10 +453,10 @@ if __name__ == "__main__":
 
             print("WhisperX ASR import: ok")
             print("WhisperX forced alignment import: ok")
-            raise SystemExit(0)
+            finish_packaged_check(0)
         except Exception:
             traceback.print_exc()
-            raise SystemExit(1)
+            finish_packaged_check(1)
     if os.environ.get("SUBFORGE_CHECK_ASR") == "1":
         import traceback
 
@@ -492,10 +502,10 @@ if __name__ == "__main__":
             print(f"Default MLX model: {default_mlx_model()}")
             print(f"Default align model: {DEFAULT_EN_ALIGN_MODEL}")
             print(f"Align model file: {align_file} ({'found' if align_file.exists() else 'missing'})")
-            raise SystemExit(0)
+            finish_packaged_check(0)
         except Exception:
             traceback.print_exc()
-            raise SystemExit(1)
+            finish_packaged_check(1)
     if os.environ.get("SUBFORGE_CHECK_DIARIZATION") == "1":
         import traceback
 
@@ -525,10 +535,10 @@ if __name__ == "__main__":
                     model_dir=os.path.dirname(model_path),
                 )
                 print(f"Speaker diarization inference: {len(inferred_turns)} turns")
-            raise SystemExit(0)
+            finish_packaged_check(0)
         except Exception:
             traceback.print_exc()
-            raise SystemExit(1)
+            finish_packaged_check(1)
     if os.environ.get("SUBFORGE_CHECK_BACKEND") == "1":
         try:
             from app.main import app
@@ -546,10 +556,14 @@ if __name__ == "__main__":
             print("Packaged FastAPI routes: ok")
             check_backend_runtime()
             print("Packaged FastAPI HTTP runtime: ok")
-            raise SystemExit(0)
+            finish_packaged_check(0)
         except Exception:
-            import traceback
-
+            error_log = os.environ.get("SUBFORGE_CHECK_ERROR_LOG", "")
+            if error_log:
+                try:
+                    Path(error_log).write_text(traceback.format_exc(), encoding="utf-8")
+                except OSError:
+                    pass
             traceback.print_exc()
-            raise SystemExit(1)
+            finish_packaged_check(1)
     main()
