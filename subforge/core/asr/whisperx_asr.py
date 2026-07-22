@@ -892,6 +892,9 @@ class WhisperXASR(BaseASR):
             self.transcribe_device, self.compute_type = resolve_faster_whisper_runtime(
                 device, compute_type
             )
+        # CTranslate2 and PyTorch have independent CUDA runtimes. A working
+        # FasterWhisper CUDA device does not prove that the bundled torch build
+        # can execute forced alignment on CUDA.
         self.align_device = _normalize_align_device(device)
         self.align_model = _normalize_align_model(align_model)
         self.batch_size = max(1, int(batch_size or 4))
@@ -950,6 +953,7 @@ class WhisperXASR(BaseASR):
                 "the WhisperX desktop runtime included."
             ) from exc
 
+        _install_offline_sentence_tokenizer(whisperx_alignment)
         with tempfile.TemporaryDirectory() as tmp:
             audio_path = self._write_audio_to_temp(Path(tmp))
             callback(15, "Loading WhisperX transcription model...")
