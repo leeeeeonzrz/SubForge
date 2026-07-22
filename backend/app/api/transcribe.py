@@ -23,6 +23,7 @@ from subforge.core.asr.alignment_models import (
     normalize_alignment_language,
 )
 from subforge.core.asr.faster_whisper import (
+    is_faster_whisper_cuda_available,
     is_faster_whisper_model_dir,
 )
 from subforge.core.asr.whisperx_asr import (
@@ -103,7 +104,8 @@ def detect_hardware() -> dict:
             result["n_threads"] = 8
             result["compute_type"] = "int8"
     else:
-        # Check for NVIDIA GPU
+        # nvidia-smi only proves that a driver is installed. FasterWhisper also
+        # needs loadable CUDA 12 cuBLAS and cuDNN 9 libraries.
         try:
             out = subprocess.check_output(
                 ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -111,9 +113,15 @@ def detect_hardware() -> dict:
                 timeout=5,
             ).strip()
             result["gpu"] = out.split("\n")[0]
-            result["device"] = "cuda"
-            result["n_threads"] = 4
-            result["compute_type"] = "float16"
+            if is_faster_whisper_cuda_available():
+                result["device"] = "cuda"
+                result["n_threads"] = 4
+                result["compute_type"] = "float16"
+            else:
+                import os
+
+                result["n_threads"] = os.cpu_count() or 4
+                result["compute_type"] = "int8"
         except Exception:
             import os
 
@@ -270,7 +278,7 @@ def _build_transcribe_config(
         transcribe_model=model_enum,
         transcribe_language=language,
         faster_whisper_device=device,
-        need_word_time_stamp=(need_word_time_stamp if model_id != "faster_whisper" else False),
+        need_word_time_stamp=need_word_time_stamp,
     )
     config.whisper_n_threads = n_threads
     config.faster_whisper_compute_type = compute_type
