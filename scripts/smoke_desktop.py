@@ -233,7 +233,7 @@ def main() -> int:
             env = os.environ.copy()
             env["SUBFORGE_CHECK_WHISPERX"] = "1"
             _run([str(exe)], env=env)
-            print("Verified packaged WhisperX Windows runtime and forced-alignment imports")
+            print("Verified packaged WhisperX device selection, PyTorch CUDA, and forced alignment")
 
             env = os.environ.copy()
             env["SUBFORGE_CHECK_DIARIZATION"] = "1"
