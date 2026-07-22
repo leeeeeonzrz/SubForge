@@ -23,6 +23,12 @@ DIARIZATION_CACHE_VERSION = 3
 _DIARIZATION_MODEL_CACHE = SingleEntryModelCache()
 _DARWIN_DATALESS_FLAG = 0x40000000
 
+
+def clear_diarization_model_cache() -> None:
+    """Release the process-local diarization model, if any."""
+    _DIARIZATION_MODEL_CACHE.clear()
+
+
 if platform.system() == "Darwin" and platform.machine() == "arm64":
     os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
