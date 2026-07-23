@@ -5,8 +5,8 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import importlib
-import json
 import importlib.util
+import json
 import logging
 import os
 import platform
