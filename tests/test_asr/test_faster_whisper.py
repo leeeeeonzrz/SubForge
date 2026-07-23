@@ -155,3 +155,30 @@ def test_packaged_worker_is_terminated_when_task_is_cancelled(tmp_path, monkeypa
         asr._run_in_packaged_worker()
 
     assert process_state["terminated"] is True
+
+
+def test_packaged_windows_cuda_routes_through_isolated_worker(tmp_path, monkeypatch):
+    model_dir = tmp_path / "faster-whisper-base"
+    _write_model(model_dir)
+    audio_path = tmp_path / "audio.wav"
+    _write_audio(audio_path)
+    monkeypatch.setattr(module, "is_faster_whisper_cuda_available", lambda: True)
+    monkeypatch.setattr(module.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(module.sys, "frozen", True, raising=False)
+    monkeypatch.delenv(module._FASTER_WORKER_FLAG, raising=False)
+    expected = [{"text": "isolated", "start": 0.0, "end": 1.0}]
+    calls = []
+
+    def fake_worker(self, callback=None):
+        calls.append(callback)
+        return expected
+
+    monkeypatch.setattr(module.FasterWhisperASR, "_run_in_packaged_worker", fake_worker)
+    asr = module.FasterWhisperASR(
+        str(audio_path),
+        whisper_model=str(model_dir),
+        device="cuda",
+    )
+
+    assert asr._run() == expected
+    assert calls == [None]

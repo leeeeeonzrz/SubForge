@@ -503,6 +503,8 @@ def _verify_data_root(data_root: Path, label: str) -> None:
             [
                 data_root / "resource" / "bin" / "whisper-cli.exe",
                 data_root / "faster_whisper" / "assets" / "silero_vad_v6.onnx",
+                data_root / "torch" / "lib" / "cudnn64_9.dll",
+                data_root / "torch" / "lib" / "libiomp5md.dll",
             ]
         )
     if _requires_mlx_metallib():
