@@ -316,7 +316,11 @@ if __name__ == "__main__":
             )
 
             device, compute_type = resolve_faster_whisper_runtime("auto", "default")
-            vad_segments = get_speech_timestamps(np.zeros(16_000, dtype=np.float32))
+            # Exercise the packaged Silero ONNX asset. Importing FasterWhisper
+            # alone succeeds even when assets/silero_vad_v6.onnx is missing.
+            vad_segments = get_speech_timestamps(
+                np.zeros(16_000, dtype=np.float32)
+            )
             if not isinstance(vad_segments, list):
                 raise RuntimeError("Packaged FasterWhisper VAD returned an invalid result")
             print(f"FasterWhisper import: ok ({device}/{compute_type})")
