@@ -227,7 +227,14 @@ def main() -> int:
 
             env = os.environ.copy()
             env["SUBFORGE_CHECK_FASTER_WHISPER"] = "1"
-            _run([str(exe)], env=env)
+            faster_whisper_error_log = tmp_path / "faster-whisper-check-error.log"
+            env["SUBFORGE_CHECK_ERROR_LOG"] = str(faster_whisper_error_log)
+            try:
+                _run([str(exe)], env=env)
+            except subprocess.CalledProcessError:
+                if faster_whisper_error_log.exists():
+                    print(faster_whisper_error_log.read_text(encoding="utf-8"))
+                raise
             print("Verified packaged FasterWhisper/CTranslate2/PyAV imports")
 
             env = os.environ.copy()
