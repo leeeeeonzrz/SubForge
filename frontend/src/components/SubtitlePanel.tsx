@@ -112,19 +112,20 @@ export function SubtitlePanel({
   const [exportFormat, setExportFormat] = useState<"srt" | "vtt" | "ass" | "txt" | "json">("srt");
   const [exportMode, setExportMode] = useState<"original" | "translated" | "bilingual">("bilingual");
   const [showExportMenu, setShowExportMenu] = useState(false);
-  const getExportFilename = useCallback((format: string) => {
+  const getExportFilename = useCallback((format: string, mode: string) => {
     const source = subtitleFile?.split(/[\\/]/).pop() || "subtitles.srt";
-    return source.replace(/\.[^.]+$/, `.${format}`);
+    const suffix = mode === "original" ? "_original" : mode === "translated" ? "_translated" : "_bilingual";
+    return source.replace(/\.[^.]+$/, `${suffix}.${format}`);
   }, [subtitleFile]);
   const handleExport = useCallback(async (format?: string, mode?: string) => {
     if (!subtitleFile) return;
     const f = format || exportFormat;
     const m = mode || exportMode;
-    const defaultName = getExportFilename(f);
+    const defaultName = getExportFilename(f, m);
     try {
       // pywebview: use POST endpoint + native save dialog
       if (typeof window !== "undefined" && "pywebview" in window) {
-        const pywin = window as unknown as { pywebview?: { api?: { save_file?: (b: string, n: string) => Promise<{ ok: boolean; path?: string; error?: string }> } } };
+        const pywin = window as unknown as { pywebview?: { api?: { save_file?: (b: string, n: string) => Promise<{ ok: boolean; path?: string; error?: string; cancelled?: boolean }> } } };
         // Wait for API to be ready (max 3s)
         if (!pywin.pywebview?.api?.save_file) {
           for (let i = 0; i < 30; i++) {
@@ -137,21 +138,19 @@ export function SubtitlePanel({
           return;
         }
         const blob = await subtitlesApi.exportPost(subtitles, f, m, defaultName);
-        const reader = new FileReader();
-        reader.onerror = () => { useAppStore.getState().setError("文件读取失败"); };
-        reader.onload = async () => {
-          const base64 = (reader.result as string).split(",")[1];
-          try {
-            const result = await pywin.pywebview!.api!.save_file!(base64, defaultName);
-            if (result && !result.ok && result.error) {
-              useAppStore.getState().setError(`保存失败: ${result.error}`);
-            }
-          } catch (e) {
-            console.error("pywebview save_file failed:", e);
-            useAppStore.getState().setError("保存失败: " + String(e));
-          }
-        };
-        reader.readAsDataURL(blob);
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onerror = () => reject(new Error("文件读取失败"));
+          reader.onload = () => resolve(String(reader.result));
+          reader.readAsDataURL(blob);
+        });
+        const base64 = dataUrl.split(",")[1];
+        const result = await pywin.pywebview.api.save_file(base64, defaultName);
+        if (result.ok && result.path) {
+          useAppStore.getState().addToast(`字幕已保存到 ${result.path}`, "success");
+        } else if (!result.cancelled) {
+          throw new Error(result.error || "原生另存为窗口未能打开");
+        }
       } else {
         // Browser: use blob download
         const blob = await subtitlesApi.exportPost(subtitles, f, m, defaultName);

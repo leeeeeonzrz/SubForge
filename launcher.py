@@ -219,6 +219,60 @@ class Api:
             traceback.print_exc()
             return {"ok": False, "error": str(exc)}
 
+    @staticmethod
+    def _save_dialog_directory() -> str:
+        """Return the configured work directory when it is usable."""
+        try:
+            from app.api.config import get_config_value
+
+            configured = Path(get_config_value("work_dir", "")).expanduser()
+            if configured.is_dir():
+                return str(configured)
+        except Exception:
+            pass
+        downloads = Path.home() / "Downloads"
+        return str(downloads if downloads.is_dir() else Path.home())
+
+    @staticmethod
+    def _show_save_dialog(window, default_filename: str, directory: str):
+        """Create the native dialog on pywebview's Windows UI thread."""
+        import webview
+
+        suffix = Path(default_filename).suffix.lower().lstrip("*") or ".srt"
+        file_types = (f"{suffix.upper().lstrip('.')} files (*{suffix})",)
+
+        def show_dialog():
+            return window.create_file_dialog(
+                webview.FileDialog.SAVE,
+                directory=directory,
+                save_filename=default_filename,
+                file_types=file_types,
+            )
+
+        if sys.platform != "win32":
+            return show_dialog()
+
+        gui = window.gui
+        native_window = gui.BrowserView.instances.get(window.uid)
+        if native_window is None:
+            raise RuntimeError("Native window is not ready")
+        if not native_window.InvokeRequired:
+            return show_dialog()
+
+        results = []
+        errors = []
+
+        def invoke_dialog():
+            try:
+                results.append(show_dialog())
+            except BaseException as exc:
+                errors.append(exc)
+
+        native_window.Invoke(gui.Func[gui.Type](invoke_dialog))
+        if errors:
+            raise RuntimeError(f"Unable to open the save dialog: {errors[0]}") from errors[0]
+        return results[0] if results else None
+
     def save_file(self, base64_data: str, default_filename: str):
         """Save a base64-encoded file using native save dialog."""
         import traceback
@@ -228,22 +282,25 @@ class Api:
         try:
             if not webview.windows:
                 return {"ok": False, "error": "No window available"}
-            print(f"[Api] save_file called: {default_filename}")
-            result = webview.windows[0].create_file_dialog(
-                webview.SAVE_DIALOG,
-                save_filename=default_filename,
+            safe_filename = Path(default_filename).name or "subtitles.srt"
+            directory = self._save_dialog_directory()
+            print(f"[Api] save_file called: {safe_filename}")
+            result = self._show_save_dialog(
+                webview.windows[0],
+                safe_filename,
+                directory,
             )
             print(f"[Api] dialog result: {result}")
             if result:
                 file_path = result if isinstance(result, str) else result[0]
-                data = base64.b64decode(base64_data)
+                data = base64.b64decode(base64_data, validate=True)
                 from subforge.core.utils.atomic_write import atomic_write_bytes
 
                 atomic_write_bytes(file_path, data)
                 print(f"[Api] saved to: {file_path}")
                 return {"ok": True, "path": file_path}
             print("[Api] dialog cancelled")
-            return {"ok": False}
+            return {"ok": False, "cancelled": True}
         except Exception as e:
             print(f"[Api] save_file error: {e}")
             traceback.print_exc()
