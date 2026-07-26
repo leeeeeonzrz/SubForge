@@ -362,17 +362,19 @@ if __name__ == "__main__":
         import traceback
 
         try:
-            import av  # noqa: F401
-            import ctranslate2  # noqa: F401
-            import faster_whisper  # noqa: F401
-            import numpy as np
-            from faster_whisper.vad import get_speech_timestamps
-
+            # Configure the shared Torch CUDA/OpenMP directory before importing
+            # CTranslate2. Windows cannot resolve the deduplicated runtime if
+            # ctranslate2 is imported first in this isolated self-check.
             from subforge.core.asr.faster_whisper import (
                 resolve_faster_whisper_runtime,
             )
 
             device, compute_type = resolve_faster_whisper_runtime("auto", "default")
+            import av  # noqa: F401
+            import ctranslate2  # noqa: F401
+            import faster_whisper  # noqa: F401
+            import numpy as np
+            from faster_whisper.vad import get_speech_timestamps
             # Exercise the packaged Silero ONNX asset. Importing FasterWhisper
             # alone succeeds even when assets/silero_vad_v6.onnx is missing.
             vad_segments = get_speech_timestamps(
@@ -384,7 +386,11 @@ if __name__ == "__main__":
             print("FasterWhisper Silero VAD inference: ok")
             finish_packaged_check(0)
         except Exception:
-            traceback.print_exc()
+            detail = traceback.format_exc()
+            print(detail)
+            error_log = os.environ.get("SUBFORGE_CHECK_ERROR_LOG", "").strip()
+            if error_log:
+                Path(error_log).write_text(detail, encoding="utf-8")
             finish_packaged_check(1)
     if os.environ.get("SUBFORGE_CHECK_WHISPERX") == "1":
         import traceback
