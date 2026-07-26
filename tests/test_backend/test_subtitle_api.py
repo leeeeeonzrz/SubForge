@@ -99,7 +99,13 @@ def test_subtitle_pipeline_uses_explicit_llm_client_without_env_mutation(
     monkeypatch.setattr(llm_module, "create_client", fake_create_client)
 
     class FakeSplitter:
-        def __init__(self, thread_num, model, llm_client=None, **_kwargs):
+        def __init__(
+            self,
+            thread_num,
+            model,
+            llm_client=None,
+            **_kwargs,
+        ):
             created["splitter_client"] = llm_client
             created["splitter_limits"] = (
                 _kwargs.get("max_word_count_cjk"),
