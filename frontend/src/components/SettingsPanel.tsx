@@ -963,7 +963,7 @@ export function SettingsPanel() {
 
         {/* LLM Translation Fine-tuning */}
         <SettingsSection title="字幕处理调节" description="控制智能断句和翻译的细节参数">
-          <SettingsField label="中文字幕每行最多字数" description="每段字幕的长度上限，断句优先按语义拆分">
+          <SettingsField label="CJK 文字每段字符上限" description="中文、日文、韩文等文本按字符计数；智能断句会尽量不超过此值">
             <div className="flex items-center gap-3">
               <input type="range" min={10} max={40} value={(settings.max_word_count_cjk as number) || 25}
                 onChange={(e) => handleSave("max_word_count_cjk", parseInt(e.target.value))}
@@ -971,7 +971,7 @@ export function SettingsPanel() {
               <span className="text-[12px] text-text-primary font-mono w-8 text-right">{(settings.max_word_count_cjk as number) || 25}</span>
             </div>
           </SettingsField>
-          <SettingsField label="英文字幕每行最多字数" description="每段字幕的单词数上限">
+          <SettingsField label="空格分词文本每段单词上限" description="英文、法文、德文等文本按单词计数；智能断句会尽量不超过此值">
             <div className="flex items-center gap-3">
               <input type="range" min={10} max={60} value={(settings.max_word_count_english as number) || 18}
                 onChange={(e) => handleSave("max_word_count_english", parseInt(e.target.value))}
