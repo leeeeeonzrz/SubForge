@@ -1,3 +1,6 @@
+import base64
+import sys
+
 import launcher
 
 
@@ -124,3 +127,79 @@ def test_start_server_preserves_exception_type(monkeypatch, tmp_path):
     assert errors == ["ValueError: bad configuration"]
     startup_log = tmp_path / "SubForge" / "startup-error.log"
     assert "ValueError: bad configuration" in startup_log.read_text(encoding="utf-8")
+
+
+def test_save_dialog_is_dispatched_to_windows_ui_thread(monkeypatch):
+    calls = []
+
+    class NativeWindow:
+        InvokeRequired = True
+
+        def Invoke(self, callback):
+            calls.append("invoke")
+            callback()
+
+    native_window = NativeWindow()
+    fake_gui = type(
+        "FakeGui",
+        (),
+        {
+            "BrowserView": type("BrowserView", (), {"instances": {"window-id": native_window}}),
+            "Func": type("Func", (), {"__class_getitem__": classmethod(lambda cls, item: lambda fn: fn)}),
+            "Type": object,
+        },
+    )
+
+    class FakeWindow:
+        uid = "window-id"
+        gui = fake_gui
+
+        def create_file_dialog(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return (r"C:\\exports\\captions.srt",)
+
+    fake_webview = type(
+        "FakeWebview",
+        (),
+        {"FileDialog": type("FileDialog", (), {"SAVE": 20})},
+    )
+    monkeypatch.setitem(sys.modules, "webview", fake_webview)
+    monkeypatch.setattr(launcher.sys, "platform", "win32")
+
+    result = launcher.Api._show_save_dialog(FakeWindow(), "captions.srt", r"C:\\exports")
+
+    assert result == (r"C:\\exports\\captions.srt",)
+    assert calls[0] == "invoke"
+    assert calls[1][1]["directory"] == r"C:\\exports"
+
+
+def test_save_file_reports_cancelled_without_writing(monkeypatch, tmp_path):
+    fake_webview = type("FakeWebview", (), {"windows": [object()]})
+    monkeypatch.setitem(sys.modules, "webview", fake_webview)
+    monkeypatch.setattr(launcher.Api, "_save_dialog_directory", staticmethod(lambda: str(tmp_path)))
+    monkeypatch.setattr(launcher.Api, "_show_save_dialog", staticmethod(lambda *args: None))
+
+    result = launcher.Api().save_file(base64.b64encode(b"subtitle").decode(), "test.srt")
+
+    assert result == {"ok": False, "cancelled": True}
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_save_file_writes_selected_path_atomically(monkeypatch, tmp_path):
+    output = tmp_path / "translated.srt"
+    fake_webview = type("FakeWebview", (), {"windows": [object()]})
+    monkeypatch.setitem(sys.modules, "webview", fake_webview)
+    monkeypatch.setattr(launcher.Api, "_save_dialog_directory", staticmethod(lambda: str(tmp_path)))
+    monkeypatch.setattr(
+        launcher.Api,
+        "_show_save_dialog",
+        staticmethod(lambda *args: (str(output),)),
+    )
+
+    result = launcher.Api().save_file(
+        base64.b64encode("译文".encode()).decode(),
+        "translated.srt",
+    )
+
+    assert result == {"ok": True, "path": str(output)}
+    assert output.read_text(encoding="utf-8") == "译文"
