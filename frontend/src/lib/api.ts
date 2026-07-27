@@ -109,7 +109,13 @@ export const subtitlesApi = {
     return res.blob();
   },
   save: (file_path: string, segments: SubtitleSegment[]) =>
-    request<{ status: string; file_path: string; count: number }>("/api/subtitles/save", {
+    request<{
+      status: string;
+      file_path: string;
+      files: { original: string; translated: string; bilingual: string };
+      directory: string;
+      count: number;
+    }>("/api/subtitles/save", {
       method: "POST",
       body: JSON.stringify({ file_path, segments }),
     }),

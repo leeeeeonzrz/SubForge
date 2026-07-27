@@ -315,7 +315,7 @@ class SaveRequest(BaseModel):
 
 @router.post("/save")
 async def save_subtitle(req: SaveRequest):
-    """Save edited subtitle segments back to file."""
+    """Save edited subtitle segments as original, translated, and bilingual files."""
     try:
         file_path = validate_path(req.file_path)
     except ValueError:
@@ -329,20 +329,36 @@ async def save_subtitle(req: SaveRequest):
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    if suffix == ".srt":
-        content = segments_to_srt(segments)
-    elif suffix == ".vtt":
-        content = segments_to_vtt(segments)
-    elif suffix == ".ass":
-        content = segments_to_ass(segments)
-    else:
+    format_name = suffix.lstrip(".")
+    if format_name not in {"srt", "vtt", "ass"}:
         raise HTTPException(status_code=400, detail=f"Unsupported format: {suffix}")
 
-    if suffix == ".srt":
-        atomic_write_srt(file_path, content)
-    else:
-        atomic_write_text(file_path, content)
-    return {"status": "ok", "file_path": str(file_path), "count": len(segments)}
+    base_stem = re.sub(
+        r"_(?:original|translated|bilingual)$",
+        "",
+        file_path.stem,
+        flags=re.IGNORECASE,
+    )
+    output_paths = {
+        mode: file_path.with_name(f"{base_stem}_{mode}{suffix}")
+        for mode in ("original", "translated", "bilingual")
+    }
+    for mode, output_path in output_paths.items():
+        mode_segments = _apply_language_mode(segments, mode)
+        content, _media_type = _export_segments(mode_segments, format_name)
+        if suffix == ".srt":
+            atomic_write_srt(output_path, content)
+        else:
+            atomic_write_text(output_path, content)
+
+    files = {mode: str(path) for mode, path in output_paths.items()}
+    return {
+        "status": "ok",
+        "file_path": files["bilingual"],
+        "files": files,
+        "directory": str(file_path.parent),
+        "count": len(segments),
+    }
 
 
 def segments_to_srt(segments: list[dict]) -> str:

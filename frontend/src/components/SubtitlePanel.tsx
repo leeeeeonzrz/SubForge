@@ -210,7 +210,18 @@ export function SubtitlePanel({
       useAppStore.getState().setError(err instanceof Error ? err.message : "Export failed");
     }
   }, [subtitleFile, subtitles, exportFormat, exportMode, getExportFilename]);
-  const handleSave = useCallback(async () => { if (!subtitleFile || subtitles.length === 0) return; try { await subtitlesApi.save(subtitleFile, subtitles); } catch (err) { useAppStore.getState().setError(err instanceof Error ? err.message : "Save failed"); } }, [subtitleFile, subtitles]);
+  const handleSave = useCallback(async () => {
+    if (!subtitleFile || subtitles.length === 0) return;
+    try {
+      const result = await subtitlesApi.save(subtitleFile, subtitles);
+      useAppStore.getState().addToast(
+        `原文、译文和双语字幕已保存到 ${result.directory}`,
+        "success",
+      );
+    } catch (err) {
+      useAppStore.getState().setError(err instanceof Error ? err.message : "Save failed");
+    }
+  }, [subtitleFile, subtitles]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent, id: number) => { e.preventDefault(); e.stopPropagation(); if (!selectedIds.has(id)) toggleSelect(id); setContextMenu({ x: e.clientX, y: e.clientY, id }); }, [selectedIds, toggleSelect]);
 
@@ -248,8 +259,9 @@ export function SubtitlePanel({
             }} />
           </label>
           <button disabled={!subtitleFile || subtitles.length === 0} onClick={handleSave}
+            title="保存原文、译文和双语三份字幕"
             className="px-2.5 py-1.5 text-[12px] rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-all border border-border disabled:opacity-30 disabled:cursor-not-allowed btn-press">
-            保存
+            保存全部
           </button>
           <div className="relative flex items-stretch">
             <button disabled={!subtitleFile || subtitles.length === 0} onClick={() => handleExport()}
