@@ -8,13 +8,52 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
 
 from app.api.subtitles import (
+    SaveRequest,
     _normalize_segment_timing,
     _timestamp_to_ms,
+    save_subtitle,
     segments_to_ass,
     segments_to_srt,
     segments_to_txt,
     segments_to_vtt,
 )
+
+
+def test_save_writes_original_translated_and_bilingual_files(tmp_path, monkeypatch):
+    import asyncio
+
+    import app.api.subtitles as subtitles_module
+
+    source = tmp_path / "episode_bilingual.srt"
+    source.write_text("existing", encoding="utf-8")
+    monkeypatch.setattr(subtitles_module, "validate_path", lambda path: Path(path))
+    segments = [
+        {
+            "id": 1,
+            "start": "00:00:00.000",
+            "end": "00:00:02.000",
+            "text": "Hello world.",
+            "translated": "你好，世界。",
+        }
+    ]
+
+    result = asyncio.run(
+        save_subtitle(SaveRequest(file_path=str(source), segments=segments))
+    )
+
+    original = tmp_path / "episode_original.srt"
+    translated = tmp_path / "episode_translated.srt"
+    bilingual = tmp_path / "episode_bilingual.srt"
+    assert set(result["files"]) == {"original", "translated", "bilingual"}
+    assert result["file_path"] == str(bilingual)
+    assert result["directory"] == str(tmp_path)
+    assert "Hello world." in original.read_text(encoding="utf-8")
+    assert "你好，世界。" not in original.read_text(encoding="utf-8")
+    assert "你好，世界。" in translated.read_text(encoding="utf-8")
+    assert "Hello world." not in translated.read_text(encoding="utf-8")
+    bilingual_text = bilingual.read_text(encoding="utf-8")
+    assert "你好，世界。\nHello world." in bilingual_text
+    assert not (tmp_path / "episode_bilingual_original.srt").exists()
 
 
 def test_normalize_segment_timing_removes_overlap():
