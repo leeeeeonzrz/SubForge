@@ -265,7 +265,7 @@ def test_subtitle_pipeline_hides_speaker_markers_in_final_output(tmp_path, monke
         )
     )
 
-    output = subtitle_path.with_stem("input_processed").read_text(encoding="utf-8")
+    output = subtitle_path.with_stem("input_bilingual").read_text(encoding="utf-8")
     result = task_manager.get_task(task.id).result
     assert "Speaker 1" not in output
     assert not any(line.startswith("- ") for line in output.splitlines())

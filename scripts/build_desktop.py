@@ -434,6 +434,24 @@ def dedupe_packaged_torch_libs() -> None:
         print(f"Deduped torch library: {duplicate.relative_to(ROOT)}")
 
 
+def dedupe_windows_native_ml_runtime() -> None:
+    """Keep one cuDNN/OpenMP runtime for Torch and CTranslate2 on Windows."""
+    if platform.system() != "Windows":
+        return
+
+    data_root = DIST_DIR / "SubForge" / "_internal"
+    shared_dir = data_root / "torch" / "lib"
+    private_dir = data_root / "ctranslate2"
+    for name in ("cudnn64_9.dll", "libiomp5md.dll"):
+        shared = shared_dir / name
+        private = private_dir / name
+        if not shared.is_file():
+            raise RuntimeError(f"Missing shared Windows ML runtime: {shared}")
+        if private.exists():
+            private.unlink()
+            print(f"Removed duplicate Windows ML runtime: {private}")
+
+
 def patch_packaged_mlx_metallib() -> None:
     """Expose MLX's default Metal shader library where the loaded dylib expects it.
 
@@ -533,6 +551,18 @@ def _verify_data_root(data_root: Path, label: str) -> None:
     missing = [str(path.relative_to(ROOT)) for path in required if not path.exists()]
     if missing:
         raise RuntimeError(f"Missing bundled resources in {label}:\n  - " + "\n  - ".join(missing))
+    if platform.system() == "Windows":
+        duplicates = [
+            data_root / "ctranslate2" / name
+            for name in ("cudnn64_9.dll", "libiomp5md.dll")
+            if (data_root / "ctranslate2" / name).exists()
+        ]
+        if duplicates:
+            paths = "\n  - ".join(str(path.relative_to(ROOT)) for path in duplicates)
+            raise RuntimeError(
+                "Conflicting Windows ML runtimes remain in "
+                f"{label}:\n  - {paths}"
+            )
 
 
 def _verify_macos_app(app: Path, expected_version: str) -> None:
@@ -631,6 +661,7 @@ def main() -> int:
         inject_packaged_mlx_runtime()
         patch_packaged_torch()
         dedupe_packaged_torch_libs()
+        dedupe_windows_native_ml_runtime()
         patch_packaged_mlx_metallib()
         resign_macos_app()
         verify_bundle(version)

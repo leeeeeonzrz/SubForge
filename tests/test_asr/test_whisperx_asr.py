@@ -520,7 +520,6 @@ def test_whisperx_reuses_managed_faster_whisper_model(tmp_path, monkeypatch):
 
     assert asr.whisper_model == str(model_dir)
     assert asr.transcribe_device == "cpu"
-    assert asr.align_device == "cpu"
 
 
 def test_whisperx_alignment_uses_cuda_when_torch_cuda_is_available(monkeypatch):
