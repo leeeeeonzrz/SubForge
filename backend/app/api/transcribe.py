@@ -39,6 +39,7 @@ from subforge.core.asr.speaker_embedding_models import (
 )
 from subforge.core.asr.whisperx_asr import (
     MLX_WHISPER_MODELS,
+    clear_alignment_model_cache,
     is_valid_mlx_model_dir,
     resolve_mlx_model,
 )
@@ -604,6 +605,15 @@ def _alignment_model_ready(model_id: str, models_dir: Path) -> bool:
     return is_alignment_model_ready(spec, models_dir)
 
 
+def _ensure_managed_model_path(path: Path, models_dir: Path) -> Path:
+    """Reject deletion targets outside the configured model root or the root itself."""
+    root = models_dir.expanduser().resolve()
+    target = path.expanduser().resolve()
+    if target == root or root not in target.parents:
+        raise ValueError(f"Refusing to modify unmanaged model path: {target}")
+    return target
+
+
 def _current_model_status() -> dict:
     """Describe the effective ASR engine and model selected in settings."""
     from app.api.config import get_config_value
@@ -900,6 +910,7 @@ async def list_whisper_models():
                 "size": info["size"],
                 "downloaded": model_path.exists(),
                 "downloadable": True,
+                "deletable": True,
                 "path": str(model_path),
                 "value": model_id,
                 "selected": selected_engine == "whisper_cpp" and selected_model == model_id,
@@ -932,6 +943,7 @@ async def list_whisper_models():
                 "size": MLX_MODEL_SIZES.get(model_value, ""),
                 "downloaded": local_ready,
                 "downloadable": False,
+                "deletable": False,
                 "path": str(model_path) if local_ready else "",
                 "resolved_model": resolved if local_ready else repo if uses_mlx else model_value,
                 "selected": selected_engine == "whisperx"
@@ -953,6 +965,7 @@ async def list_whisper_models():
                 "size": info["size"],
                 "downloaded": ready,
                 "downloadable": True,
+                "deletable": True,
                 "path": str(model_path),
                 "value": model_value,
                 "selected": selected_model == model_value
@@ -984,6 +997,7 @@ async def list_whisper_models():
                 "size": info["size"],
                 "downloaded": ready,
                 "downloadable": True,
+                "deletable": True,
                 "path": str(model_path),
                 "align_model": info["align_model"],
                 "value": info["align_model"],
@@ -1013,6 +1027,7 @@ async def list_whisper_models():
                 "size": info["size"],
                 "downloaded": ready,
                 "downloadable": True,
+                "deletable": True,
                 "path": str(model_path),
                 "value": info["repo"],
                 "selected": selected_diarization != "off",
@@ -1095,6 +1110,62 @@ async def download_whisper_model(req: DownloadModelRequest):
     task_obj.add_done_callback(_background_tasks.discard)
     task_obj.add_done_callback(lambda _task: task_manager.unregister_running_task(task.id))
     return {"task_id": task.id, "status": "started"}
+
+
+@router.post("/delete-model")
+async def delete_whisper_model(req: DownloadModelRequest):
+    """Delete one managed model without allowing arbitrary filesystem paths."""
+    models_dir = _get_models_dir()
+    if req.model_id in WHISPER_CPP_MODELS:
+        model_path = models_dir / f"ggml-{req.model_id}.bin"
+        model_kind = "file"
+    elif req.model_id in WHISPERX_MODELS:
+        model_path = _alignment_model_path(req.model_id, models_dir)
+        model_kind = "alignment"
+    elif req.model_id in DIARIZATION_MODELS:
+        model_path = models_dir / DIARIZATION_MODELS[req.model_id]["dirname"]
+        model_kind = "diarization"
+    elif req.model_id in FASTER_WHISPER_MODELS:
+        model_path = models_dir / req.model_id
+        model_kind = "directory"
+    elif req.model_id.startswith("mlx-") or req.model_id.startswith("whisperx-"):
+        raise HTTPException(
+            status_code=400,
+            detail="该模型由外部缓存按需管理，不能从这里安全删除。",
+        )
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown model: {req.model_id}")
+
+    try:
+        model_path = _ensure_managed_model_path(model_path, models_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    lock = _model_download_locks.get(str(model_path))
+    if lock and lock.locked():
+        raise HTTPException(status_code=409, detail="模型仍在下载中，请稍后再删除。")
+    if not model_path.exists():
+        return {"status": "not_found", "model_id": req.model_id}
+
+    try:
+        if model_kind == "alignment":
+            clear_alignment_model_cache()
+        elif model_kind == "diarization":
+            from subforge.core.asr.speaker_diarization import clear_diarization_model_cache
+
+            clear_diarization_model_cache()
+        if model_path.is_dir():
+            await run_blocking(shutil.rmtree, model_path)
+        else:
+            await run_blocking(model_path.unlink)
+    except OSError as exc:
+        logger.exception("Failed to delete model %s", req.model_id)
+        raise HTTPException(
+            status_code=409,
+            detail=f"模型文件正在使用或无法删除：{exc}",
+        ) from exc
+
+    return {"status": "deleted", "model_id": req.model_id, "path": str(model_path)}
 
 
 async def _download_model(task_id: str, model_id: str, dest: Path):

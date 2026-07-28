@@ -35,6 +35,10 @@ _MLX_PREVIEW_LINE = re.compile(
     r"(?P<end>\d{2}(?::\d{2})?:\d{2}\.\d{3})\]\s*(?P<text>.+?)\s*$"
 )
 
+def clear_alignment_model_cache() -> None:
+    """Release the process-local forced-alignment model, if any."""
+    _ALIGNMENT_MODEL_CACHE.clear()
+
 MIXED_LANGUAGE_MIN_CONFIDENCE = 0.80
 MIXED_LANGUAGE_MAX_PRIMARY_CONFIDENCE = 0.20
 MIXED_LANGUAGE_MIN_MARGIN = 0.15

@@ -137,6 +137,11 @@ export const transcribeApi = {
       method: "POST",
       body: JSON.stringify({ model_id }),
     }),
+  deleteModel: (model_id: string) =>
+    request<{ status: string; model_id: string; path?: string }>("/api/transcribe/delete-model", {
+      method: "POST",
+      body: JSON.stringify({ model_id }),
+    }),
   resolveAlignmentDecision: (task_id: string, action: "retry" | "continue" | "ignore") =>
     request<{ status: string; action: string }>(`/api/transcribe/${task_id}/alignment-decision`, {
       method: "POST",
@@ -303,6 +308,7 @@ export interface AsrModelInfo {
   size: string;
   downloaded: boolean;
   downloadable?: boolean;
+  deletable?: boolean;
   path: string;
   align_model?: string;
   value?: string;

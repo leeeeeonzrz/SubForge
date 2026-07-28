@@ -468,6 +468,9 @@ function TranscribeWorkspace({ startTask, cancelTask }: WorkflowWorkspaceProps) 
         ? mlxModels
         : models.filter((model) => model.category === "faster_whisper");
     }
+    if (config.transcribeModel === "faster_whisper") {
+      return models.filter((model) => model.category === "faster_whisper");
+    }
     return [];
   }, [config.transcribeModel, models]);
 
