@@ -21,6 +21,11 @@ from .status import ASRStatus
 logger = setup_logger("whisperx_asr")
 _ALIGNMENT_MODEL_CACHE = SingleEntryModelCache()
 
+
+def clear_alignment_model_cache() -> None:
+    """Release the process-local forced-alignment model, if any."""
+    _ALIGNMENT_MODEL_CACHE.clear()
+
 MIXED_LANGUAGE_MIN_CONFIDENCE = 0.80
 MIXED_LANGUAGE_MAX_PRIMARY_CONFIDENCE = 0.20
 MIXED_LANGUAGE_MAX_GAP_SECONDS = 1.25

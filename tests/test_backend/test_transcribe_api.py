@@ -47,6 +47,7 @@ def test_faster_whisper_models_use_distinct_download_ids(tmp_path, monkeypatch):
     assert model["value"] == "small"
     assert model["selected"] is True
     assert model["downloaded"] is False
+    assert model["deletable"] is True
 
 
 def test_hardware_detection_requires_complete_cuda_runtime(monkeypatch):
@@ -334,3 +335,34 @@ def test_model_self_test_returns_real_transcript_metadata(tmp_path, monkeypatch)
     assert result["ok"] is True
     assert result["transcript"] == "model test passed"
     assert result["segment_count"] == 1
+
+
+def test_delete_model_removes_only_requested_managed_directory(tmp_path, monkeypatch):
+    models_dir = tmp_path / "models"
+    model_dir = models_dir / "faster-whisper-small"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.bin").write_bytes(b"model")
+    monkeypatch.setattr(transcribe_api, "_get_models_dir", lambda: models_dir)
+
+    result = asyncio.run(
+        transcribe_api.delete_whisper_model(
+            transcribe_api.DownloadModelRequest(model_id="faster-whisper-small")
+        )
+    )
+
+    assert result["status"] == "deleted"
+    assert not model_dir.exists()
+    assert models_dir.exists()
+
+
+def test_delete_model_path_guard_rejects_model_root_and_outside_path(tmp_path):
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+
+    for target in (models_dir, tmp_path / "outside"):
+        try:
+            transcribe_api._ensure_managed_model_path(target, models_dir)
+        except ValueError as exc:
+            assert "Refusing to modify unmanaged model path" in str(exc)
+        else:
+            raise AssertionError(f"Unsafe model path was accepted: {target}")
