@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import threading
 import time
 from pathlib import Path
@@ -16,6 +17,15 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 _background_tasks: set[asyncio.Task] = set()
+_GENERATED_SUBTITLE_SUFFIX = re.compile(
+    r"_(?:original|translated|bilingual|recovery)$",
+    flags=re.IGNORECASE,
+)
+
+
+def _generated_base_stem(path: Path) -> str:
+    """Return the stable source stem for SubForge-generated subtitle variants."""
+    return _GENERATED_SUBTITLE_SUFFIX.sub("", path.stem)
 
 
 def _result_path(input_file: str, suffix: str, configured_work_dir: str = "") -> Path:
@@ -37,7 +47,25 @@ def _result_path(input_file: str, suffix: str, configured_work_dir: str = "") ->
 
             output_dir = WORK_PATH.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir / f"{source.stem}{suffix}.srt"
+    return output_dir / f"{_generated_base_stem(source)}{suffix}.srt"
+
+
+def _translation_source_path(input_file: str) -> Path:
+    """Prefer the immutable source sidecar when reprocessing bilingual output.
+
+    Generated bilingual files are target-on-top. Re-parsing them requires a
+    lossy language guess that is ambiguous for names, numbers, mixed scripts,
+    and non-Chinese translation directions. The sibling ``_original`` file is
+    the authoritative source when it exists.
+    """
+    selected = Path(input_file).resolve()
+    if not selected.stem.lower().endswith("_bilingual"):
+        return selected
+
+    original = selected.with_name(
+        f"{_generated_base_stem(selected)}_original{selected.suffix}"
+    )
+    return original if original.is_file() else selected
 
 
 def _preview_segments(data) -> list[dict]:
@@ -208,7 +236,13 @@ async def _run_subtitle(task_id: str, req: SubtitleRequest):
                 logger.warning(f"Failed to save partial result: {e}")
 
         # Load subtitle into ASRData
-        asr_data = ASRData.from_subtitle_file(req.subtitle_file)
+        translation_source_path = _translation_source_path(req.subtitle_file)
+        if translation_source_path != Path(req.subtitle_file).resolve():
+            logger.info(
+                "Using immutable source sidecar for bilingual retranslation: %s",
+                translation_source_path,
+            )
+        asr_data = ASRData.from_subtitle_file(str(translation_source_path))
         if any(segment.speaker_id for segment in asr_data.segments):
             from subforge.core.asr.speaker_diarization import smooth_speaker_assignments
 
@@ -460,7 +494,10 @@ async def _run_subtitle(task_id: str, req: SubtitleRequest):
         task_manager.complete_task(
             task_id,
             {
-                "subtitle_file": str(output_paths["bilingual"]),
+                # Keep the editor's backing path source-only. The UI receives
+                # bilingual fields below, while a later retranslation must not
+                # feed rendered bilingual text through language guessing.
+                "subtitle_file": str(output_paths["original"]),
                 "subtitle_files": {
                     name: str(path) for name, path in output_paths.items()
                 },
