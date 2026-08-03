@@ -86,6 +86,31 @@ def test_result_path_moves_session_uploads_to_durable_work_dir(tmp_path, monkeyp
     assert result == durable / "input_processed.srt"
 
 
+def test_result_path_normalizes_generated_variant_suffixes(tmp_path):
+    import app.api.subtitle as subtitle_module
+
+    bilingual = tmp_path / "episode_bilingual.srt"
+
+    assert subtitle_module._result_path(str(bilingual), "_original") == (
+        tmp_path / "episode_original.srt"
+    )
+    assert subtitle_module._result_path(str(bilingual), "_translated") == (
+        tmp_path / "episode_translated.srt"
+    )
+    assert subtitle_module._result_path(str(bilingual), "_bilingual") == bilingual
+
+
+def test_bilingual_retranslation_prefers_original_sidecar(tmp_path):
+    import app.api.subtitle as subtitle_module
+
+    bilingual = tmp_path / "episode_bilingual.srt"
+    original = tmp_path / "episode_original.srt"
+    bilingual.write_text("translated\nsource", encoding="utf-8")
+    original.write_text("source", encoding="utf-8")
+
+    assert subtitle_module._translation_source_path(str(bilingual)) == original.resolve()
+
+
 def test_backend_parse_srt_preserves_bilingual_fields():
     srt = """1
 00:00:00,000 --> 00:00:02,000
@@ -262,11 +287,80 @@ def test_subtitle_pipeline_cleans_chinese_translation_punctuation(tmp_path, monk
     completed = task_manager.get_task(task.id)
     assert completed is not None
     assert completed.result is not None
+    assert completed.result["subtitle_file"] == str(
+        subtitle_path.with_stem("input_original")
+    )
     assert completed.result["subtitle_files"] == {
         "original": str(subtitle_path.with_stem("input_original")),
         "translated": str(subtitle_path.with_stem("input_translated")),
         "bilingual": str(subtitle_path.with_stem("input_bilingual")),
     }
+
+
+def test_retranslation_never_uses_translated_line_as_source(tmp_path, monkeypatch):
+    import asyncio
+
+    original_path = tmp_path / "episode_original.srt"
+    bilingual_path = tmp_path / "episode_bilingual.srt"
+    original_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nOriginal source sentence.\n",
+        encoding="utf-8",
+    )
+    bilingual_path.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n"
+        "Translated target sentence.\nOriginal source sentence.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        config_module,
+        "get_config_value",
+        lambda key, default=None: {
+            "thread_num": 1,
+            "batch_size": 1,
+            "replace_chinese_punctuation": False,
+        }.get(key, default),
+    )
+
+    class FakeSplitter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def split_subtitle(self, asr_data):
+            return asr_data
+
+    seen_sources = []
+
+    class FakeTranslator:
+        def translate_subtitle(self, asr_data):
+            seen_sources.extend(segment.text for segment in asr_data.segments)
+            asr_data.segments[0].translated_text = "Fresh translation."
+            return asr_data
+
+    monkeypatch.setattr(split_module, "SubtitleSplitter", FakeSplitter)
+    monkeypatch.setattr(
+        TranslatorFactory,
+        "create_translator",
+        staticmethod(lambda **_kwargs: FakeTranslator()),
+    )
+
+    task = task_manager.create_task("subtitle")
+    asyncio.run(
+        _run_subtitle(
+            task.id,
+            SubtitleRequest(
+                subtitle_file=str(bilingual_path),
+                target_language="english",
+                translator="bing",
+                need_optimize=False,
+                need_translate=True,
+            ),
+        )
+    )
+
+    assert seen_sources == ["Original source sentence."]
+    result = task_manager.get_task(task.id).result
+    assert result["subtitle_file"] == str(original_path)
+    assert not (tmp_path / "episode_bilingual_original.srt").exists()
 
 
 def test_subtitle_pipeline_hides_speaker_markers_in_final_output(tmp_path, monkeypatch):
