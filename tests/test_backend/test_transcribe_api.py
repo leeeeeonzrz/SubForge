@@ -184,24 +184,13 @@ def test_windows_reports_managed_whisperx_model_as_ready(tmp_path, monkeypatch):
 
     status = transcribe_api._current_model_status()
     models = asyncio.run(transcribe_api.list_whisper_models())
-    listed = next(model for model in models if model["id"] == "whisperx-large-v3")
+    listed = next(model for model in models if model["id"] == "faster-whisper-large-v3")
 
     assert status["model_ready"] is True
     assert status["model_path"] == str(model_dir)
     assert status["model_state"] == "ready"
     assert listed["downloaded"] is True
     assert listed["path"] == str(model_dir)
-
-    shared_model = tmp_path / "models" / "faster-whisper-large-v3"
-    shared_model.mkdir(parents=True)
-    (shared_model / "config.json").write_text("{}" * 50, encoding="utf-8")
-    (shared_model / "model.bin").write_bytes(b"x" * (1024 * 1024))
-    (shared_model / "tokenizer.json").write_text("{}" * 512, encoding="utf-8")
-
-    status = transcribe_api._current_model_status()
-    assert status["model_id"] == "faster-whisper-large-v3"
-    assert status["model_path"] == str(shared_model)
-    assert status["model_ready"] is True
 
 
 def test_model_list_exposes_language_specific_alignment_models(tmp_path, monkeypatch):

@@ -918,15 +918,13 @@ async def list_whisper_models():
             }
         )
     for model_value, repo in MLX_WHISPER_MODELS.items():
-        if uses_mlx:
-            resolved = resolve_mlx_model(model_value)
-            model_path = Path(resolved).expanduser()
-            local_ready = is_valid_mlx_model_dir(model_path)
-        else:
-            local_model = find_faster_whisper_model_dir(model_value, models_dir)
-            resolved = str(local_model) if local_model is not None else model_value
-            model_path = local_model or Path()
-            local_ready = local_model is not None
+        if not uses_mlx:
+            # Windows/Linux WhisperX shares the managed FasterWhisper model
+            # entries below instead of exposing duplicate on-demand models.
+            continue
+        resolved = resolve_mlx_model(model_value)
+        model_path = Path(resolved).expanduser()
+        local_ready = is_valid_mlx_model_dir(model_path)
         result.append(
             {
                 "id": f"mlx-{model_value}" if uses_mlx else f"whisperx-{model_value}",
