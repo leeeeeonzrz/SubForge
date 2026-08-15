@@ -23,6 +23,7 @@ from .asr_data import ASRDataSeg
 from .base import BaseASR
 from .status import ASRStatus
 from .worker_runtime import atomic_json_write as _atomic_json_write
+from .worker_runtime import hidden_worker_process_kwargs as _hidden_worker_process_kwargs
 from .worker_runtime import log_tail as _log_tail
 from .worker_runtime import stop_process as _stop_process
 
@@ -286,7 +287,6 @@ class FasterWhisperASR(BaseASR):
                     _FASTER_WORKER_HEARTBEAT: str(heartbeat_path),
                 }
             )
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             log_file = log_path.open("w", encoding="utf-8")
             try:
                 process = subprocess.Popen(
@@ -295,7 +295,7 @@ class FasterWhisperASR(BaseASR):
                     stdin=subprocess.DEVNULL,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
-                    creationflags=creationflags,
+                    **_hidden_worker_process_kwargs(),
                 )
                 last_progress: tuple[int, str] | None = None
                 last_heartbeat_mtime = -1

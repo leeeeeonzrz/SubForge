@@ -21,6 +21,7 @@ from .faster_whisper import find_faster_whisper_model_dir, resolve_faster_whispe
 from .model_cache import SingleEntryModelCache
 from .status import ASRStatus
 from .worker_runtime import atomic_json_write as _atomic_json_write
+from .worker_runtime import hidden_worker_process_kwargs as _hidden_worker_process_kwargs
 from .worker_runtime import log_tail as _worker_log_tail
 from .worker_runtime import stop_process as _stop_worker_process
 
@@ -2490,6 +2491,7 @@ class WhisperXASR(BaseASR):
                     stdin=subprocess.DEVNULL,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
+                    **_hidden_worker_process_kwargs(),
                 )
                 preview_reader = log_path.open("r", encoding="utf-8", errors="replace")
                 preview_buffer = ""

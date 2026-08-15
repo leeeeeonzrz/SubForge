@@ -128,6 +128,7 @@ def test_packaged_worker_is_terminated_when_task_is_cancelled(tmp_path, monkeypa
     cancelled = threading.Event()
     cancelled.set()
     process_state = {"terminated": False}
+    popen_kwargs = {}
 
     class FakeProcess:
         returncode = None
@@ -149,12 +150,24 @@ def test_packaged_worker_is_terminated_when_task_is_cancelled(tmp_path, monkeypa
         device="cuda",
         cancel_event=cancelled,
     )
-    monkeypatch.setattr(module.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess())
+    monkeypatch.setattr(
+        module,
+        "_hidden_worker_process_kwargs",
+        lambda: {"creationflags": 0x08000000, "startupinfo": "hidden"},
+    )
+
+    def fake_popen(*_args, **kwargs):
+        popen_kwargs.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
 
     with pytest.raises(RuntimeError, match="cancelled"):
         asr._run_in_packaged_worker()
 
     assert process_state["terminated"] is True
+    assert popen_kwargs["creationflags"] == 0x08000000
+    assert popen_kwargs["startupinfo"] == "hidden"
 
 
 def test_packaged_windows_cuda_routes_through_isolated_worker(tmp_path, monkeypatch):

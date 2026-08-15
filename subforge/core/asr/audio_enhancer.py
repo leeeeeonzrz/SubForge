@@ -17,6 +17,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from .worker_runtime import atomic_json_write as _atomic_json_write
+from .worker_runtime import hidden_worker_process_kwargs as _hidden_worker_process_kwargs
 from .worker_runtime import stop_process as _stop_process
 
 logger = logging.getLogger(__name__)
@@ -578,7 +579,6 @@ def _enhance_in_packaged_worker(
                 _DENOISE_WORKER_HEARTBEAT: str(heartbeat_path),
             }
         )
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         with log_path.open("w", encoding="utf-8") as log_file:
             process = subprocess.Popen(
                 [sys.executable],
@@ -586,7 +586,7 @@ def _enhance_in_packaged_worker(
                 stdin=subprocess.DEVNULL,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
-                creationflags=creationflags,
+                **_hidden_worker_process_kwargs(),
             )
             last_heartbeat_at = time.monotonic()
             last_heartbeat_mtime = -1

@@ -79,7 +79,15 @@ class BaseASR:
         if not self.file_binary:
             return 0.01
         try:
-            audio = AudioSegment.from_file(BytesIO(self.file_binary))
+            # Keep the filename when one exists. Outer-VAD segments are WAV
+            # files, which pydub can read directly without launching ffprobe
+            # and ffmpeg for every segment.
+            audio_source = (
+                self.audio_input
+                if isinstance(self.audio_input, str)
+                else BytesIO(self.file_binary)
+            )
+            audio = AudioSegment.from_file(audio_source)
             return audio.duration_seconds
         except Exception as e:
             logger.warning(f"Failed to get audio duration: {e}")

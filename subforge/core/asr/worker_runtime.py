@@ -3,9 +3,30 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
+
+
+def hidden_worker_process_kwargs() -> dict[str, Any]:
+    """Return Windows process options that keep packaged workers invisible.
+
+    ``CREATE_NO_WINDOW`` prevents a console from being allocated for console
+    children. ``STARTF_USESHOWWINDOW``/``SW_HIDE`` also covers executable and
+    bootloader combinations that briefly create a top-level window before the
+    worker entry point takes control.
+    """
+    if os.name != "nt":
+        return {}
+
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+    return {
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        "startupinfo": startupinfo,
+    }
 
 
 def atomic_json_write(path: Path, payload: object) -> None:

@@ -1,3 +1,6 @@
+import wave
+from types import SimpleNamespace
+
 from subforge.core.asr import base as asr_base
 from subforge.core.asr.asr_data import ASRDataSeg
 from subforge.core.asr.base import BaseASR
@@ -24,6 +27,46 @@ class DummyASR(BaseASR):
 
     def _make_segments(self, resp_data):
         return [ASRDataSeg(str(resp_data), 0, 1000)]
+
+
+def test_duration_keeps_wav_path_to_avoid_per_segment_ffmpeg(monkeypatch, tmp_path):
+    audio_path = tmp_path / "vad_0001.wav"
+    audio_path.write_bytes(b"RIFF-test")
+    received = []
+    monkeypatch.setattr(
+        asr_base.AudioSegment,
+        "from_file",
+        lambda source: received.append(source)
+        or SimpleNamespace(duration_seconds=1.25),
+    )
+    asr = BaseASR.__new__(BaseASR)
+    asr.audio_input = str(audio_path)
+    asr.file_binary = audio_path.read_bytes()
+
+    assert asr._get_audio_duration() == 1.25
+    assert received == [str(audio_path)]
+
+
+def test_wav_duration_does_not_spawn_ffmpeg(monkeypatch, tmp_path):
+    from pydub import audio_segment
+
+    audio_path = tmp_path / "vad_0002.wav"
+    with wave.open(str(audio_path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(b"\0\0" * 16_000)
+
+    monkeypatch.setattr(asr_base, "get_asr_cache", FakeCache)
+
+    def unexpected_process(*_args, **_kwargs):
+        raise AssertionError("WAV duration lookup must not start ffmpeg")
+
+    monkeypatch.setattr(audio_segment.subprocess, "Popen", unexpected_process)
+
+    asr = DummyASR(str(audio_path), use_cache=False)
+
+    assert asr.audio_duration == 1.0
 
 
 def test_base_asr_does_not_read_or_write_cache_when_disabled(monkeypatch, tmp_path):

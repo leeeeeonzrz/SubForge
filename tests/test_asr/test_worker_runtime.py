@@ -5,7 +5,32 @@ import subprocess
 from pathlib import Path
 from unittest.mock import Mock
 
+from subforge.core.asr import worker_runtime
 from subforge.core.asr.worker_runtime import atomic_json_write, log_tail, stop_process
+
+
+def test_windows_worker_process_is_created_hidden(monkeypatch) -> None:
+    class FakeStartupInfo:
+        def __init__(self) -> None:
+            self.dwFlags = 0
+            self.wShowWindow = None
+
+    monkeypatch.setattr(worker_runtime.os, "name", "nt")
+    monkeypatch.setattr(
+        worker_runtime.subprocess,
+        "STARTUPINFO",
+        FakeStartupInfo,
+        raising=False,
+    )
+    monkeypatch.setattr(worker_runtime.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    monkeypatch.setattr(worker_runtime.subprocess, "STARTF_USESHOWWINDOW", 0x00000001, raising=False)
+    monkeypatch.setattr(worker_runtime.subprocess, "SW_HIDE", 0, raising=False)
+
+    kwargs = worker_runtime.hidden_worker_process_kwargs()
+
+    assert kwargs["creationflags"] == 0x08000000
+    assert kwargs["startupinfo"].dwFlags & 0x00000001
+    assert kwargs["startupinfo"].wShowWindow == 0
 
 
 def test_atomic_json_write_replaces_target_without_leaving_temporary_file(
