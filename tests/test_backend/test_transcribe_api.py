@@ -69,6 +69,29 @@ def test_hardware_detection_requires_complete_cuda_runtime(monkeypatch):
     assert hardware["compute_type"] == "int8"
 
 
+def test_windows_hardware_probe_does_not_open_a_console(monkeypatch):
+    calls = []
+    no_window = 0x08000000
+    monkeypatch.setattr(transcribe_api.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(transcribe_api.platform, "machine", lambda: "AMD64")
+    monkeypatch.setattr(transcribe_api.subprocess, "CREATE_NO_WINDOW", no_window, raising=False)
+    monkeypatch.setattr(
+        transcribe_api.subprocess,
+        "check_output",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or "NVIDIA GeForce RTX\n",
+    )
+    monkeypatch.setattr(
+        transcribe_api, "is_faster_whisper_cuda_available", lambda: True
+    )
+
+    hardware = transcribe_api.detect_hardware()
+
+    assert hardware["device"] == "cuda"
+    assert len(calls) == 1
+    assert calls[0][0][0][0] == "nvidia-smi"
+    assert calls[0][1]["creationflags"] == no_window
+
+
 def test_model_status_reports_detected_local_mlx_model(tmp_path, monkeypatch):
     values = _config_values(tmp_path)
     local_model = tmp_path / "whisper-large-v3-fp16"

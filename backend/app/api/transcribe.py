@@ -53,6 +53,13 @@ _model_test_lock = asyncio.Lock()
 _model_download_locks: dict[str, asyncio.Lock] = {}
 
 
+def _hidden_process_creationflags() -> int:
+    """Prevent short-lived hardware probes from flashing a console on Windows."""
+    if platform.system() != "Windows":
+        return 0
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def detect_hardware() -> dict:
     """Detect hardware and return optimal whisper settings."""
     result = {
@@ -72,6 +79,7 @@ def detect_hardware() -> dict:
                 ["sysctl", "-n", "machdep.cpu.brand_string"],
                 text=True,
                 timeout=5,
+                creationflags=_hidden_process_creationflags(),
             ).strip()
             result["chip"] = out
 
@@ -82,6 +90,7 @@ def detect_hardware() -> dict:
                         ["sysctl", "-n", "hw.perflevel0.logicalcpu"],
                         text=True,
                         timeout=5,
+                        creationflags=_hidden_process_creationflags(),
                     ).strip()
                 )
             except Exception:
@@ -104,6 +113,7 @@ def detect_hardware() -> dict:
                 ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
                 text=True,
                 timeout=5,
+                creationflags=_hidden_process_creationflags(),
             ).strip()
             result["gpu"] = out.split("\n")[0]
             if is_faster_whisper_cuda_available():
