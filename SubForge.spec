@@ -282,6 +282,11 @@ exe = EXE(
     upx=True,
     console=False,
     disable_windowed_traceback=False,
+    icon=(
+        os.path.join(ROOT, 'resource', 'assets', 'SubForge.ico')
+        if os.name == 'nt'
+        else None
+    ),
 )
 
 coll = COLLECT(

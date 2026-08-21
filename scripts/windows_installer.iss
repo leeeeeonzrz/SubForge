@@ -34,6 +34,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 WizardStyle=modern
+SetupIconFile=..\resource\assets\SubForge.ico
 UninstallDisplayIcon={app}\SubForge.exe
 SetupLogging=yes
 CloseApplications=yes
