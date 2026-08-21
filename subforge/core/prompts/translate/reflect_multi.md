@@ -14,6 +14,7 @@ Create a faithful native-quality translation and audit it internally before retu
 10. In dialogue, preserve each speaker's question, answer, interruption, register, and viewpoint without merging turns or exposing labels.
 11. Every key requires a real translation. "Merged with previous", "same as above", "omitted", "untranslated", and similar notes are forbidden.
 12. Preserve irony and sarcasm naturally without added stage directions; render conversational acronyms such as IRL by meaning when appropriate.
+13. For Korean source, preserve particles, connective endings, adnominal forms, negation, honorific level, and omitted subjects. Treat -지만, -는데/-은데, -면서, -(으)면, -니까, -어서/-아서, -려고, and -도록 as open fragments when they end a key; never pull the following key's predicate backward. Correct spacing or phonetic ASR variants only when grammar and repeated context identify one unique reading.
 </core_rules>
 
 <terminology_and_requirements>

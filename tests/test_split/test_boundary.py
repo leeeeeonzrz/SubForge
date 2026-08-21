@@ -38,6 +38,37 @@ def _cues(texts: list[str], *, speakers: list[str] | None = None) -> list[ASRDat
     return result
 
 
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("저는", "이 방식이 더 낫다고 생각합니다."),
+        ("하지만", "문제는 아직 남아 있습니다."),
+        ("시간이 없으니까", "지금 바로 시작해야 합니다."),
+        ("할", "수 있습니다."),
+        ("이런", "문제는 다시 생기면 안 됩니다."),
+    ],
+)
+def test_normalizer_merges_dependent_korean_boundaries(left, right):
+    repaired = normalize_boundaries(_cues([left, right]), hard_max_cjk_chars=25)
+
+    assert len(repaired) == 1
+    assert repaired[0].text == f"{left} {right}"
+
+
+def test_normalizer_keeps_complete_korean_reply_separate():
+    repaired = normalize_boundaries(_cues(["맞아요.", "다음 문제로 넘어가죠."]))
+
+    assert [segment.text for segment in repaired] == ["맞아요.", "다음 문제로 넘어가죠."]
+
+
+def test_normalizer_respects_korean_speaker_boundary():
+    repaired = normalize_boundaries(
+        _cues(["저는", "그렇게 생각하지 않습니다."], speakers=["S1", "S2"])
+    )
+
+    assert [segment.text for segment in repaired] == ["저는", "그렇게 생각하지 않습니다."]
+
+
 def test_assessment_rejects_user_reported_dangling_boundaries():
     boundaries = [
         ("potential solutions because", "it can deliver electricity"),

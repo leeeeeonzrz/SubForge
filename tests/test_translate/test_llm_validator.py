@@ -2510,6 +2510,29 @@ class TestValidateLLmResponse:
 
         assert translator._needs_alignment_audit() is False
 
+    @pytest.mark.parametrize("source_language", ["ko", "ja", "fr"])
+    def test_alignment_audit_is_enabled_for_explicit_non_english_source(
+        self, source_language
+    ):
+        translator = _make_translator(is_reflect=False)
+        source = [
+            SubtitleProcessData(
+                index=1,
+                original_text="source",
+                source_language=source_language,
+            )
+        ]
+
+        assert translator._needs_alignment_audit(source) is True
+
+    def test_alignment_audit_stays_disabled_for_plain_english_source(self):
+        translator = _make_translator(is_reflect=False)
+        source = [
+            SubtitleProcessData(index=1, original_text="This is fine.", source_language="en")
+        ]
+
+        assert translator._needs_alignment_audit(source) is False
+
     def test_alignment_audit_requires_two_matching_flags(self, monkeypatch):
         translator = _make_minimax_reflect_translator()
         source = {

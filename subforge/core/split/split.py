@@ -6,7 +6,11 @@ from typing import Any, Callable, List, Optional, Union
 
 from subforge.core.asr.asr_data import ASRData, ASRDataSeg
 from subforge.core.llm.client import LLMRequestCancelled
-from subforge.core.split.boundary import finalize_japanese_boundaries, normalize_boundaries
+from subforge.core.split.boundary import (
+    finalize_japanese_boundaries,
+    finalize_korean_boundaries,
+    normalize_boundaries,
+)
 from subforge.core.split.length_policy import (
     DEFAULT_CJK_HARD_LIMIT,
     DEFAULT_ENGLISH_SOFT_LIMIT,
@@ -64,6 +68,28 @@ MATCH_LARGE_SHIFT = 100  # 未匹配时的大偏移量
 
 _NO_SPACE_BEFORE = set(",.;:!?)]}，。！？；：、）】》")
 _NO_SPACE_AFTER = set("([{（【《")
+_HANGUL_RE = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
+_ISOLATED_ENGLISH_SUBJECTS = {
+    "i",
+    "you",
+    "he",
+    "she",
+    "it",
+    "we",
+    "they",
+    "this",
+    "that",
+    "these",
+    "those",
+}
+_KOREAN_SHORT_SUBJECT_RE = re.compile(
+    r"^(?:저|나|제|내|너|당신|우리|저희|이것|그것|저것|이거|그거|저거|"
+    r"이게|그게|저게|이건|그건|저건|얘|걔)(?:은|는|이|가)?$"
+)
+_KOREAN_OPEN_TAIL_RE = re.compile(
+    r"(?:지만|는데|은데|ㄴ데|면서|으면|다면|니까|어서|아서|려고|도록|뿐만\s+아니라)$"
+)
+_KOREAN_CONNECTORS = {"그리고", "하지만", "그래서", "그런데", "그러면"}
 _DANGLING_TAIL_WORDS = {
     "a",
     "an",
@@ -91,6 +117,21 @@ _DANGLING_TAIL_WORDS = {
 }
 
 
+def _is_short_dependency_cue(text: str) -> bool:
+    """Detect a compact cue that cannot naturally stand before its continuation."""
+    normalized = str(text or "").strip()
+    if not normalized or re.search(r"[.!?。！？]\s*$", normalized):
+        return False
+    if normalized.casefold() in _ISOLATED_ENGLISH_SUBJECTS:
+        return True
+    compact = re.sub(r"\s+", "", normalized)
+    return bool(
+        _KOREAN_SHORT_SUBJECT_RE.fullmatch(compact)
+        or _KOREAN_OPEN_TAIL_RE.search(compact)
+        or compact in _KOREAN_CONNECTORS
+    )
+
+
 def _join_texts(texts: List[str]) -> str:
     """Join token/word texts without losing spaces after punctuation."""
     result = ""
@@ -104,6 +145,14 @@ def _join_texts(texts: List[str]) -> str:
             continue
 
         if (
+            _HANGUL_RE.search(result)
+            and result[-1] in ".,;:!?。！？"
+            and _HANGUL_RE.match(text[0])
+        ):
+            result += f" {text}"
+        elif _HANGUL_RE.search(result[-1]) and _HANGUL_RE.match(text[0]):
+            result += f" {text}"
+        elif (
             text[0] in _NO_SPACE_BEFORE
             or result[-1] in _NO_SPACE_AFTER
             or is_mainly_cjk(result[-1])
@@ -341,6 +390,10 @@ class SubtitleSplitter:
                 hard_max_cjk_chars=self.max_word_count_cjk,
             )
             final_segments = finalize_japanese_boundaries(
+                final_segments,
+                hard_max_chars=self.max_word_count_cjk,
+            )
+            final_segments = finalize_korean_boundaries(
                 final_segments,
                 hard_max_chars=self.max_word_count_cjk,
             )
@@ -878,7 +931,7 @@ class SubtitleSplitter:
                 (bool(next_text) and next_text[0].islower())
                 or current_text.endswith((",", ";", ":"))
                 or current_first_word in {"and", "but", "or", "so"}
-                or current_text == "I"
+                or _is_short_dependency_cue(current_text)
             )
             current_is_short_continuation = (
                 current_words <= 3
@@ -938,10 +991,7 @@ class SubtitleSplitter:
                 )
 
                 # 合并文本和原子词时间轴
-                if is_mainly_cjk(current_seg.text):
-                    merged_text = current_seg.text + next_seg.text
-                else:
-                    merged_text = current_seg.text + " " + next_seg.text
+                merged_text = _join_texts([current_seg.text, next_seg.text])
 
                 segments[i] = ASRDataSeg.from_segments(
                     [current_seg, next_seg],

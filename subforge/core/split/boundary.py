@@ -16,6 +16,8 @@ HARD_MAX_WORDS = 22
 HARD_MAX_CJK_CHARS = 25
 MAX_JAPANESE_ATOMIC_OVERFLOW_CHARS = 4
 MAX_JAPANESE_ATOMIC_DURATION_MS = 8000
+MAX_KOREAN_ATOMIC_OVERFLOW_CHARS = 4
+MAX_KOREAN_ATOMIC_DURATION_MS = 8000
 MAX_BOUNDARY_SHIFT_WORDS = 8
 MAX_RELOCATABLE_GAP_MS = 1800
 MAX_DIARIZATION_GLITCH_GAP_MS = 250
@@ -27,6 +29,7 @@ _TOKEN_RE = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
 _TERMINAL_RE = re.compile(r"[.!?][\"')\]]*$")
 _CLAUSE_RE = re.compile(r"[,;:][\"')\]]*$")
 _JAPANESE_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff]")
+_KOREAN_RE = re.compile(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]")
 _KATAKANA_RE = re.compile(r"^[\u30a0-\u30ff\u31f0-\u31ffー]+$")
 _JAPANESE_PARTICLE_HEAD_RE = re.compile(
     r"^(?:が|を|は|に|へ|と|で|の|も|や|から|まで|より|ので|のに)"
@@ -73,6 +76,35 @@ _JAPANESE_BOUND_FORMS = (
     "ていく",
     "てきます",
     "となります",
+)
+_KOREAN_SHORT_SUBJECT_RE = re.compile(
+    r"^(?:저|나|제|내|너|당신|우리|저희|이것|그것|저것|이거|그거|저거|"
+    r"이게|그게|저게|이건|그건|저건|얘|걔)(?:은|는|이|가)?$"
+)
+_KOREAN_OPEN_TAIL_RE = re.compile(
+    r"(?:지만|는데|은데|ㄴ데|면서|으면|다면|니까|어서|아서|려고|도록|뿐만\s+아니라)$"
+)
+_KOREAN_CONNECTORS = {"그리고", "하지만", "그래서", "그런데", "그러면"}
+_KOREAN_SHORT_MODIFIERS = {
+    "아주",
+    "매우",
+    "정말",
+    "너무",
+    "가장",
+    "더",
+    "덜",
+    "이런",
+    "그런",
+    "저런",
+    "어떤",
+    "여러",
+    "모든",
+}
+_KOREAN_ADNOMINAL_TAIL_RE = re.compile(
+    r"(?:하는|되는|있는|없는|했던|하던|된|될|한|할|있을|없을)$"
+)
+_KOREAN_DEPENDENT_NOUN_HEAD_RE = re.compile(
+    r"^(?:것|수|때|점|이유|방법|사람|부분|경우)(?:\s|$|[을를이가은는의])"
 )
 
 _HARD_DANGLING_TAILS = {
@@ -1621,6 +1653,14 @@ def _join_words(words: Iterable[ASRWord]) -> str:
         if not result:
             result = text
         elif (
+            _KOREAN_RE.search(result)
+            and result[-1] in ".,;:!?。！？"
+            and _KOREAN_RE.match(text[0])
+        ):
+            result += f" {text}"
+        elif _KOREAN_RE.search(result[-1]) and _KOREAN_RE.match(text[0]):
+            result += f" {text}"
+        elif (
             text[0] in no_space_before
             or result[-1] in no_space_after
             or re.match(r"[\u3040-\u30ff\u31f0-\u31ff\u3400-\u9fff\uac00-\ud7af]", text[0])
@@ -1634,6 +1674,15 @@ def _join_words(words: Iterable[ASRWord]) -> str:
 
 def _word_count(words: Sequence[ASRWord]) -> int:
     return sum(max(1, len(_tokens(word.text))) for word in words if word.text.strip())
+
+
+def _korean_display_count(words: Sequence[ASRWord]) -> int:
+    """Count Korean display length without treating a whole eojeol as one character."""
+    return sum(
+        max(1, len(_KOREAN_RE.findall(word.text)))
+        for word in words
+        if word.text.strip()
+    )
 
 
 def _dominant_speaker(words: Sequence[ASRWord], fallback: str = "") -> str:
@@ -1670,6 +1719,94 @@ def _make_cue(words: Sequence[ASRWord], fallback_speaker: str) -> ASRDataSeg:
 
 def _is_japanese_cue(segment: ASRDataSeg) -> bool:
     return segment.language_code == "ja" or bool(_JAPANESE_RE.search(segment.text))
+
+
+def _is_korean_cue(segment: ASRDataSeg) -> bool:
+    return segment.language_code == "ko" or bool(_KOREAN_RE.search(segment.text))
+
+
+def _has_unstable_korean_boundary(left: str, right: str) -> bool:
+    """Return whether a Korean cue ends with a grammar unit owned by the next cue."""
+    left = str(left or "").strip()
+    right = str(right or "").strip()
+    if not left or not right or _has_terminal_punctuation(left):
+        return False
+
+    compact_left = re.sub(r"\s+", "", left)
+    normalized_right = re.sub(r"\s+", " ", right)
+    if _KOREAN_SHORT_SUBJECT_RE.fullmatch(compact_left):
+        return True
+    if compact_left in _KOREAN_CONNECTORS or compact_left in _KOREAN_SHORT_MODIFIERS:
+        return True
+    if _KOREAN_OPEN_TAIL_RE.search(compact_left):
+        return True
+    return bool(
+        _KOREAN_ADNOMINAL_TAIL_RE.search(compact_left)
+        and _KOREAN_DEPENDENT_NOUN_HEAD_RE.match(normalized_right)
+    )
+
+
+def _repair_korean_boundaries(
+    segments: Sequence[ASRDataSeg],
+    *,
+    hard_max_chars: int,
+) -> list[ASRDataSeg]:
+    """Merge only compact Korean pairs with an unambiguously dependent left cue."""
+    result = list(segments)
+    index = 0
+    while index < len(result) - 1:
+        left = result[index]
+        right = result[index + 1]
+        words = [*left.words, *right.words]
+        if (
+            not left.words
+            or not right.words
+            or not _is_korean_cue(left)
+            or not _is_korean_cue(right)
+            or left.translated_text
+            or right.translated_text
+            or _is_hard_boundary(left, right)
+            or not _has_unstable_korean_boundary(left.text, right.text)
+            or _korean_display_count(words)
+            > hard_max_chars + MAX_KOREAN_ATOMIC_OVERFLOW_CHARS
+            or words[-1].end_time - words[0].start_time > MAX_KOREAN_ATOMIC_DURATION_MS
+        ):
+            index += 1
+            continue
+
+        result[index : index + 2] = [
+            _make_cue(words, left.speaker_id or right.speaker_id)
+        ]
+        logger.info(
+            "Merged dependent Korean boundary at subtitles %s-%s: %s / %s",
+            index + 1,
+            index + 2,
+            left.text,
+            right.text,
+        )
+        if index:
+            index -= 1
+    return result
+
+
+def finalize_korean_boundaries(
+    segments: Sequence[ASRDataSeg],
+    *,
+    hard_max_chars: int = HARD_MAX_CJK_CHARS,
+) -> list[ASRDataSeg]:
+    """Apply Korean grammar-boundary repair until the result is stable."""
+    result = list(segments)
+    for _ in range(8):
+        signature = [
+            (segment.start_time, segment.end_time, segment.text) for segment in result
+        ]
+        result = _repair_korean_boundaries(result, hard_max_chars=hard_max_chars)
+        repaired_signature = [
+            (segment.start_time, segment.end_time, segment.text) for segment in result
+        ]
+        if repaired_signature == signature:
+            break
+    return result
 
 
 def _has_unstable_japanese_boundary(left: str, right: str) -> bool:
@@ -2212,6 +2349,10 @@ def normalize_boundaries(
     result = _remove_singular_corrections(segments)
     result = _split_internal_terminal_clauses(result)
     result = _repair_japanese_boundaries_until_stable(
+        result,
+        hard_max_chars=hard_max_cjk_chars,
+    )
+    result = finalize_korean_boundaries(
         result,
         hard_max_chars=hard_max_cjk_chars,
     )

@@ -30,6 +30,7 @@ Produce accurate, complete, natural spoken subtitles. Fidelity comes before styl
 26. Preserve spoken self-corrections as one corrected fact. In a pattern such as "20, uh, 20.8", the first number is an abandoned false start and the final subtitle should state 20.8 once.
 27. Resolve an obvious omitted conversational noun from immediate context only when unambiguous. A phone-fit aside such as "if you have a smaller—this is a Pro Max" may say "if your phone is smaller—mine is a Pro Max" without borrowing the following clause.
 28. Keep distinct source qualities distinct in natural Chinese. In ride commentary, "stiff, bouncy, crashy" describes firmness, body bounce, and harsh impact; do not collapse them into repeated synonyms such as "颠、颠簸".
+29. For Korean source, preserve the meaning carried by particles, connective endings, adnominal forms, negation, honorific level, and omitted subjects. A key ending in -지만, -는데/-은데, -면서, -(으)면, -니까, -어서/-아서, -려고, or -도록 is normally an open fragment: translate only that fragment under its own key and never pull the following predicate forward. Treat Korean spacing or phonetic ASR variants as corrections only when grammar and repeated context make one reading unambiguous.
 </requirements>
 
 <terminology_and_requirements>

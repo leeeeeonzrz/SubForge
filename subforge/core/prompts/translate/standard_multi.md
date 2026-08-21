@@ -14,6 +14,7 @@ Produce complete, accurate, concise, and idiomatic spoken subtitles. Fidelity co
 10. Use anonymous speaker metadata only to understand dialogue. Preserve questions, answers, interruptions, register, and speaker-specific viewpoints without outputting or renaming speakers.
 11. Every key must contain a real translation. Placeholders such as "merged with previous", "same as above", "omitted", or "untranslated" are forbidden.
 12. Preserve irony and sarcasm through natural wording, conversational acronyms such as IRL through their actual meaning, and discourse markers only when they carry real intent.
+13. For Korean source, preserve particles, connective endings, adnominal forms, negation, honorific level, and omitted subjects. Open endings such as -지만, -는데/-은데, -면서, -(으)면, -니까, -어서/-아서, -려고, and -도록 never authorize borrowing the following key's predicate. Correct spacing or phonetic ASR variants only when grammar and repeated context make one reading unambiguous.
 </core_rules>
 
 <terminology_and_requirements>

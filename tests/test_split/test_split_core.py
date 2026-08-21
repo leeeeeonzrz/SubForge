@@ -95,6 +95,19 @@ class TestPreprocessSegments:
         assert text == "Hey everyone, welcome back 3.5L VTEC, sedan"
 
 
+def test_join_texts_preserves_korean_word_spaces():
+    assert _join_texts(["저는", "이", "방법이", "좋아요"]) == "저는 이 방법이 좋아요"
+    assert _join_texts(["맞아요.", "다음", "문제입니다."]) == "맞아요. 다음 문제입니다."
+
+
+def test_split_to_word_segments_keeps_korean_eojeol_units():
+    data = ASRData([ASRDataSeg("저는 이 방법이 좋아요", 0, 2_000, language_code="ko")])
+
+    data.split_to_word_segments()
+
+    assert [segment.text for segment in data.segments] == ["저는", "이", "방법이", "좋아요"]
+
+
 class TestSubtitleSplitterInit:
     """测试 SubtitleSplitter 初始化"""
 
@@ -686,6 +699,53 @@ class TestMergeShortSegment:
 
         assert len(segments) == 1
         assert segments[0].text == "I I mean, it sounds amazing, right?"
+
+    def test_merges_isolated_english_subject_before_capitalized_predicate(self):
+        segments = [
+            ASRDataSeg("This", 0, 120, speaker_id="Speaker 1"),
+            ASRDataSeg("Does not make sense.", 1_020, 2_000, speaker_id="Speaker 1"),
+        ]
+        splitter = SubtitleSplitter(thread_num=1, model="gpt-4o-mini")
+
+        splitter.merge_short_segment(segments)
+
+        assert len(segments) == 1
+        assert segments[0].text == "This Does not make sense."
+
+    def test_merges_short_korean_subject_before_its_predicate(self):
+        segments = [
+            ASRDataSeg("저는", 0, 160, speaker_id="Speaker 1", language_code="ko"),
+            ASRDataSeg(
+                "이 방식이 더 낫다고 생각합니다.",
+                1_060,
+                2_500,
+                speaker_id="Speaker 1",
+                language_code="ko",
+            ),
+        ]
+        splitter = SubtitleSplitter(thread_num=1, model="gpt-4o-mini")
+
+        splitter.merge_short_segment(segments)
+
+        assert len(segments) == 1
+        assert segments[0].text == "저는 이 방식이 더 낫다고 생각합니다."
+
+    def test_keeps_complete_short_korean_reply_separate(self):
+        segments = [
+            ASRDataSeg("맞아요.", 0, 300, speaker_id="Speaker 1", language_code="ko"),
+            ASRDataSeg(
+                "다음 문제로 넘어가죠.",
+                1_100,
+                2_100,
+                speaker_id="Speaker 1",
+                language_code="ko",
+            ),
+        ]
+        splitter = SubtitleSplitter(thread_num=1, model="gpt-4o-mini")
+
+        splitter.merge_short_segment(segments)
+
+        assert len(segments) == 2
 
     def test_merge_respects_max_word_count(self):
         """测试合并不超过最大字数"""

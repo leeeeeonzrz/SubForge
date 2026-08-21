@@ -29,6 +29,7 @@ Create a faithful native-quality translation, then audit it before returning the
 25. Preserve spoken self-corrections as one corrected fact. In a pattern such as "20, uh, 20.8", the first number is an abandoned false start and the final subtitle should state 20.8 once.
 26. Resolve an obvious omitted conversational noun from immediate context only when unambiguous. A phone-fit aside such as "if you have a smaller—this is a Pro Max" may say "if your phone is smaller—mine is a Pro Max" without borrowing the following clause.
 27. Keep distinct source qualities distinct in natural Chinese. In ride commentary, "stiff, bouncy, crashy" describes firmness, body bounce, and harsh impact; do not collapse them into repeated synonyms such as "颠、颠簸".
+28. For Korean source, preserve particles, connective endings, adnominal forms, negation, honorific level, and omitted subjects. Do not complete an open Korean fragment such as -지만, -는데/-은데, -면서, -(으)면, -니까, -어서/-아서, -려고, or -도록 with meaning owned by the following key. Correct Korean spacing or a phonetic ASR variant only when grammar and repeated context support one unique reading.
 </non_negotiable_rules>
 
 <terminology_and_requirements>

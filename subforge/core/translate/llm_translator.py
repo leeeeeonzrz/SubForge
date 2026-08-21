@@ -310,7 +310,7 @@ class LLMTranslator(BaseTranslator):
             else:
                 processed_result = {k: f"{v}" for k, v in result_dict.items()}
 
-            if self._needs_alignment_audit():
+            if self._needs_alignment_audit(subtitle_chunk):
                 processed_result = self._audit_reflective_alignment(
                     subtitle_dict,
                     processed_result,
@@ -346,9 +346,20 @@ class LLMTranslator(BaseTranslator):
             logger.error(f"LLM translation error: {e}")
             return self._translate_chunk_single(subtitle_chunk)
 
-    def _needs_alignment_audit(self) -> bool:
-        """Run conservative alignment checks for every model in reflective mode."""
-        return self.is_reflect
+    def _needs_alignment_audit(
+        self,
+        source_items: Optional[List[SubtitleProcessData]] = None,
+    ) -> bool:
+        """Audit reflective runs and explicitly non-English source subtitles."""
+        if self.is_reflect:
+            return True
+        return bool(
+            source_items
+            and any(
+                item.source_language.strip().lower() not in {"", "en", "eng", "english"}
+                for item in source_items
+            )
+        )
 
     def _audit_reflective_alignment(
         self,
@@ -5038,7 +5049,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         translated_list: List[SubtitleProcessData],
     ) -> List[SubtitleProcessData]:
         """Repair confirmed alignment errors and high-confidence adjacent repetition."""
-        if not (self.is_reflect and self._needs_alignment_audit()):
+        if not self._needs_alignment_audit(source_list):
             return translated_list
 
         translated_by_index = {item.index: item for item in translated_list}
