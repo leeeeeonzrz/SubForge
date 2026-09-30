@@ -6,11 +6,35 @@ block_cipher = None
 ROOT = os.path.dirname(os.path.abspath(SPEC))
 APP_VERSION = os.environ.get('SUBFORGE_BUILD_VERSION', '0.0.0-dev')
 
+native_bootloader = os.environ.get('SUBFORGE_NATIVE_BOOTLOADER')
+if native_bootloader:
+    from PyInstaller.utils import osx as osxutils
+
+    class AppKitEXE(EXE):
+        def _bootloader_file(self, exe, extension=None):
+            return native_bootloader
+
+        def assemble(self):
+            super().assemble()
+            # PyInstaller downgrades the SDK marker to Python's SDK for Tk
+            # compatibility. This app uses AppKit; preserve the SDK that really
+            # compiled our host so macOS can render its native glass controls.
+            sdk = osxutils.get_macos_sdk_version(native_bootloader)
+            osxutils.set_macos_sdk_version(self.name, *sdk)
+            osxutils.sign_binary(self.name, self.codesign_identity, self.entitlements_file)
+            self.mtm = os.path.getmtime(self.name)
+
+    EXE = AppKitEXE
+
 # MLX is injected after PyInstaller finishes. Importing mlx_whisper while
 # collecting submodules initializes Metal and can terminate headless builds.
 optional_hiddenimports = []
 optional_datas = []
 optional_binaries = []
+try:
+    optional_hiddenimports += collect_submodules('keyring.backends')
+except Exception:
+    pass
 if os.name == 'nt':
     optional_hiddenimports += [
         'colorama',
@@ -37,12 +61,14 @@ if os.name == 'nt':
             optional_binaries += collect_dynamic_libs(runtime_pkg)
         except Exception:
             pass
-    # FasterWhisper loads its packaged Silero ONNX model lazily when VAD starts.
-    # Import-only checks pass without it, so collect package data explicitly.
-    try:
-        optional_datas += collect_data_files('faster_whisper', include_py_files=False)
-    except Exception:
-        pass
+
+# FasterWhisper loads its packaged Silero ONNX model lazily when VAD starts.
+# Import-only checks pass without it, so collect package data on every platform
+# where the selectable FasterWhisper engine is bundled.
+try:
+    optional_datas += collect_data_files('faster_whisper', include_py_files=False)
+except Exception:
+    pass
 
 whisperx_runtime_excludes = [] if os.name == 'nt' else [
     'whisperx.asr', 'whisperx.transcribe', 'whisperx.vads',
@@ -307,6 +333,8 @@ app = BUNDLE(
     bundle_identifier='com.subforge.app',
     info_plist={
         'CFBundleDisplayName': 'SubForge',
+        'CFBundleDevelopmentRegion': 'zh-Hans',
+        'CFBundleLocalizations': ['zh-Hans'],
         'CFBundleShortVersionString': APP_VERSION,
         'CFBundleVersion': APP_VERSION,
         'NSHighResolutionCapable': True,

@@ -8,6 +8,7 @@ on:
       - "frontend/**"
       - "resource/**"
       - "launcher.py"
+      - "desktop_dialogs.py"
       - "build_macos.py"
       - "scripts/build_desktop.py"
       - "scripts/smoke_desktop.py"
@@ -54,7 +55,13 @@ jobs:
           - name: macOS Intel
             os: macos-15-intel
             uv-extra: ""
-            artifact-name: desktop-macOS
+            artifact-name: desktop-macOS-intel
+            build-flavor: ""
+            cuda: false
+          - name: macOS Apple Silicon
+            os: macos-15
+            uv-extra: "--extra denoise --extra whisperx"
+            artifact-name: desktop-macOS-arm64
             build-flavor: ""
             cuda: false
 
@@ -89,7 +96,7 @@ jobs:
         working-directory: frontend
 
       - name: Build desktop bundle
-        run: uv run --no-sync ${{ matrix.uv-extra }} --with pyinstaller --with pywebview python scripts/build_desktop.py --clean
+        run: uv run --no-sync ${{ matrix.uv-extra }} --with pyinstaller==6.20.0 --with pywebview python scripts/build_desktop.py --clean
 
       - name: Smoke test packaged macOS app
         if: runner.os == 'macOS'
@@ -140,14 +147,18 @@ jobs:
           retention-days: 14
 
       - name: Upload to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" --title "$TAG" --generate-notes
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            gh release upload "$TAG" artifacts/*-setup.exe --clobber
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            NOTES=".github/release-notes/$TAG.md"
+            if [ -f "$NOTES" ]; then
+              gh release create "$TAG" --verify-tag --draft --title "SubForge $TAG" --notes-file "$NOTES"
+            else
+              gh release create "$TAG" --verify-tag --draft --title "SubForge $TAG" --generate-notes
+            fi
           fi
+          gh release upload "$TAG" artifacts/*-setup.exe --clobber

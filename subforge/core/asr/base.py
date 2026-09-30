@@ -115,7 +115,11 @@ class BaseASR:
             if cached_result is not None:
                 logger.debug("找到缓存，直接返回")
                 segments = self._make_segments(cached_result)
-                return ASRData(segments)
+                data = ASRData(segments)
+                if isinstance(cached_result, dict):
+                    data.coverage_issues = list(cached_result.get("coverage_issues") or [])
+                    data.excluded_speech_ranges = list(cached_result.get("excluded_speech_ranges") or [])
+                return data
 
         # Run ASR
         resp_data = self._run(callback, **kwargs)
@@ -127,7 +131,11 @@ class BaseASR:
             self._cache.set(cache_key, resp_data, expire=86400 * 2)
 
         segments = self._make_segments(resp_data)
-        return ASRData(segments)
+        data = ASRData(segments)
+        if isinstance(resp_data, dict):
+            data.coverage_issues = list(resp_data.get("coverage_issues") or [])
+            data.excluded_speech_ranges = list(resp_data.get("excluded_speech_ranges") or [])
+        return data
 
     def _get_key(self) -> str:
         """Get cache key for this ASR request.

@@ -181,6 +181,47 @@ def test_transcribe_keeps_word_results_when_vad_refinement_fails(monkeypatch):
     assert result.segments[1].end_time == 1_700
 
 
+def test_enhanced_chunked_transcription_realigns_numbers_on_original_audio(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    enhancer = importlib.import_module("subforge.core.asr.audio_enhancer")
+    vad = importlib.import_module("subforge.core.asr.speech_vad")
+    original = str(tmp_path / "original.wav")
+    enhanced = str(tmp_path / "enhanced.wav")
+    data = ASRData([ASRDataSeg("245-35ZR19.", 1000, 2000), ASRDataSeg("I", 4000, 4200)])
+    decoded_paths, aligned_paths = [], []
+
+    def decoder(path, *_args, **_kwargs):
+        decoded_paths.append(path)
+        # Deliberately no realign method: this is the chunked decoding wrapper.
+        return SimpleNamespace(run=lambda **_: data)
+
+    class LocalAligner:
+        def __init__(self, path, **_):
+            assert path == original
+
+        def realign_compound_word_gaps(self, result, path):
+            aligned_paths.append(path)
+            result.segments[0].end_time = 3900
+
+    monkeypatch.setattr(enhancer, "is_available", lambda: True)
+    monkeypatch.setattr(enhancer, "enhance_audio", lambda *_args, **_kwargs: enhanced)
+    monkeypatch.setattr(vad, "is_available", lambda: False)
+    monkeypatch.setattr(transcribe_module, "_create_asr_instance", decoder)
+    monkeypatch.setattr(transcribe_module, "WhisperXASR", LocalAligner)
+    monkeypatch.setattr(ASRData, "filter_hallucinations", lambda self, **_: self)
+    config = TranscribeConfig(
+        transcribe_model=TranscribeModelEnum.WHISPERX,
+        transcribe_language="en",
+        enable_audio_enhancement=True,
+    )
+    result = transcribe_module.transcribe(original, config)
+    assert decoded_paths == [enhanced]
+    assert aligned_paths == [original]
+    assert result.segments[0].end_time == 3900
+    assert result.segments[1].start_time == 4000
+
+
 @pytest.mark.parametrize(
     "engine",
     [
@@ -263,7 +304,9 @@ def test_transcribe_passes_fixed_speaker_count_to_diarization(monkeypatch):
     )
 
     def _diarize(_audio_path, **kwargs):
-        received["num_speakers"] = kwargs["num_speakers"]
+        received.update(
+            {key: kwargs[key] for key in ("num_speakers", "min_speakers", "max_speakers")}
+        )
         return [diarization.SpeakerTurn(0, 4_000, "Speaker 1")]
 
     monkeypatch.setattr(diarization, "diarize_audio", _diarize)
@@ -278,7 +321,7 @@ def test_transcribe_passes_fixed_speaker_count_to_diarization(monkeypatch):
 
     transcribe_module.transcribe("original.wav", config)
 
-    assert received["num_speakers"] == 5
+    assert received == {"num_speakers": 5, "min_speakers": None, "max_speakers": None}
 
 
 def test_transcribe_bounds_automatic_speaker_count(monkeypatch):
@@ -318,7 +361,71 @@ def test_transcribe_bounds_automatic_speaker_count(monkeypatch):
 
     transcribe_module.transcribe("original.wav", config)
 
-    assert received == {"num_speakers": None, "min_speakers": 2, "max_speakers": 10}
+    assert received == {"num_speakers": None, "min_speakers": 1, "max_speakers": 10}
+
+
+@pytest.mark.parametrize("detected_count", [1, 2, 5])
+def test_auto_speaker_count_preserves_words_and_real_speaker_boundaries(
+    monkeypatch, detected_count
+):
+    diarization = importlib.import_module("subforge.core.asr.speaker_diarization")
+    speech_vad = importlib.import_module("subforge.core.asr.speech_vad")
+    from subforge.core.split.split import SubtitleSplitter
+
+    phrases = [
+        ["And", "having", "been", "there."],
+        ["I", "agree."],
+        ["Sounds", "good."],
+        ["Thank", "you."],
+        ["Absolutely."],
+    ][:detected_count]
+    words = []
+    turns = []
+    cursor = 1_000
+    for index, phrase in enumerate(phrases):
+        start = cursor
+        for word in phrase:
+            words.append(ASRDataSeg(word, cursor, cursor + 200))
+            cursor += 240
+        turns.append(diarization.SpeakerTurn(start, cursor, f"Speaker {index + 1}"))
+    data = ASRData(words)
+    original = [(word.text, word.start_time, word.end_time) for word in words]
+    monkeypatch.setattr(DummyWordTimestampASR, "run", lambda self, callback=None: data)
+    monkeypatch.setattr(
+        transcribe_module, "_create_asr_instance", lambda *_args, **_kwargs: DummyWordTimestampASR()
+    )
+    monkeypatch.setattr(
+        diarization, "require_local_diarization_model", lambda *_args, **_kwargs: "/tmp/model"
+    )
+
+    def _diarize(_audio_path, **kwargs):
+        assert kwargs["num_speakers"] is None
+        assert kwargs["min_speakers"] == 1
+        assert kwargs["max_speakers"] == 10
+        return turns
+
+    monkeypatch.setattr(diarization, "diarize_audio", _diarize)
+    monkeypatch.setattr(speech_vad, "is_available", lambda: False)
+    messages = []
+    config = TranscribeConfig(
+        transcribe_model=TranscribeModelEnum.WHISPERX,
+        need_word_time_stamp=True,
+        enable_audio_enhancement=False,
+        speaker_diarization="auto",
+        speaker_count=9,  # A previously saved fixed count must not affect auto mode.
+    )
+    result = transcribe_module.transcribe(
+        "original.wav", config, callback=lambda _progress, message: messages.append(message)
+    )
+    assert [(s.text, s.start_time, s.end_time) for s in result.segments] == original
+    assert {s.speaker_id for s in result.segments} == {
+        f"Speaker {index + 1}" for index in range(detected_count)
+    }
+    assert f"Detected {detected_count} speakers..." in messages
+
+    splitter = SubtitleSplitter(thread_num=1, model="test")
+    groups = splitter._group_by_time_gaps(result.segments, max_gap=1_500)
+    assert [[s.text for s in group] for group in groups] == phrases
 
 
 def test_transcribe_two_speaker_mode_allows_short_incidental_voices(monkeypatch):
@@ -434,7 +541,7 @@ def test_transcribe_multispeaker_always_skips_enhancement(monkeypatch):
     monkeypatch.setattr(
         transcribe_module.ASRData,
         "filter_hallucinations",
-        lambda self, audio_path: vad_paths.append(audio_path),
+        lambda self, audio_path, **_kwargs: vad_paths.append(audio_path),
     )
     config = TranscribeConfig(
         transcribe_model=TranscribeModelEnum.WHISPERX,

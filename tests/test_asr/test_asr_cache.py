@@ -1,6 +1,8 @@
 import wave
 from types import SimpleNamespace
 
+import pytest
+
 from subforge.core.asr import base as asr_base
 from subforge.core.asr.asr_data import ASRDataSeg
 from subforge.core.asr.base import BaseASR
@@ -73,7 +75,7 @@ def test_base_asr_does_not_read_or_write_cache_when_disabled(monkeypatch, tmp_pa
     from pydub.generators import Sine
 
     audio_path = tmp_path / "audio.wav"
-    Sine(440).to_audio_segment(duration=500).export(audio_path, format="wav")
+    Sine(440).to_audio_segment(duration=500).export(audio_path, format="wav").close()
     fake_cache = FakeCache()
     fake_cache.values["asr-v2:DummyASR:any"] = "cached"
 
@@ -93,7 +95,7 @@ def test_base_asr_uses_cache_only_when_enabled(monkeypatch, tmp_path):
     from pydub.generators import Sine
 
     audio_path = tmp_path / "audio.wav"
-    Sine(440).to_audio_segment(duration=500).export(audio_path, format="wav")
+    Sine(440).to_audio_segment(duration=500).export(audio_path, format="wav").close()
     fake_cache = FakeCache()
     fake_cache.values["asr-v2:DummyASR:any"] = "cached"
 
@@ -107,3 +109,20 @@ def test_base_asr_uses_cache_only_when_enabled(monkeypatch, tmp_path):
     assert result.segments[0].text == "cached"
     assert fake_cache.get_calls == 1
     assert fake_cache.set_calls == 0
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_base_asr_preserves_coverage_issues(monkeypatch, tmp_path, cached):
+    from pydub.generators import Sine
+
+    audio = tmp_path / "audio.wav"
+    Sine(440).to_audio_segment(duration=50).export(audio, format="wav").close()
+    payload = {"coverage_issues": [{"start": 10, "end": 14.2, "reason": "decode_budget"}]}
+    cache = FakeCache()
+    cache.values["asr-v2:DummyASR:any"] = payload
+    monkeypatch.setattr(asr_base, "get_asr_cache", lambda: cache)
+    monkeypatch.setattr(asr_base, "is_cache_enabled", lambda: True)
+    asr = DummyASR(str(audio), use_cache=cached)
+    asr._get_key = lambda: "any"
+    asr._run = lambda *args, **kwargs: payload
+    assert asr.run().coverage_issues == payload["coverage_issues"]

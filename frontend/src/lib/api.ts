@@ -1,3 +1,5 @@
+import { createConfigWriter } from "./configWrites";
+
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_URL ??
   (typeof window !== "undefined" && window.location.port === "3000"
@@ -54,7 +56,7 @@ type NativeOpenResult = {
 };
 
 export async function openNativeFile(
-  kind: "media" | "subtitle"
+  kind: "media" | "subtitle" | "any"
 ): Promise<{ available: boolean; path: string | null }> {
   if (typeof window === "undefined" || !("pywebview" in window)) {
     return { available: false, path: null };
@@ -153,6 +155,7 @@ export const transcribeApi = {
 export const subtitleApi = {
   start: (data: {
     subtitle_file: string;
+    media_file?: string;
     target_language?: string;
     translator?: string;
     llm_provider?: string;
@@ -169,13 +172,13 @@ export const subtitleApi = {
 };
 
 // Config
+const configWriter = createConfigWriter((key, value) => request("/api/config/", {
+  method: "POST", body: JSON.stringify({ key, value }),
+}));
 export const configApi = {
   get: () => request<Record<string, unknown>>("/api/config/"),
-  update: (key: string, value: unknown) =>
-    request("/api/config/", {
-      method: "POST",
-      body: JSON.stringify({ key, value }),
-    }),
+  update: configWriter.update,
+  flush: configWriter.flush,
   switchLlmProvider: (data: {
     provider: string;
     current_base_url: string;
@@ -202,6 +205,15 @@ export const configApi = {
   fetchWhisperModels: () => request<{ models: string[]; error?: string }>("/api/config/whisper-models"),
 };
 
+// Free hosted models
+export const freeModelsApi = {
+  nvidiaStatus: () => request<FreeModelProviderStatus>("/api/free-models/nvidia"),
+  scanNvidia: () =>
+    request<{ task_id: string; status: string }>("/api/free-models/nvidia/scan", {
+      method: "POST",
+    }),
+};
+
 // LLM Logs
 export const llmLogsApi = {
   list: (page = 1, search = "") =>
@@ -219,7 +231,18 @@ export const healthApi = {
 };
 
 // Types
+export interface DownloadProgress {
+  phase: "downloading" | "waiting" | "retrying";
+  downloaded_bytes: number;
+  total_bytes: number | null;
+  speed_bps: number | null;
+  eta_seconds: number | null;
+  eta_range_seconds?: [number, number] | null;
+  progress: number | null;
+}
+
 export interface TaskInfo {
+  download?: DownloadProgress | null;
   id: string;
   type: string;
   status: "pending" | "running" | "completed" | "failed" | "cancelled";
@@ -243,6 +266,42 @@ export interface TaskInfo {
         total: number;
       }
   ) | null;
+}
+
+export type FreeModelProbeStatus =
+  | "available"
+  | "busy"
+  | "restricted"
+  | "incompatible"
+  | "unavailable";
+
+export interface FreeModelProbeResult {
+  id: string;
+  status: FreeModelProbeStatus;
+  reason: string;
+  retryable: boolean;
+  http_status: number | null;
+  latency_ms: number;
+  message: string;
+}
+
+export interface FreeModelScanResult {
+  provider: "nvidia";
+  scanned_at: string;
+  catalog_count: number;
+  tested_count: number;
+  duration_ms: number;
+  counts: Record<FreeModelProbeStatus, number>;
+  results: FreeModelProbeResult[];
+}
+
+export interface FreeModelProviderStatus {
+  provider: "nvidia";
+  base_url: string;
+  model: string;
+  api_key_configured: boolean;
+  active_task_id: string | null;
+  last_scan: FreeModelScanResult | null;
 }
 
 export interface MissingAlignmentModel {

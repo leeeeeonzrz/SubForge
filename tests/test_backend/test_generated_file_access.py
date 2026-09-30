@@ -1,0 +1,164 @@
+"""Native external-drive input grants must follow saved pipeline outputs only."""
+
+import asyncio
+import importlib
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
+
+from app import security
+from app.api import config, subtitle, subtitles, transcribe
+from app.core.task_manager import task_manager
+
+from subforge.core.asr.asr_data import ASRData, ASRDataSeg
+from subforge.core.translate.factory import TranslatorFactory
+from subforge.settings import LlmRuntimeConfig
+
+
+@pytest.fixture
+def external_input(tmp_path, monkeypatch):
+    monkeypatch.setattr(security, "_get_allowed_roots", lambda: [])
+    monkeypatch.setattr(security, "_granted_paths", set())
+    monkeypatch.setattr(config, "get_config_value", lambda key, default=None: default)
+    monkeypatch.setattr(
+        config,
+        "get_llm_runtime_config",
+        lambda: LlmRuntimeConfig(
+            provider="custom",
+            base_url="",
+            api_key="",
+            model="",
+        ),
+    )
+    source = tmp_path / "external.srt"
+    source.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nThe car is ready.\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nLet's go.\n",
+        encoding="utf-8",
+    )
+    security.grant_path(source)
+    return source
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_subtitle_output_and_recovery_remain_accessible(external_input, monkeypatch, fail):
+    split_module = importlib.import_module("subforge.core.split.split")
+
+    def forbidden_splitter(**kwargs):
+        pytest.fail("Smart splitting is disabled: no LLM splitter may be constructed")
+
+    monkeypatch.setattr(split_module, "SubtitleSplitter", forbidden_splitter)
+
+    class Translator:
+        def translate_subtitle(self, data):
+            data.segments[0].translated_text = "车已准备好。"
+            if fail:
+                raise RuntimeError("Test provider unavailable")
+            data.segments[1].translated_text = "出发吧。"
+            return data
+
+    monkeypatch.setattr(TranslatorFactory, "create_translator", lambda **kwargs: Translator())
+    task = task_manager.create_task("subtitle")
+    asyncio.run(
+        subtitle._run_subtitle(
+            task.id,
+            subtitle.SubtitleRequest(
+                subtitle_file=str(external_input),
+                need_optimize=False,
+                need_translate=True,
+                translator="bing",
+            ),
+        )
+    )
+    completed = task_manager.get_task(task.id)
+    assert completed.status == ("failed" if fail else "completed")
+    output = (completed.result["recovery_file"] if fail
+              else completed.result["subtitle_files"]["bilingual"])
+    if not fail:
+        for path in completed.result["subtitle_files"].values():
+            assert security.validate_path(path).is_file()
+        original = asyncio.run(subtitles.load_subtitle(completed.result["subtitle_file"]))
+        assert all(not s["translated"] for s in original["segments"])
+    assert security.validate_path(output).is_file()
+    loaded = asyncio.run(subtitles.load_subtitle(output))
+    assert loaded["count"] == 2
+    assert [s["text"] for s in loaded["segments"]] == ["The car is ready.", "Let's go."]
+    assert loaded["segments"][0]["translated"] == "车已准备好"
+    with pytest.raises(ValueError):
+        security.validate_path(str(external_input.with_name("private.txt")))
+
+
+@pytest.mark.parametrize("issue_reason", [None, "context_disagreement", "suspected_non_speech_text", "mixed"])
+def test_transcription_output_can_be_loaded_from_external_drive(external_input, monkeypatch, issue_reason):
+    video = external_input.with_suffix(".mp4")
+    video.touch()
+    security.grant_path(video)
+    monkeypatch.setattr(
+        transcribe,
+        "_build_transcribe_config",
+        lambda *args: SimpleNamespace(detect_additional_languages=False),
+    )
+    video_utils = importlib.import_module("subforge.core.utils.video_utils")
+    asr_module = importlib.import_module("subforge.core.asr.transcribe")
+    monkeypatch.setattr(video_utils, "video2audio", lambda *args: True)
+    original_srt = external_input.read_bytes()
+    result = ASRData([ASRDataSeg("New transcription.", 0, 1000)])
+    if issue_reason:
+        result.coverage_issues = [{"start": 10, "end": 14.2, "reason": "context_disagreement" if issue_reason == "mixed" else issue_reason}]
+    if issue_reason == "mixed":
+        result.coverage_issues.append({"start": 20, "end": 21, "reason": "suspected_non_speech_text"})
+    monkeypatch.setattr(asr_module, "transcribe", lambda *args: result)
+    # The input SRT must not already be granted: the transcriber grants its own output.
+    security.clear_granted_paths()
+    security.grant_path(video)
+    task = task_manager.create_task("transcribe")
+    asyncio.run(
+        transcribe._run_transcription(
+            task.id, transcribe.TranscribeRequest(file_path=str(video), model="whisper_cpp")
+        )
+    )
+    completed = task_manager.get_task(task.id)
+    coverage_warning = issue_reason in {"context_disagreement", "mixed"}
+    assert completed.status == ("failed" if coverage_warning else "completed"), completed.error
+    output = completed.result["recovery_file" if coverage_warning else "subtitle_file"]
+    if coverage_warning:
+        assert external_input.read_bytes() == original_srt
+        assert completed.result["coverage_issues"] == result.coverage_issues
+        assert completed.preview_segments[0]["text"] == "New transcription."
+        assert "00:00:10.000 - 00:00:14.200" in completed.error
+        assert output.endswith("_recovery.srt")
+    if issue_reason == "suspected_non_speech_text":
+        assert completed.error is None
+        assert completed.result["coverage_issues"] == result.coverage_issues
+        assert "00:00:10.000 - 00:00:14.200" in completed.result["warning"]
+        assert "可继续翻译" in completed.result["warning"]
+    assert security.validate_path(output).is_file()
+    assert (
+        asyncio.run(subtitles.load_subtitle(output))["segments"][0]["text"] == "New transcription."
+    )
+    # Exercise the handoff with the persisted ASR output, without external API
+    # calls: both complete transcripts and reviewed recovery files are usable.
+    class Translator:
+        def translate_subtitle(self, data):
+            data.segments[0].translated_text = "新的转录。"
+            return data
+
+    monkeypatch.setattr(TranslatorFactory, "create_translator", lambda **kwargs: Translator())
+    translation = task_manager.create_task("subtitle")
+    asyncio.run(subtitle._run_subtitle(
+        translation.id,
+        subtitle.SubtitleRequest(
+            subtitle_file=output, need_optimize=False, need_translate=True, translator="bing",
+        ),
+    ))
+    translated = task_manager.get_task(translation.id)
+    assert translated.status == "completed", translated.error
+    loaded_translation = asyncio.run(subtitles.load_subtitle(translated.result["subtitle_file"]))
+    assert loaded_translation["segments"][0]["text"] == "New transcription."
+    assert loaded_translation["segments"][0]["translated"] == "新的转录"
+    with pytest.raises(ValueError):
+        security.validate_path(str(video.with_name("private.txt")))

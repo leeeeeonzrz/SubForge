@@ -77,3 +77,10 @@ test("late running update is ignored after the same task completed", () => {
   assert.equal(isStaleAfterTerminal("subtitle-1", "running", "subtitle-1"), true);
   assert.equal(isStaleAfterTerminal("subtitle-1", "completed", "subtitle-1"), false);
 });
+
+
+test("revision-only polls cannot fall back to a stale partial file", () => {
+  assert.equal(shouldLoadLegacyPartial({
+    id: "subtitle-1", status: "running", subtitle_file: "partial.srt", preview_revision: 1,
+  }), false);
+});

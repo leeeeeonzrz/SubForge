@@ -5,6 +5,11 @@ from subforge.core.split.boundary import (
     assess_english_boundary,
     normalize_boundaries,
 )
+from subforge.core.split.boundary_registry import (
+    BOUNDARY_SCORE_RULES,
+    BoundaryScoreSeverity,
+    boundary_score_rule,
+)
 
 
 def _cues(texts: list[str], *, speakers: list[str] | None = None) -> list[ASRDataSeg]:
@@ -69,6 +74,61 @@ def test_normalizer_respects_korean_speaker_boundary():
     assert [segment.text for segment in repaired] == ["저는", "그렇게 생각하지 않습니다."]
 
 
+def test_numeric_boundary_registry_has_unique_stable_ids() -> None:
+    assert len({rule.rule_id for rule in BOUNDARY_SCORE_RULES}) == len(BOUNDARY_SCORE_RULES)
+    assert all(boundary_score_rule(rule.rule_id) is rule for rule in BOUNDARY_SCORE_RULES)
+    assert all(rule.explanation_template for rule in BOUNDARY_SCORE_RULES)
+    assert all(rule.source_languages == ("en",) for rule in BOUNDARY_SCORE_RULES)
+    assert (
+        boundary_score_rule("split.boundary.english.numeric.calendar_month_year").severity
+        == BoundaryScoreSeverity.ERROR
+    )
+    assert (
+        boundary_score_rule(
+            "split.boundary.english.grammar.attributive_or_comparative_modifier"
+        ).severity
+        == BoundaryScoreSeverity.WARNING
+    )
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "rule_id", "weight"),
+    [
+        (
+            "The meeting is in March",
+            "2026 before the opening.",
+            "split.boundary.english.numeric.calendar_month_year",
+            42,
+        ),
+        (
+            "The tunnel is between five",
+            "and six kilometres long.",
+            "split.boundary.english.numeric.range_conjunction",
+            38,
+        ),
+        (
+            "The wheel is about",
+            "500 millimetres wide.",
+            "split.boundary.english.numeric.approximate_magnitude",
+            38,
+        ),
+    ],
+)
+def test_numeric_boundary_rules_emit_observable_legacy_equivalent_contributions(
+    left: str,
+    right: str,
+    rule_id: str,
+    weight: int,
+) -> None:
+    assessment = assess_english_boundary(left, right)
+    contribution = next(item for item in assessment.contributions if item.rule_id == rule_id)
+
+    assert contribution.weight == weight
+    assert contribution.reason in assessment.reasons
+    assert assessment.registered_risk >= weight
+    assert assessment.unregistered_risk == assessment.risk - assessment.registered_risk
+
+
 def test_assessment_rejects_user_reported_dangling_boundaries():
     boundaries = [
         ("potential solutions because", "it can deliver electricity"),
@@ -118,6 +178,126 @@ def test_assessment_rejects_real_spoken_english_dependency_boundaries():
     assert all(assess_english_boundary(left, right).unstable for left, right in boundaries)
 
 
+@pytest.mark.parametrize(
+    ("left", "right", "reason"),
+    [
+        (
+            "The additional runway at Gatwick would have cost",
+            "less, but the facility handles fewer flights.",
+            "scalar predicate separated from its comparative complement",
+        ),
+        (
+            "because we're in for some turbulent",
+            "British politics.",
+            "determiner and adjective separated from their head noun",
+        ),
+        (
+            "That's up from 480,000 flights and 84.5 million passengers",
+            "today.",
+            "sentence-final temporal adverb separated from its clause",
+        ),
+    ],
+)
+def test_assessment_catches_airport_sample_dependencies(left, right, reason):
+    assessment = assess_english_boundary(left, right)
+
+    assert assessment.unstable
+    assert reason in assessment.reasons
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (
+            "the sphere could move from a one-off megaproject to a truly",
+            "global network of venues.",
+        ),
+        ("This is a very", "good car."),
+        ("That was an exceptionally", "difficult decision."),
+    ],
+)
+def test_assessment_keeps_attributive_degree_modifier_with_its_head(left, right):
+    assessment = assess_english_boundary(left, right)
+
+    assert assessment.unstable
+    assert "determiner and degree modifier separated from their head noun" in assessment.reasons
+
+
+def test_normalizer_repairs_attributive_degree_modifier_boundary_without_word_loss():
+    source = [
+        "In other words, the sphere could move from a one-off or even two-off megaproject to a truly",
+        "global network of venues.",
+        "That would change the economics.",
+    ]
+
+    repaired = normalize_boundaries(_cues(source))
+
+    assert " ".join(segment.text for segment in repaired).split() == " ".join(source).split()
+    assert "a truly | global network" not in " | ".join(segment.text for segment in repaired)
+    assert all(len(segment.text.split()) <= 22 for segment in repaired)
+
+
+def test_normalizer_repairs_airport_sample_dependencies_across_label_glitches():
+    cues = _cues(
+        [
+            "The additional runway at Gatwick would have cost",
+            "less, but the facility handles fewer flights.",
+            "because we're in for some turbulent",
+            "British politics. Please return to your seats.",
+        ],
+        speakers=["S1", "S1", "S3", "S1"],
+    )
+
+    repaired = normalize_boundaries(cues)
+    combined = " | ".join(segment.text for segment in repaired)
+
+    assert "cost | less" not in combined
+    assert "turbulent | British" not in combined
+    assert "cost less" in combined
+    assert "turbulent British politics" in combined
+
+
+def test_assessment_accepts_complete_scalar_complement_before_contrast():
+    assessment = assess_english_boundary(
+        "The additional runway at Gatwick would have cost less,",
+        "but the facility handles fewer flights.",
+    )
+
+    assert not assessment.unstable
+
+
+def test_assessment_does_not_treat_time_noun_as_dangling_adjective():
+    assessment = assess_english_boundary(
+        "That's going through a consultation period at the moment",
+        "and it's hoped it'll become final policy.",
+    )
+
+    assert "determiner and adjective separated from their head noun" not in assessment.reasons
+
+
+def test_normalizer_attaches_isolated_trailing_today_across_label_glitch():
+    cues = _cues(
+        [
+            "That's up from 480,000 flights and 84.5 million passengers",
+            "today.",
+            "The idea starts here.",
+        ],
+        speakers=["S1", "S3", "S1"],
+    )
+    shift = 3_000 - (cues[1].start_time - cues[0].end_time)
+    for cue in cues[1:]:
+        cue.start_time += shift
+        cue.end_time += shift
+        for word in cue.words:
+            word.start_time += shift
+            word.end_time += shift
+
+    repaired = normalize_boundaries(cues)
+
+    assert repaired[0].text.endswith("passengers today.")
+    assert repaired[1].text == "The idea starts here."
+
+
 def test_assessment_keeps_rev_matching_technical_term_together():
     assessment = assess_english_boundary(
         "which is their fancy way of saying rev",
@@ -126,6 +306,77 @@ def test_assessment_keeps_rev_matching_technical_term_together():
 
     assert assessment.unstable
     assert "split lexical unit 'rev matching'" in assessment.reasons
+
+
+def test_assessment_keeps_power_steering_technical_term_together():
+    assessment = assess_english_boundary(
+        "but look at this under the Honda badge power",
+        "steering this was a big deal in 1982",
+    )
+
+    assert assessment.unstable
+    assert "split lexical unit 'power steering'" in assessment.reasons
+
+
+def test_assessment_keeps_calendar_month_with_its_year():
+    assessment = assess_english_boundary(
+        "projects cancelled in the year leading up to January",
+        "2026, basically we're now looking at a mixed-use world.",
+    )
+
+    assert assessment.unstable
+    assert "calendar month separated from its year" in assessment.reasons
+
+
+def test_assessment_keeps_irregular_attributive_adjective_with_head_noun():
+    assessment = assess_english_boundary(
+        "the buildings are responding to a very different",
+        "world generating very different demands.",
+    )
+
+    assert assessment.unstable
+    assert "dangling attributive 'different'" in assessment.reasons
+
+
+def test_assessment_moves_sentence_adverb_to_its_following_clause():
+    assessment = assess_english_boundary(
+        "projects were cancelled by January 2026, basically",
+        "we're now looking at a mixed-use world.",
+    )
+
+    assert assessment.unstable
+    assert "sentence adverb separated from its finite predicate" in assessment.reasons
+
+
+def test_assessment_keeps_auxiliary_adverb_with_progressive_predicate():
+    assessment = assess_english_boundary(
+        "projects were cancelled by January 2026, basically we're now",
+        "looking at a mixed-use world.",
+    )
+
+    assert assessment.unstable
+    assert "auxiliary and sentence adverb separated from their predicate" in assessment.reasons
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        ("projects were cancelled in the year leading", "up to January 2026"),
+        ("projects were cancelled in the year leading up", "to January 2026"),
+    ],
+)
+def test_assessment_keeps_leading_up_to_phrase_together(left, right):
+    assert assess_english_boundary(left, right).unstable
+
+
+def test_assessment_keeps_year_with_its_defining_participial_phrase():
+    assessment = assess_english_boundary(
+        "18 projects were cancelled in the city in the year",
+        "leading up to January 2026.",
+    )
+
+    assert assessment.unstable
+    assert "time frame separated from its defining participial phrase" in assessment.reasons
 
 
 def test_assessment_keeps_separated_take_away_construction_together():
@@ -315,6 +566,77 @@ def test_assessment_keeps_ordinal_gear_term_together():
     ("left", "right", "reason"),
     [
         (
+            "Hey everyone, welcome back to Topher Drives where today you join",
+            "me in Pebble Beach, California for the first drive.",
+            "transitive predicate separated from its pronoun object",
+        ),
+        (
+            "to complement the brighter",
+            "color on the driver's side.",
+            "attributive or comparative modifier separated from its head",
+        ),
+        (
+            "because that small cocooned",
+            "cabin is the highlight color.",
+            "dangling modifier 'cocooned'",
+        ),
+        (
+            "it's not like a GT3 RS where you have a huge",
+            "spoiler on the back.",
+            "dangling modifier 'huge'",
+        ),
+        (
+            "which is a three-legged",
+            "chassis with a 1.5-liter engine.",
+            "hyphenated attributive 'three-legged' separated from its noun",
+        ),
+        (
+            "I have some comfort knowing that my home state of Michigan",
+            "is represented on the license plate.",
+            "proper-name subject separated from its predicate",
+        ),
+        (
+            "because I always say that the 8-speed ZF torque converter gearbox",
+            "is the benchmark.",
+            "trailing noun subject separated from its finite predicate",
+        ),
+        (
+            "I don't know that I'm missing anything",
+            "that's Supersports specific in this interior.",
+            "relative clause 'that's' separated from its antecedent",
+        ),
+    ],
+)
+def test_assessment_catches_bentley_sample_dependencies(left, right, reason):
+    assessment = assess_english_boundary(left, right)
+
+    assert assessment.unstable
+    assert reason in assessment.reasons
+
+
+def test_normalizer_keeps_bentley_destination_together():
+    source = [
+        "Hey everyone, welcome back to Topher Drives where today you join",
+        (
+            "me in Pebble Beach, California for some ultra-exclusive first street "
+            "driving impressions on the new 2027 Bentley Supersports."
+        ),
+        "I'm here with John, the product communications manager for Bentley.",
+    ]
+
+    repaired = normalize_boundaries(_cues(source))
+    combined = " | ".join(segment.text for segment in repaired)
+
+    assert "join | me" not in combined
+    assert "in | Pebble Beach" not in combined
+    assert "Pebble Beach, California | for" in combined
+    assert all(len(segment.text.split()) <= 22 for segment in repaired)
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "reason"),
+    [
+        (
             "predicted the rise of a figure like",
             "Donald Trump that would use populist messaging",
             "comparative marker separated from its example",
@@ -498,9 +820,20 @@ def test_assessment_rejects_degree_complement_split_from_predicate():
     boundaries = [
         ("And maybe part of the reason blue zones resonate", "so deeply in America"),
         ("And loneliness and isolation became", "so widespread that it was an epidemic"),
+        ("but they're both far", "smaller in terms of the space actually used"),
     ]
 
     assert all(assess_english_boundary(left, right).unstable for left, right in boundaries)
+
+
+def test_assessment_rejects_postpositive_participle_modifier_split_from_noun():
+    assessment = assess_english_boundary(
+        "workers had to climb up huge ladders",
+        "mounted on wheels to reach the upper sections during assembly.",
+    )
+
+    assert assessment.unstable
+    assert "postpositive participial modifier separated from its noun" in assessment.reasons
 
 
 def test_assessment_rejects_cross_language_sensitive_vehicle_boundaries():
@@ -705,6 +1038,86 @@ def test_normalizer_moves_opinion_marker_and_model_year_to_next_cue():
     assert all(not cue.text.endswith("a 2026") for cue in repaired)
 
 
+def test_normalizer_keeps_calendar_month_and_year_in_one_cue():
+    cues = _cues(
+        [
+            "and with 18 condo projects cancelled in the city in the year leading up to January",
+            "2026, basically we're now looking at a mixed-use world.",
+        ]
+    )
+
+    repaired = normalize_boundaries(cues)
+
+    assert any("January 2026" in cue.text for cue in repaired)
+    assert all(not cue.text.endswith("January") for cue in repaired)
+    assert all(not cue.text.startswith("2026") for cue in repaired)
+
+
+def test_normalizer_keeps_attributive_head_and_rehomes_sentence_adverb():
+    cues = _cues(
+        [
+            "the buildings are responding to a very different",
+            "world generating very different demands.",
+            "projects were cancelled by January 2026, basically",
+            "we're now looking at a mixed-use world.",
+        ]
+    )
+
+    repaired = normalize_boundaries(cues)
+
+    assert any("different world" in cue.text for cue in repaired)
+    assert all(not cue.text.rstrip(" ,").endswith("basically") for cue in repaired)
+    assert any("basically we're" in cue.text for cue in repaired)
+
+
+def test_normalizer_keeps_long_leading_up_to_date_clause_readable():
+    cues = _cues(
+        [
+            "So, with demand for offices having slipped dramatically,",
+            "and with 18 condo projects cancelled in the city in the year leading",
+            "up to January 2026, basically we're now looking at a mixed-use world.",
+        ]
+    )
+
+    repaired = normalize_boundaries(cues)
+
+    assert all(
+        not cue.text.rstrip(" ,").endswith(("leading", "leading up", "basically"))
+        for cue in repaired
+    )
+    assert all(not cue.text.startswith(("up to", "to January", "2026")) for cue in repaired)
+    assert any("leading up to January 2026" in cue.text for cue in repaired)
+
+
+def test_normalizer_keeps_full_year_leading_up_to_frame_together():
+    cues = _cues(
+        [
+            "and with 18 condo projects cancelled in the city in the year",
+            "leading up to January 2026, basically we're now looking at a mixed-use world.",
+        ]
+    )
+
+    repaired = normalize_boundaries(cues)
+
+    assert all(not cue.text.rstrip(" ,").endswith("in the year") for cue in repaired)
+    assert any("in the year leading up to January 2026" in cue.text for cue in repaired)
+
+
+def test_normalizer_moves_auxiliary_adverb_to_progressive_predicate():
+    cues = _cues(
+        [
+            "and with 18 condo projects cancelled in the city in the year leading up to "
+            "January 2026, basically we're now",
+            "looking at a mixed-use world.",
+        ]
+    )
+
+    repaired = normalize_boundaries(cues)
+
+    assert all(not cue.text.rstrip(" ,").endswith("we're now") for cue in repaired)
+    assert any("we're now looking" in cue.text for cue in repaired)
+
+
 def test_normalizer_repairs_consecutive_degree_and_fixed_phrase_boundaries():
     cues = _cues(
         [
@@ -809,6 +1222,91 @@ def test_normalizer_repairs_a_short_diarization_flip_inside_a_sentence():
 
     assert repaired[0].text.endswith("really good jobs.")
     assert repaired[1].text.startswith("There's thousands")
+
+
+def test_normalizer_repairs_modifier_noun_across_tiny_diarization_flip():
+    cues = _cues(
+        ["It's a critical", "aspect of the design."],
+        speakers=["S1", "S2"],
+    )
+
+    repaired = normalize_boundaries(cues)
+
+    assert len(repaired) == 1
+    assert repaired[0].text == "It's a critical aspect of the design."
+
+
+def test_normalizer_merges_measurement_with_comparative_relation():
+    cues = _cues(
+        ["which is around 400 metres", "closer to sea level than Addis Ababa."],
+    )
+
+    repaired = normalize_boundaries(cues)
+
+    assert len(repaired) == 1
+    assert "400 metres closer to sea level" in repaired[0].text
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "reason"),
+    [
+        (
+            "established hubs welcoming",
+            "20 to 30 million passengers each year",
+            "transitive participle separated from its quantified object",
+        ),
+        (
+            "it needs to substantially",
+            "redevelop its existing airports",
+            "infinitive adverb separated from its predicate",
+        ),
+        (
+            "the hub welcomes more than 20 million passengers",
+            "each year",
+            "frequency phrase separated from its quantified statement",
+        ),
+        (
+            "Which brings us to Bishoftu. About 35 kilometres away,",
+            "the new site is less densely populated",
+            "distance modifier separated from its location noun",
+        ),
+        (
+            "airline capacity rose by 6.7%, which is around",
+            "24 million seats",
+            "approximate magnitude separated from its numeric value",
+        ),
+        (
+            "those terminals that will hopefully",
+            "process millions of passengers",
+            "modal adverb separated from its predicate",
+        ),
+        (
+            "but for a plane hurtling down the runway,",
+            "a lack of density makes takeoff harder",
+            "contrastive prepositional frame separated from its main clause",
+        ),
+    ],
+)
+def test_assessment_catches_quantified_and_location_dependencies(left, right, reason):
+    assert reason in assess_english_boundary(left, right).reasons
+
+
+def test_normalizer_repairs_modifier_noun_across_363ms_diarization_flip():
+    cues = _cues(
+        ["those stats are on a serious", "upward trajectory."],
+        speakers=["S1", "S2"],
+    )
+    shift = 343
+    cues[1].start_time += shift
+    cues[1].end_time += shift
+    for word in cues[1].words:
+        word.start_time += shift
+        word.end_time += shift
+
+    repaired = normalize_boundaries(cues)
+
+    assert len(repaired) == 1
+    assert "serious upward trajectory" in repaired[0].text
 
 
 def test_normalizer_repairs_a_strong_dependency_across_a_320ms_speaker_flip():
@@ -999,6 +1497,23 @@ def test_assessment_keeps_translation_sensitive_lexical_units_together(
 @pytest.mark.parametrize(
     ("left", "right", "reason"),
     [
+        ("It is nothing to write home", "about, but it is decent.", "home about"),
+        ("It is nothing to write", "home about, but it is decent.", "write home"),
+        ("Test the six-speaker sound", "system in this car.", "sound system"),
+        ("None of the bass", "systems are exceptional.", "bass systems"),
+        ("They can tune it and put", "power wherever it is needed.", "open complement after 'put'"),
+    ],
+)
+def test_assessment_keeps_fixed_idiom_and_open_put_complement_together(left, right, reason):
+    assessment = assess_english_boundary(left, right)
+
+    assert assessment.unstable
+    assert any(reason in item for item in assessment.reasons)
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "reason"),
+    [
         (
             "He contradicts himself as though there's no",
             "record of his previous words.",
@@ -1106,6 +1621,61 @@ def test_assessment_keeps_coordinated_complement_subject_with_have_predicate():
     assert "coordinated subject separated from its predicate" in assessment.reasons
 
 
+@pytest.mark.parametrize(
+    ("left", "right", "reason"),
+    [
+        ("Back above", "ground, the route features guideways.", "above ground"),
+        (
+            "a poured concrete deck that the rail tracks",
+            "then sit on top of",
+            "trailing noun subject separated from its finite predicate",
+        ),
+        ("proposed by a New York", "consulting firm in 1910", "proper name"),
+        (
+            "The window was eight years. Initially,",
+            "Cost projections sat around $6.8 billion.",
+            "discourse frame separated from its following clause",
+        ),
+        (
+            "It became more expensive. So, as you'll learn,",
+            "the old route was still cheaper.",
+            "discourse frame separated from its following clause",
+        ),
+        (
+            "Officials expected further increases. In 2018,",
+            "Doug Ford became premier.",
+            "discourse frame separated from its following clause",
+        ),
+        (
+            "projects that captured my imagination over the last",
+            "10 years of this journey",
+            "incomplete multi-word phrase",
+        ),
+        ("I put a lot of my heart", "and soul into this book", "heart and"),
+        (
+            "I apply it in my personal life",
+            "outside of these videos",
+            "dependent phrase beginning with 'outside'",
+        ),
+        (
+            "It takes all of the scattered information",
+            "built up across months and years",
+            "postpositive participial modifier separated from its noun",
+        ),
+        (
+            "I do not know how lawmakers",
+            "and construction firms can modernise infrastructure",
+            "coordinated noun subject split before its shared predicate",
+        ),
+    ],
+)
+def test_toronto_triplet_dependency_boundaries_are_unstable(left, right, reason):
+    assessment = assess_english_boundary(left, right)
+
+    assert assessment.unstable
+    assert any(reason in item for item in assessment.reasons)
+
+
 def test_assessment_keeps_case_studies_compound_together():
     assessment = assess_english_boundary(
         "And he wrote about these kind of case",
@@ -1186,6 +1756,16 @@ def test_assessment_keeps_short_noun_subject_with_predicate():
 
     assert assessment.unstable
     assert "short noun subject separated from its predicate" in assessment.reasons
+
+
+def test_assessment_keeps_connective_clause_subject_with_copular_predicate():
+    assessment = assess_english_boundary(
+        "Obviously we have four-corner air suspension, so ride quality",
+        "is good. The road here is smooth.",
+    )
+
+    assert assessment.unstable
+    assert "clause-final subject separated from its finite predicate" in assessment.reasons
 
 
 @pytest.mark.parametrize(
@@ -1344,9 +1924,7 @@ def test_assessment_keeps_discourse_and_reporting_units_together(left, right, re
         ),
     ],
 )
-def test_assessment_keeps_additional_translation_sensitive_units_together(
-    left, right, reason
-):
+def test_assessment_keeps_additional_translation_sensitive_units_together(left, right, reason):
     assessment = assess_english_boundary(left, right)
 
     assert assessment.unstable
@@ -1466,6 +2044,221 @@ def test_assessment_catches_general_open_completions(left, right, reason):
 
     assert assessment.unstable
     assert reason in assessment.reasons
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "reason"),
+    [
+        (
+            "But that's the beauty of the collection. You never",
+            "know what you're going to find next.",
+            "subject and adverb separated from its predicate",
+        ),
+        (
+            "Next is another car that's probably never going",
+            "anywhere after this season.",
+            "progressive predicate separated from its complement",
+        ),
+        (
+            "I need a better solution for actually",
+            "holding all of these keys.",
+            "adverb separated from its gerund",
+        ),
+        (
+            "Next up is another car that's",
+            "probably never going anywhere.",
+            "subject and auxiliary stranded at 'that's'",
+        ),
+        (
+            "I have never had any previous",
+            "owners contact me.",
+            "dangling attributive 'previous'",
+        ),
+        (
+            "I have a plate that says",
+            "Big Sexy on the front.",
+            "reporting predicate separated from its quoted object",
+        ),
+        (
+            "I",
+            "Think the biggest update is the broken power top.",
+            "standalone subject separated from its predicate",
+        ),
+    ],
+)
+def test_assessment_catches_predicate_dependencies_after_adverbs(left, right, reason):
+    assessment = assess_english_boundary(left, right)
+
+    assert assessment.unstable
+    assert reason in assessment.reasons
+
+
+def test_assessment_keeps_completed_progressive_before_new_sentence():
+    assessment = assess_english_boundary(
+        "I've been driving",
+        "And the car remains reliable.",
+    )
+
+    assert "progressive predicate separated from its complement" not in assessment.reasons
+
+
+def test_assessment_does_not_treat_sentence_initial_just_as_a_name():
+    assessment = assess_english_boundary(
+        "I went to get something for Emily",
+        "Just so I could drive the truck.",
+    )
+
+    assert "proper name split between adjacent tokens" not in assessment.reasons
+
+
+def test_normalizer_rejoins_sentence_suffix_across_short_speaker_flip():
+    left_words = [
+        ASRWord(token, index * 120, index * 120 + 100, speaker_id="S1")
+        for index, token in enumerate("But that's the beauty of the collection. You never".split())
+    ]
+    right_words = [
+        ASRWord(
+            token,
+            left_words[-1].end_time + 20 + index * 120,
+            left_words[-1].end_time + 120 + index * 120,
+            speaker_id="S2",
+        )
+        for index, token in enumerate("know what you're going to find next.".split())
+    ]
+    segments = [
+        ASRDataSeg(
+            " ".join(word.text for word in left_words),
+            left_words[0].start_time,
+            left_words[-1].end_time,
+            speaker_id="S1",
+            words=left_words,
+            timestamp_granularity="sentence",
+        ),
+        ASRDataSeg(
+            " ".join(word.text for word in right_words),
+            right_words[0].start_time,
+            right_words[-1].end_time,
+            speaker_id="S2",
+            words=right_words,
+            timestamp_granularity="sentence",
+        ),
+    ]
+
+    normalized = normalize_boundaries(segments)
+
+    assert [segment.text for segment in normalized] == [
+        "But that's the beauty of the collection.",
+        "You never know what you're going to find next.",
+    ]
+    assert [segment.speaker_id for segment in normalized] == ["S1", "S1"]
+
+
+def test_normalizer_moves_progressive_relative_clause_to_readable_cue():
+    left_tokens = "Next up is another car that's probably never going".split()
+    right_tokens = (
+        "anywhere and also It also has a very special first video attached to it,".split()
+    )
+    left_words = [
+        ASRWord(token, index * 120, index * 120 + 100, speaker_id="S1")
+        for index, token in enumerate(left_tokens)
+    ]
+    right_words = [
+        ASRWord(
+            token,
+            left_words[-1].end_time + 60 + index * 120,
+            left_words[-1].end_time + 160 + index * 120,
+            speaker_id="S1",
+        )
+        for index, token in enumerate(right_tokens)
+    ]
+    segments = [
+        ASRDataSeg(
+            " ".join(left_tokens),
+            left_words[0].start_time,
+            left_words[-1].end_time,
+            speaker_id="S1",
+            words=left_words,
+            timestamp_granularity="sentence",
+        ),
+        ASRDataSeg(
+            " ".join(right_tokens),
+            right_words[0].start_time,
+            right_words[-1].end_time,
+            speaker_id="S1",
+            words=right_words,
+            timestamp_granularity="sentence",
+        ),
+    ]
+
+    normalized = normalize_boundaries(segments)
+
+    assert [segment.text for segment in normalized] == [
+        "Next up is another car",
+        "that's probably never going anywhere and also It also has a very special first "
+        "video attached to it,",
+    ]
+
+
+def test_normalizer_preserves_reply_after_cross_speaker_question_completion():
+    left_words = [
+        ASRWord("do", 0, 80, speaker_id="S1"),
+        ASRWord("you", 100, 240, speaker_id="S1"),
+        ASRWord("still", 260, 360, speaker_id="S1"),
+    ]
+    right_words = [
+        ASRWord("love", 380, 460, speaker_id="S2"),
+        ASRWord("her", 480, 560, speaker_id="S2"),
+        ASRWord("I", 600, 720, speaker_id="S2"),
+        ASRWord("love", 740, 900, speaker_id="S2"),
+        ASRWord("this", 920, 1080, speaker_id="S2"),
+        ASRWord("car.", 1100, 1500, speaker_id="S2"),
+    ]
+    segments = [
+        ASRDataSeg(
+            "do you still",
+            0,
+            360,
+            speaker_id="S1",
+            words=left_words,
+            timestamp_granularity="sentence",
+        ),
+        ASRDataSeg(
+            "love her I love this car.",
+            380,
+            1500,
+            speaker_id="S2",
+            words=right_words,
+            timestamp_granularity="sentence",
+        ),
+    ]
+
+    normalized = normalize_boundaries(segments)
+
+    assert [(segment.speaker_id, segment.text) for segment in normalized] == [
+        ("S1", "do you still love her"),
+        ("S2", "I love this car."),
+    ]
+
+
+def test_assessment_rejects_capitalized_standalone_of_phrase():
+    assessment = assess_english_boundary(
+        "that you guys are seeing from the thumbnail.",
+        "Of this video of driving every car in my collection.",
+    )
+
+    assert assessment.unstable
+    assert "standalone 'of' phrase separated from its governing noun" in assessment.reasons
+
+
+def test_normalizer_returns_noun_before_short_cross_speaker_reply():
+    normalized = normalize_boundaries(_cues(["A little", "car, yeah."], speakers=["S2", "S1"]))
+
+    assert [(segment.speaker_id, segment.text) for segment in normalized] == [
+        ("S2", "A little car,"),
+        ("S1", "yeah."),
+    ]
+
+    assert normalize_boundaries(normalized) == normalized
 
 
 def test_normalizer_repairs_single_word_completion_across_short_speaker_flip():
@@ -1589,6 +2382,51 @@ def test_assessment_accepts_this_as_a_complete_demonstrative_object():
 
 
 @pytest.mark.parametrize(
+    ("left", "right", "reason"),
+    [
+        (
+            "This is such a luxury feature that you would never",
+            "get in a modern car and see it.",
+            "negative auxiliary is separated from its complement",
+        ),
+        (
+            "Once you learn the controls, you would really have no",
+            "problem driving it.",
+            "negative auxiliary is separated from its complement",
+        ),
+        (
+            "Once you learn the controls, you'd",
+            "really have no problem driving it.",
+            "subject and auxiliary stranded at 'you'd'",
+        ),
+    ],
+)
+def test_assessment_rejects_negative_auxiliary_split_from_complement(left, right, reason):
+    assessment = assess_english_boundary(left, right)
+
+    assert assessment.unstable is True
+    assert reason in assessment.reasons
+
+
+def test_assessment_allows_complete_visibility_phrase_before_reason_clause():
+    assessment = assess_english_boundary(
+        "Cars in the 1980s were easy to see out of",
+        "because we did not have thick pillars.",
+    )
+
+    assert assessment.unstable is False
+
+
+def test_assessment_treats_steering_as_a_noun_before_new_interjection():
+    assessment = assess_english_boundary(
+        "You would have no problem with the steering",
+        "My goodness, it is beautifully light.",
+    )
+
+    assert assessment.unstable is False
+
+
+@pytest.mark.parametrize(
     ("left", "right"),
     [
         ("The concrete core is quite small,", "but it carries the full load."),
@@ -1608,12 +2446,32 @@ def test_assessment_does_not_treat_complete_adjectives_or_er_nouns_as_dangling(
     [
         ("I think it's...", "actually more practical.", "subject and auxiliary stranded at 'it's'"),
         ("They haven't", "changed the design.", "incomplete predicate 'haven't'"),
-        ("It is less expensive than", "it first appears.", "comparative clause separated after 'than'"),
-        ("The system was defined", "by the earlier standard.", "participle separated from its complement"),
+        (
+            "It is less expensive than",
+            "it first appears.",
+            "comparative clause separated after 'than'",
+        ),
+        (
+            "The system was defined",
+            "by the earlier standard.",
+            "participle separated from its complement",
+        ),
         ("We are telling", "other teams what changed.", "participle separated from its complement"),
-        ("The package has 6", "speakers in total.", "numeric value separated from its unit or noun"),
-        ("It provides a slightly lower", "center of gravity.", "attributive or comparative modifier separated from its head"),
-        ("The facade is a sea of glass", "and metal.", "coordinated noun phrase split at conjunction"),
+        (
+            "The package has 6",
+            "speakers in total.",
+            "numeric value separated from its unit or noun",
+        ),
+        (
+            "It provides a slightly lower",
+            "center of gravity.",
+            "attributive or comparative modifier separated from its head",
+        ),
+        (
+            "The facade is a sea of glass",
+            "and metal.",
+            "coordinated noun phrase split at conjunction",
+        ),
         ("The price goes all the way", "up to $50,000.", "incomplete multi-word phrase"),
         ("It is still", "possible to include a spare.", "dangling modifier 'still'"),
         (
@@ -1628,6 +2486,77 @@ def test_assessment_catches_general_lexical_dependencies(left, right, reason):
 
     assert assessment.unstable
     assert reason in assessment.reasons
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "reason"),
+    [
+        (
+            "but we are going to start with the 94",
+            "F-150. One of my favorite keys.",
+            "model year separated from its vehicle name",
+        ),
+        (
+            "I'd offer it to the museum. You guys",
+            "saw me drive their cars earlier this year.",
+            "sentence-final subject belongs to the following predicate",
+        ),
+        (
+            "I've tried to arrange this like",
+            "my garage in Grand Theft Auto 5.",
+            "comparison frame separated from its object",
+        ),
+        (
+            "where else will I find a turbocharged",
+            "Cobalt SS with low mileage?",
+            "powertrain modifier separated from its vehicle name",
+        ),
+        (
+            "man did I think",
+            "I was the coolest person in the world.",
+            "emphatic inversion separated from its complement",
+        ),
+        (
+            "They had that really cool,",
+            "like, LFA-style one that slid back and forth.",
+            "filler separated from the demonstrative head noun",
+        ),
+        (
+            "I was driving it pretty steadily, actually,",
+            "Until the power top stopped working.",
+            "dependent adverbial clause beginning with 'until'",
+        ),
+        (
+            "The video has not gone live yet",
+            "at the time of this recording.",
+            "dependent phrase beginning with 'at'",
+        ),
+    ],
+)
+def test_assessment_catches_latest_full_run_boundaries(left, right, reason):
+    assessment = assess_english_boundary(left, right)
+
+    assert assessment.unstable
+    assert reason in assessment.reasons
+
+
+def test_normalizer_repairs_latest_full_run_boundaries_without_losing_words():
+    source = [
+        "but we are going to start with the 94",
+        "F-150. One of my favorite keys.",
+        "I'd offer it to the museum. You guys",
+        "saw me drive their cars earlier this year.",
+        "They had that really cool,",
+        "like, LFA-style one that slid back and forth.",
+    ]
+
+    repaired = normalize_boundaries(_cues(source))
+
+    assert " ".join(segment.text for segment in repaired).split() == " ".join(source).split()
+    assert all(
+        not assess_english_boundary(left.text, right.text).unstable
+        for left, right in zip(repaired, repaired[1:])
+    )
 
 
 def _japanese_cues(texts: list[str]) -> list[ASRDataSeg]:
@@ -1672,7 +2601,10 @@ def test_normalizer_repairs_japanese_katakana_and_particle_boundaries():
 
     assert "".join(segment.text for segment in repaired) == "".join(source)
     assert all("トンネ" not in segment.text[-3:] for segment in repaired[:-1])
-    assert all(not segment.text.startswith(("が", "を", "は", "に", "へ", "で", "の")) for segment in repaired[1:])
+    assert all(
+        not segment.text.startswith(("が", "を", "は", "に", "へ", "で", "の"))
+        for segment in repaired[1:]
+    )
     assert all(not segment.text.endswith("のですね") for segment in repaired[:-1])
 
 
@@ -1682,9 +2614,7 @@ def test_normalizer_merges_short_japanese_filler_with_following_phrase():
         hard_max_cjk_chars=25,
     )
 
-    assert [segment.text for segment in repaired] == [
-        "こちらのですね掘ったトンネルにどんどん"
-    ]
+    assert [segment.text for segment in repaired] == ["こちらのですね掘ったトンネルにどんどん"]
 
 
 def test_normalizer_does_not_split_japanese_auxiliary_ending():
@@ -1693,9 +2623,7 @@ def test_normalizer_does_not_split_japanese_auxiliary_ending():
         hard_max_cjk_chars=25,
     )
 
-    assert [segment.text for segment in repaired] == [
-        "こちらのですね掘ったトンネルに"
-    ]
+    assert [segment.text for segment in repaired] == ["こちらのですね掘ったトンネルに"]
 
 
 def test_normalizer_keeps_japanese_verb_stem_with_inflection():
@@ -1719,9 +2647,7 @@ def test_normalizer_merges_japanese_dangling_coordination():
         hard_max_cjk_chars=25,
     )
 
-    assert [segment.text for segment in repaired] == [
-        "トンネルの土の圧力や水の圧力を"
-    ]
+    assert [segment.text for segment in repaired] == ["トンネルの土の圧力や水の圧力を"]
 
 
 def test_normalizer_keeps_small_tsu_with_japanese_inflection():
@@ -1742,9 +2668,7 @@ def test_normalizer_merges_dangling_japanese_genitive_modifier():
         hard_max_cjk_chars=25,
     )
 
-    assert [segment.text for segment in repaired] == [
-        "トンネルのですね土の圧力や水の圧力を"
-    ]
+    assert [segment.text for segment in repaired] == ["トンネルのですね土の圧力や水の圧力を"]
 
 
 def test_normalizer_allows_small_overflow_for_indivisible_japanese_phrase():
@@ -1753,9 +2677,7 @@ def test_normalizer_allows_small_overflow_for_indivisible_japanese_phrase():
         hard_max_cjk_chars=16,
     )
 
-    assert [segment.text for segment in repaired] == [
-        "トンネルのですね土の圧力や水の圧力を"
-    ]
+    assert [segment.text for segment in repaired] == ["トンネルのですね土の圧力や水の圧力を"]
     assert len(repaired[0].text) == 18
 
 
@@ -1777,9 +2699,7 @@ def test_normalizer_keeps_japanese_attributive_phrase_with_noun():
         hard_max_cjk_chars=25,
     )
 
-    assert [segment.text for segment in repaired] == [
-        "こちらのですね掘ったトンネルにどんどん"
-    ]
+    assert [segment.text for segment in repaired] == ["こちらのですね掘ったトンネルにどんどん"]
 
 
 def test_normalizer_keeps_japanese_degree_adverb_with_adjective():
@@ -1788,9 +2708,7 @@ def test_normalizer_keeps_japanese_degree_adverb_with_adjective():
         hard_max_cjk_chars=25,
     )
 
-    assert "".join(segment.text for segment in repaired) == (
-        "それが非常に難しい工事の中身でした"
-    )
+    assert "".join(segment.text for segment in repaired) == ("それが非常に難しい工事の中身でした")
     assert all(
         not (left.text.endswith("難し") and right.text.startswith("い"))
         for left, right in zip(repaired, repaired[1:])
@@ -1803,9 +2721,7 @@ def test_normalizer_merges_short_japanese_topic_with_its_predicate():
         hard_max_cjk_chars=16,
     )
 
-    assert [segment.text for segment in repaired] == [
-        "それが非常に難しい工事の中身でした"
-    ]
+    assert [segment.text for segment in repaired] == ["それが非常に難しい工事の中身でした"]
 
 
 def test_normalizer_does_not_split_japanese_i_adjective_ending():
@@ -1814,10 +2730,70 @@ def test_normalizer_does_not_split_japanese_i_adjective_ending():
         hard_max_cjk_chars=25,
     )
 
-    assert "".join(segment.text for segment in repaired) == (
-        "それが非常に難しい工事の中身でした"
-    )
+    assert "".join(segment.text for segment in repaired) == ("それが非常に難しい工事の中身でした")
     assert all(
         not (left.text.endswith("難し") and right.text.startswith("い"))
         for left, right in zip(repaired, repaired[1:])
     )
+
+
+def test_normalizer_uses_one_stable_cue_to_repair_short_number_unit_tail():
+    cues = _cues(
+        [
+            "Where else can I find a turbocharged GS 400 that only has 57,252",
+            "miles on it?",
+            "Let's fire it up and go drive it.",
+        ]
+    )
+    cursor = 0
+    for cue in cues:
+        for word in cue.words:
+            word.start_time = cursor
+            word.end_time = cursor + 500
+            cursor += 600
+        cue.start_time = cue.words[0].start_time
+        cue.end_time = cue.words[-1].end_time
+
+    repaired = normalize_boundaries(
+        cues,
+        soft_max_words=16,
+        hard_max_words=20,
+    )
+
+    assert len(repaired) == 3
+    assert all(
+        not (left.text.rstrip().endswith("57,252") and right.text.startswith("miles"))
+        for left, right in zip(repaired, repaired[1:])
+    )
+    assert "57,252 miles" in " ".join(segment.text for segment in repaired)
+
+
+@pytest.mark.parametrize("change", ["cleaned_text", "translation", "language", "overlap"])
+def test_korean_repair_preserves_source_and_atomic_timing(change):
+    from subforge.core.split.boundary import finalize_korean_boundaries
+
+    cues = _cues(["저는", "그렇게 생각합니다."])
+    if change == "cleaned_text":
+        cues[1].text = "다르게 생각합니다."
+    elif change == "translation":
+        cues[0].translated_text = "我"
+    elif change == "language":
+        cues[0].language_code = "ko"
+        cues[1].language_code = "ja"
+    else:
+        cues[1].words[0].start_time = cues[0].words[-1].end_time - 1
+    before = [(c.text, c.translated_text, c.start_time, c.end_time, list(c.words)) for c in cues]
+    result = finalize_korean_boundaries(cues)
+    assert [(c.text, c.translated_text, c.start_time, c.end_time, list(c.words)) for c in result] == before
+
+
+def test_korean_repair_retains_every_atomic_word_and_speaker():
+    from subforge.core.split.boundary import finalize_korean_boundaries
+
+    cues = _cues(["저는", "그렇게 생각합니다."], speakers=["S1", "S1"])
+    words = [word for cue in cues for word in cue.words]
+    result = finalize_korean_boundaries(cues)
+    assert len(result) == 1
+    assert result[0].words == words
+    assert result[0].speaker_id == "S1"
+    assert result[0].text == "저는 그렇게 생각합니다."

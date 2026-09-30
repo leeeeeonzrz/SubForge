@@ -265,6 +265,122 @@ def test_failed_websocket_event_carries_recovery_preview_snapshot():
     assert events[-1]["preview_segments"] == segments
 
 
+@pytest.mark.parametrize("terminal", ["completed", "failed", "cancelled"])
+def test_terminal_results_are_owned_snapshots(terminal):
+    manager = TaskManager()
+    task = manager.create_task("subtitle")
+    events = []
+    manager.add_listener(lambda _id, data: events.append(data))
+    segments = [{"id": 1, "text": "source", "translated": "saved"}]
+    result = {"segments": segments, "warnings": ["original warning"], "preview_revision": 1}
+    if terminal == "completed":
+        manager.complete_task(task.id, result)
+    elif terminal == "failed":
+        manager.fail_task(task.id, "provider failed", result)
+    else:
+        manager.finalize_cancelled_task(task.id, result, preview_segments=segments)
+
+    segments[0]["translated"] = "late mutation"
+    result["warnings"].append("late warning")
+    events[-1]["result"]["warnings"].append("listener mutation")
+    snapshot = manager.get_task(task.id)
+    assert snapshot.result["segments"][0]["translated"] == "saved"
+    assert snapshot.result["warnings"] == ["original warning"]
+    if terminal != "failed":
+        assert snapshot.preview_segments[0]["translated"] == "saved"
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed"])
+def test_cancel_recovery_cannot_replace_a_different_terminal_state(terminal):
+    manager = TaskManager()
+    task = manager.create_task("subtitle")
+    if terminal == "completed":
+        manager.complete_task(task.id, {"subtitle_file": "final.srt"})
+    else:
+        manager.fail_task(task.id, "original failure", {"recovery_file": "original.srt"})
+    expected = manager.get_task(task.id)
+    manager.finalize_cancelled_task(
+        task.id,
+        {"recovery_file": "late.srt"},
+        preview_segments=[{"id": 1, "translated": "late"}],
+    )
+    assert manager.get_task(task.id) == expected
+
+
+def test_cancel_recovery_notifies_without_releasing_a_draining_worker():
+    async def run():
+        manager = TaskManager()
+        task = manager.create_task("subtitle", resource_key="subtitle:/input.srt")
+        events = []
+        manager.add_listener(lambda _id, data: events.append(data))
+        running = asyncio.create_task(asyncio.sleep(60))
+        manager.register_running_task(task.id, running)
+        manager.cancel_task(task.id)
+        segments = [{"id": 1, "translated": "saved translation"}]
+        manager.finalize_cancelled_task(
+            task.id, {"recovery_file": "/tmp/recovery.srt"}, preview_segments=segments
+        )
+        try:
+            assert events[-1]["status"] == TaskStatus.CANCELLED
+            assert events[-1]["preview_segments"] == segments
+            assert events[-1]["result"] == {"recovery_file": "/tmp/recovery.srt"}
+            events[-1]["preview_segments"][0]["translated"] = "listener mutation"
+            assert manager.get_task(task.id).preview_segments == segments
+            with pytest.raises(TaskResourceBusyError):
+                manager.create_task("subtitle", resource_key="subtitle:/input.srt")
+            with pytest.raises(asyncio.CancelledError):
+                await running
+        finally:
+            manager.unregister_running_task(task.id)
+        replacement = manager.create_task("subtitle", resource_key="subtitle:/input.srt")
+        assert replacement.id != task.id
+
+    asyncio.run(run())
+
+
+def test_preview_notification_revision_matches_its_payload_after_interleaving(monkeypatch):
+    import threading
+
+    manager = TaskManager()
+    task = manager.create_task("subtitle")
+    waiting = threading.Event()
+    release = threading.Event()
+    events = []
+    notify = manager._notify_listeners
+
+    def delayed(task_id, **kwargs):
+        if threading.current_thread().name == "first-preview":
+            waiting.set()
+            assert release.wait(2)
+        notify(task_id, **kwargs)
+
+    monkeypatch.setattr(manager, "_notify_listeners", delayed)
+    manager.add_listener(lambda _id, data: events.append(data))
+    first = [{"id": 1, "translated": "old"}]
+    latest = [{"id": 1, "translated": "new"}]
+    worker = threading.Thread(target=manager.publish_preview, args=(task.id, first), name="first-preview")
+    worker.start()
+    try:
+        assert waiting.wait(2)
+        manager.publish_preview(task.id, latest)
+    finally:
+        release.set()
+        worker.join(2)
+    assert not worker.is_alive()
+    assert len(events) == 2
+    # Both events observe revision 2; neither may carry revision 1's old text.
+    assert all(event["preview_revision"] == 2 for event in events)
+    assert all(event["preview_delta"]["segments"] == latest for event in events)
+
+
+def test_preview_delta_replaces_snapshot_when_a_field_is_removed():
+    manager = TaskManager()
+    assert manager._build_preview_delta(
+        [{"id": 1, "text": "one", "speaker": "A"}],
+        [{"id": 1, "text": "one"}],
+    ) == {"mode": "replace", "segments": [{"id": 1, "text": "one"}], "total": 1}
+
+
 def test_progress_is_clamped_and_does_not_move_backwards():
     manager = TaskManager()
     task = manager.create_task("subtitle")
@@ -344,3 +460,34 @@ def test_cancelled_running_task_keeps_resource_until_worker_unregisters():
         assert replacement.id != first.id
 
     asyncio.run(run())
+
+
+def test_download_progress_can_correct_estimate_and_clear_on_verification():
+    manager = TaskManager()
+    task = manager.create_task("download_model")
+    data = {"phase": "downloading", "progress": 80, "eta_seconds": 10}
+    manager.update_progress(task.id, 80, "download", download=data)
+    data["progress"] = 1
+    assert manager.get_task(task.id).download["progress"] == 80
+    manager.update_progress(task.id, 40, "retry", download={"progress": 40})
+    assert manager.get_task(task.id).progress == 40
+    manager.update_progress(task.id, 99, "正在校验")
+    assert manager.get_task(task.id).download is None
+    manager.complete_task(task.id)
+    assert manager.get_task(task.id).progress == 100
+
+
+@pytest.mark.parametrize("terminal", ["fail", "cancel", "complete"])
+def test_download_terminal_state_discards_stale_eta(terminal):
+    manager = TaskManager()
+    task = manager.create_task("download_model")
+    manager.update_progress(task.id, 20, download={"progress": 20, "eta_seconds": 100})
+    if terminal == "fail":
+        manager.fail_task(task.id, "connection lost")
+    elif terminal == "cancel":
+        manager.cancel_task(task.id)
+    else:
+        manager.complete_task(task.id)
+    assert manager.get_task(task.id).download is None
+    manager.update_progress(task.id, 30, download={"progress": 30, "eta_seconds": 80})
+    assert manager.get_task(task.id).download is None

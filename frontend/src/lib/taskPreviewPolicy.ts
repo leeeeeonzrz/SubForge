@@ -9,6 +9,7 @@ export interface PreviewTaskState {
   id: string;
   status: PreviewTaskStatus;
   subtitle_file?: string | null;
+  preview_revision?: number | null;
   preview_segments?: unknown[] | null;
   preview_delta?: unknown | null;
 }
@@ -17,6 +18,7 @@ export function shouldLoadLegacyPartial(task: PreviewTaskState): boolean {
   return Boolean(
     task.status === "running" &&
       task.subtitle_file &&
+      !task.preview_revision &&
       !task.preview_segments &&
       !task.preview_delta
   );

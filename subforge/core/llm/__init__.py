@@ -6,23 +6,51 @@ from .client import (
     call_llm,
     cancel_client_requests,
     close_client,
+    constrain_local_llm_workload,
     create_client,
     get_llm_client,
+    is_deepseek_v4_model,
+    is_glm_53_model,
+    is_kimi_k3_model,
+    is_lmstudio_qwen_38_request,
+    is_nemotron_3_ultra_model,
+    is_qwen_38_model,
     prefers_native_reasoning,
 )
-from .response import get_response_text, parse_json_object, strip_reasoning_blocks
+from .response import (
+    get_response_history_message,
+    get_response_text,
+    parse_json_object,
+    strip_reasoning_blocks,
+)
+from .telemetry import (
+    LLMTaskTelemetrySnapshot,
+    configure_client_telemetry,
+    snapshot_client_telemetry,
+)
 
 __all__ = [
     "call_llm",
     "cancel_client_requests",
     "close_client",
+    "constrain_local_llm_workload",
     "create_client",
     "get_llm_client",
+    "is_deepseek_v4_model",
+    "is_glm_53_model",
+    "is_kimi_k3_model",
+    "is_lmstudio_qwen_38_request",
+    "is_nemotron_3_ultra_model",
+    "is_qwen_38_model",
     "prefers_native_reasoning",
     "check_llm_connection",
     "get_available_models",
     "check_whisper_connection",
     "get_response_text",
+    "get_response_history_message",
     "parse_json_object",
     "strip_reasoning_blocks",
+    "LLMTaskTelemetrySnapshot",
+    "configure_client_telemetry",
+    "snapshot_client_telemetry",
 ]

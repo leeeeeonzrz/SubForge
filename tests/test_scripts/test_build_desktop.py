@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import zipfile
 from types import SimpleNamespace
@@ -5,6 +6,47 @@ from types import SimpleNamespace
 import pytest
 
 from scripts import build_desktop
+
+
+def test_macos_bundle_declares_chinese_native_ui():
+    tree = ast.parse((build_desktop.ROOT / "SubForge.spec").read_text())
+    bundle = next(node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Name) and node.func.id == "BUNDLE")
+    info = next(arg.value for arg in bundle.keywords if arg.arg == "info_plist")
+    fields = {ast.literal_eval(key): value for key, value in zip(info.keys, info.values)}
+    assert ast.literal_eval(fields["CFBundleDevelopmentRegion"]) == "zh-Hans"
+    assert ast.literal_eval(fields["CFBundleLocalizations"]) == ["zh-Hans"]
+
+
+def test_native_bootloader_leaves_older_sdks_on_standard_fallback(monkeypatch):
+    monkeypatch.setattr(build_desktop.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        build_desktop, "_run", lambda *args, **kwargs: SimpleNamespace(stdout="15.5")
+    )
+    assert build_desktop.prepare_native_bootloader() is None
+
+
+def test_native_bootloader_reuses_matching_sdk_and_architecture(monkeypatch, tmp_path):
+    monkeypatch.setattr(build_desktop.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(build_desktop.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(build_desktop, "BUILD_DIR", tmp_path)
+    monkeypatch.setitem(
+        build_desktop.sys.modules, "PyInstaller", SimpleNamespace(__version__="6.20.0")
+    )
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return SimpleNamespace(stdout="26.5" if command[-1] == "--show-sdk-version" else "/SDK")
+
+    monkeypatch.setattr(build_desktop, "_run", fake_run)
+    cache = tmp_path / "native-bootloader"
+    binary = cache / "pyinstaller-6.20.0/PyInstaller/bootloader/Darwin-64bit/runw"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"existing build")
+    (cache / "sdk-build.txt").write_text("26.5\n/SDK\narm64\n6.20.0\n")
+    assert build_desktop.prepare_native_bootloader() == binary
+    assert len(commands) == 2  # No download or compiler execution on a cache hit.
 
 
 def test_windows_installer_removes_previous_pyinstaller_runtime():
@@ -78,10 +120,12 @@ def test_pyinstaller_receives_release_version(monkeypatch, tmp_path):
 
     monkeypatch.setattr(build_desktop, "DIST_DIR", dist_dir)
     monkeypatch.setattr(build_desktop, "_run", fake_run)
+    monkeypatch.setattr(build_desktop, "prepare_native_bootloader", lambda: tmp_path / "runw")
 
     build_desktop.build_pyinstaller("9.8.7")
 
     assert captured["env"]["SUBFORGE_BUILD_VERSION"] == "9.8.7"
+    assert captured["env"]["SUBFORGE_NATIVE_BOOTLOADER"] == str(tmp_path / "runw")
     assert not stale_bundle.exists()
 
 
@@ -107,6 +151,31 @@ def test_managed_dist_cleanup_removes_numbered_duplicates_only(monkeypatch, tmp_
     assert all(not path.exists() for path in managed_paths)
     assert unrelated.read_bytes() == b"archive"
     assert notes.is_dir()
+
+
+def test_clean_preserves_evaluation_artifacts(monkeypatch, tmp_path):
+    build_dir = tmp_path / "build"
+    dist_dir = tmp_path / "dist"
+    artifact_dir = tmp_path / "artifacts"
+    frontend_dir = tmp_path / "frontend"
+    for path in (build_dir, dist_dir, frontend_dir / ".next"):
+        path.mkdir(parents=True)
+    manifest = artifact_dir / "translation-quality" / "corpus.local.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(build_desktop, "ROOT", tmp_path)
+    monkeypatch.setattr(build_desktop, "BUILD_DIR", build_dir)
+    monkeypatch.setattr(build_desktop, "DIST_DIR", dist_dir)
+    monkeypatch.setattr(build_desktop, "ARTIFACT_DIR", artifact_dir)
+    monkeypatch.setattr(build_desktop, "FRONTEND_DIR", frontend_dir)
+
+    build_desktop.clean()
+
+    assert not build_dir.exists()
+    assert not dist_dir.exists()
+    assert not (frontend_dir / ".next").exists()
+    assert manifest.read_text(encoding="utf-8") == "{}"
 
 
 def test_macos_build_discards_intermediate_bundle_after_verification(monkeypatch, tmp_path):
@@ -423,3 +492,40 @@ def test_windows_bundle_rejects_missing_shared_ml_runtime(tmp_path, monkeypatch)
 
     with pytest.raises(RuntimeError, match="Missing shared Windows ML runtime"):
         build_desktop.dedupe_windows_native_ml_runtime()
+
+
+@pytest.mark.parametrize("has_faster_whisper", [False, True])
+def test_macos_intel_vad_requirement_matches_optional_runtime(
+    tmp_path, monkeypatch, has_faster_whisper
+):
+    data_root = tmp_path / "bundle" / "Contents" / "Resources"
+    required = [
+        data_root / "frontend" / "out" / "index.html",
+        data_root / "frontend" / "out" / "_next" / "build.js",
+        data_root / "resource" / "assets" / "logo.png",
+        data_root / "resource" / "bin" / "ffmpeg",
+        data_root / "resource" / "bin" / "ffprobe",
+    ]
+    for path in required:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"test")
+    monkeypatch.setattr(build_desktop, "ROOT", tmp_path)
+    monkeypatch.setattr(build_desktop.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(build_desktop, "_requires_mlx_metallib", lambda: False)
+    monkeypatch.setattr(
+        build_desktop.importlib.util,
+        "find_spec",
+        lambda name: object() if has_faster_whisper and name == "faster_whisper" else None,
+    )
+
+    if not has_faster_whisper:
+        build_desktop._verify_data_root(data_root, "test bundle")
+        return
+
+    with pytest.raises(RuntimeError, match="silero_vad_v6.onnx"):
+        build_desktop._verify_data_root(data_root, "test bundle")
+
+    vad_asset = data_root / "faster_whisper" / "assets" / "silero_vad_v6.onnx"
+    vad_asset.parent.mkdir(parents=True)
+    vad_asset.write_bytes(b"onnx")
+    build_desktop._verify_data_root(data_root, "test bundle")

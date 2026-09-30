@@ -3,6 +3,7 @@
 
 Starts FastAPI backend in background and opens a native window.
 """
+
 import base64
 import multiprocessing
 import os
@@ -15,6 +16,8 @@ import traceback
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from desktop_dialogs import choose_input_file, configure_native_language
 
 _NULL_STREAMS = []
 
@@ -203,6 +206,16 @@ def check_backend_runtime(timeout_seconds: float = 30.0) -> None:
 class Api:
     """API exposed to the pywebview JavaScript context."""
 
+    def get_desktop_state(self):
+        from desktop_chrome import get_desktop_state
+
+        return get_desktop_state()
+
+    def sync_desktop_state(self, state):
+        from desktop_chrome import sync_desktop_state
+
+        return sync_desktop_state(state)
+
     def open_file(self, kind: str = "media"):
         """Select a local input without copying multi-gigabyte media through HTTP."""
         import traceback
@@ -212,19 +225,7 @@ class Api:
         try:
             if not webview.windows:
                 return {"ok": False, "error": "No window available"}
-            file_types = (
-                ("Subtitle files (*.srt;*.vtt;*.ass)",)
-                if kind == "subtitle"
-                else (
-                    "Media files (*.mp4;*.mov;*.mkv;*.avi;*.webm;*.mp3;*.wav;*.m4a;*.flac)",
-                    "All files (*.*)",
-                )
-            )
-            result = webview.windows[0].create_file_dialog(
-                webview.OPEN_DIALOG,
-                allow_multiple=False,
-                file_types=file_types,
-            )
+            result = choose_input_file(webview.windows[0], kind)
             if not result:
                 return {"ok": False, "cancelled": True}
             file_path = result if isinstance(result, str) else result[0]
@@ -345,6 +346,9 @@ class Api:
 
 
 def main():
+    # Configure before importing AppKit/pywebview so native bundles do not
+    # cache English while the application itself is entirely Chinese.
+    configure_native_language()
     # Start FastAPI in background thread
     port = find_available_port()
     url = f"http://{HOST}:{port}"
@@ -369,13 +373,22 @@ def main():
 
     # Open native window with JS API
     import webview
+
     api = Api()
 
     def on_loaded():
-        """Signal that pywebview API is ready."""
+        """Install native chrome before handing the ready signal to the editor."""
+        try:
+            webview.windows[0].events.loaded.wait(15)
+            from desktop_chrome import install_native_toolbar
+
+            install_native_toolbar(webview.windows[0])
+        except Exception:
+            import logging
+
+            logging.getLogger(__name__).exception("Could not initialize native toolbar")
         webview.windows[0].evaluate_js(
-            "window.__pywebview_ready = true; "
-            "window.dispatchEvent(new Event('pywebviewready'));"
+            "window.__pywebview_ready = true; window.dispatchEvent(new Event('pywebviewready'));"
         )
 
     window = webview.create_window(
@@ -514,30 +527,34 @@ if __name__ == "__main__":
 
             install_whisperx_runtime_stubs()
             import torch
+            import torch.version
             from whisperx.alignment import align as _align  # noqa: F401
             from whisperx.alignment import load_align_model as _load_align_model  # noqa: F401
-            from whisperx.asr import load_model as _load_model  # noqa: F401
             from whisperx.audio import load_audio as _load_audio  # noqa: F401
 
-            from subforge.core.asr.faster_whisper import resolve_faster_whisper_runtime
-            from subforge.core.asr.whisperx_asr import _normalize_align_device
+            if sys.platform == "win32":
+                from whisperx.asr import load_model as _load_model  # noqa: F401
 
-            if os.name == "nt" and torch.version.cuda is None:
-                raise RuntimeError("Windows desktop build contains CPU-only PyTorch")
-            transcribe_device, compute_type = resolve_faster_whisper_runtime(
-                "auto", "default"
-            )
-            align_device = _normalize_align_device("auto")
-            if align_device == "cuda":
-                probe = torch.ones(1, device="cuda")
-                if probe.device.type != "cuda":
-                    raise RuntimeError("PyTorch CUDA tensor probe did not use CUDA")
-            print(
-                "WhisperX Windows runtime: ok "
-                f"(transcribe={transcribe_device}/{compute_type}, "
-                f"alignment={align_device}, torch={torch.__version__})"
-            )
-            print("WhisperX ASR and forced alignment imports: ok")
+                from subforge.core.asr.faster_whisper import resolve_faster_whisper_runtime
+                from subforge.core.asr.whisperx_asr import _normalize_align_device
+
+                if os.name == "nt" and torch.version.cuda is None:
+                    raise RuntimeError("Windows desktop build contains CPU-only PyTorch")
+                transcribe_device, compute_type = resolve_faster_whisper_runtime(
+                    "auto", "default"
+                )
+                align_device = _normalize_align_device("auto")
+                if align_device == "cuda":
+                    probe = torch.ones(1, device="cuda")
+                    if probe.device.type != "cuda":
+                        raise RuntimeError("PyTorch CUDA tensor probe did not use CUDA")
+                print(
+                    "WhisperX Windows runtime: ok "
+                    f"(transcribe={transcribe_device}/{compute_type}, "
+                    f"alignment={align_device}, torch={torch.__version__})"
+                )
+                print("WhisperX ASR and forced alignment imports: ok")
+            print("WhisperX forced alignment import: ok")
             finish_packaged_check(0)
         except Exception:
             traceback.print_exc()
@@ -556,11 +573,7 @@ if __name__ == "__main__":
                 raise RuntimeError("MLX Metal probe returned an invalid result")
 
             mps_backend = getattr(getattr(torch, "backends", None), "mps", None)
-            if not (
-                mps_backend
-                and mps_backend.is_built()
-                and mps_backend.is_available()
-            ):
+            if not (mps_backend and mps_backend.is_built() and mps_backend.is_available()):
                 raise RuntimeError("PyTorch MPS is unavailable in this execution session")
             mps_probe = torch.ones(1, device="mps") + 1
             if float(mps_probe.cpu().item()) != 2.0:
@@ -586,7 +599,9 @@ if __name__ == "__main__":
             print("WhisperX alignment import: ok")
             print(f"Default MLX model: {default_mlx_model()}")
             print(f"Default align model: {DEFAULT_EN_ALIGN_MODEL}")
-            print(f"Align model file: {align_file} ({'found' if align_file.exists() else 'missing'})")
+            print(
+                f"Align model file: {align_file} ({'found' if align_file.exists() else 'missing'})"
+            )
             finish_packaged_check(0)
         except Exception:
             traceback.print_exc()
@@ -634,6 +649,8 @@ if __name__ == "__main__":
                 "/api/transcribe/start",
                 "/api/subtitle/start",
                 "/api/subtitles/load",
+                "/api/free-models/nvidia",
+                "/api/free-models/nvidia/scan",
             }
             missing = required_paths - route_paths
             if missing:

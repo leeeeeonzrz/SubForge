@@ -4,7 +4,9 @@ import logging
 import platform
 import shutil
 import subprocess
+import threading
 import time
+from functools import partial
 from pathlib import Path
 from typing import Literal
 
@@ -13,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from app.core.blocking import run_blocking
 from app.core.task_manager import TaskResourceBusyError, task_manager
-from app.security import validate_path
+from app.security import grant_path, validate_path
 from app.services.task_runtime import create_pipeline_context, schedule_background_task
 from subforge.application import subtitle_preview_segments
 from subforge.core.asr.alignment_models import (
@@ -561,17 +563,55 @@ async def _run_transcription(task_id: str, req: TranscribeRequest):
                 else:
                     work_dir = source.parent
             work_dir.mkdir(parents=True, exist_ok=True)
-            subtitle_path = work_dir / f"{video_stem}.srt"
+            coverage_issues = getattr(result, "coverage_issues", [])
+            # Uncertain isolated words are retained in a complete transcript.
+            # They need review, but do not represent missing speech or an ASR
+            # failure. Actual coverage gaps still use the recovery/error path.
+            blocking_issues = [
+                issue for issue in coverage_issues
+                if issue.get("reason") != "suspected_non_speech_text"
+            ]
+            suffix = "_recovery" if blocking_issues else ""
+            subtitle_path = work_dir / f"{video_stem}{suffix}.srt"
             context.checkpoint()
             result.save(str(subtitle_path))
+            grant_path(str(subtitle_path))
             result.save_language_metadata(str(subtitle_path))
-            task_manager.complete_task(
-                task_id,
-                {
-                    "subtitle_file": str(subtitle_path),
-                    "segments": subtitle_preview_segments(result),
-                },
+            result.save_timing_metadata(
+                str(subtitle_path),
+                getattr(result, "timing_speech_segments", []),
+                getattr(result, "media_duration_ms", None),
             )
+            if blocking_issues:
+                from subforge.core.asr.speech_gap_repair import coverage_issue_message
+
+                context.publish_preview(
+                    subtitle_preview_segments(result), subtitle_file=str(subtitle_path)
+                )
+                task_manager.fail_task(
+                    task_id,
+                    coverage_issue_message(coverage_issues),
+                    {
+                        "recovery_file": str(subtitle_path),
+                        "segments": subtitle_preview_segments(result),
+                        "coverage_issues": coverage_issues,
+                    },
+                )
+                return
+            completion_result = {
+                "subtitle_file": str(subtitle_path),
+                "segments": subtitle_preview_segments(result),
+            }
+            if coverage_issues:
+                from subforge.core.asr.speech_gap_repair import coverage_review_ranges
+
+                completion_result["coverage_issues"] = coverage_issues
+                completion_result["warning"] = (
+                    f"转录已完成；{len(coverage_issues)} 处短字幕的音频证据不确定，"
+                    f"请复核：{coverage_review_ranges(coverage_issues)}。"
+                    "字幕已保留并保存，可继续翻译。"
+                )
+            task_manager.complete_task(task_id, completion_result)
         else:
             raise RuntimeError(
                 "Transcription produced no subtitle segments. Check the selected "
@@ -1176,6 +1216,11 @@ async def delete_whisper_model(req: DownloadModelRequest):
     return {"status": "deleted", "model_id": req.model_id, "path": str(model_path)}
 
 
+def _report_download(task_id: str, data: dict):
+    message = {"waiting": "等待网络响应…", "retrying": "正在重新传输…"}.get(data["phase"], "正在下载…")
+    task_manager.update_progress(task_id, data.get("progress") or 0, message, download=data)
+
+
 async def _download_model(task_id: str, model_id: str, dest: Path):
     if model_id in DIARIZATION_MODELS:
         await _download_diarization_model(task_id, model_id, dest)
@@ -1222,20 +1267,33 @@ async def _download_model(task_id: str, model_id: str, dest: Path):
                     if total > max_bytes:
                         raise RuntimeError("Model download exceeds the expected size limit")
                     downloaded = 0
-                    last_pct = -1
+                    from subforge.core.utils.download_progress import DownloadEstimator
 
-                    with open(tmp_dest, "wb") as f:
-                        async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
-                            downloaded += len(chunk)
-                            if downloaded > max_bytes:
-                                raise RuntimeError("Model download exceeds the expected size limit")
-                            f.write(chunk)
-                            if total > 0:
-                                pct = min(99, int(downloaded / total * 100))
-                                if pct > last_pct:
-                                    last_pct = pct
-                                    task_manager.update_progress(task_id, pct, f"下载中... {pct}%")
+                    estimator = DownloadEstimator()
+                    transfer = {"downloaded": 0}
 
+                    async def heartbeat():
+                        while True:
+                            _report_download(task_id, estimator.update(
+                                transfer["downloaded"], total, transfer["downloaded"], time.monotonic()
+                            ))
+                            await asyncio.sleep(1)
+
+                    monitor = asyncio.create_task(heartbeat())
+
+                    try:
+                        with open(tmp_dest, "wb") as f:
+                            async for chunk in resp.aiter_bytes(chunk_size=64 * 1024):
+                                downloaded += len(chunk)
+                                if downloaded > max_bytes:
+                                    raise RuntimeError("Model download exceeds the expected size limit")
+                                f.write(chunk)
+                                transfer["downloaded"] = downloaded
+                    finally:
+                        monitor.cancel()
+                        await asyncio.gather(monitor, return_exceptions=True)
+
+            task_manager.update_progress(task_id, 99, "正在校验模型文件…")
             if downloaded == 0 or (total > 0 and downloaded != total):
                 raise RuntimeError("Model download was empty or incomplete")
             tmp_dest.replace(dest)
@@ -1264,25 +1322,29 @@ async def _download_huggingface_alignment_model(task_id: str, model_id: str):
             if _alignment_model_ready(model_id, models_dir):
                 task_manager.complete_task(task_id, {"path": str(dest)})
                 return
-            task_manager.update_progress(task_id, 5, f"正在下载{spec.language_name}词级对齐模型...")
+            task_manager.update_progress(task_id, 0, f"正在下载{spec.language_name}词级对齐模型...")
 
-            def _snapshot_download():
-                from huggingface_hub import snapshot_download
+            from subforge.core.utils.model_download import run_cancellable_model_download
 
-                return snapshot_download(
-                    repo_id=spec.model_name,
-                    cache_dir=str(models_dir),
-                    allow_patterns=[
+            cancel_event = threading.Event()
+            await run_blocking(
+                partial(run_cancellable_model_download, progress_callback=lambda data: _report_download(task_id, data)),
+                "huggingface_snapshot",
+                {
+                    "repo_id": spec.model_name,
+                    "cache_dir": str(models_dir),
+                    "allow_patterns": [
                         "*.json",
                         "*.txt",
                         "*.model",
                         "*.bin",
                         "*.safetensors",
                     ],
-                )
-
-            await run_blocking(_snapshot_download)
-            task_manager.update_progress(task_id, 95, "正在校验模型文件...")
+                },
+                cancel_event,
+                on_cancel=cancel_event.set,
+            )
+            task_manager.update_progress(task_id, 99, "正在校验模型文件...")
             if not _alignment_model_ready(model_id, models_dir):
                 raise RuntimeError("下载完成但模型配置或权重文件不完整")
             task_manager.complete_task(task_id, {"path": str(dest)})
@@ -1310,16 +1372,20 @@ async def _download_faster_whisper_model(task_id: str, model_id: str, dest: Path
                 shutil.rmtree(staging, ignore_errors=True)
             staging.parent.mkdir(parents=True, exist_ok=True)
             task_manager.update_progress(
-                task_id, 5, f"正在下载 FasterWhisper {model_value} 模型..."
+                task_id, 0, f"正在下载 FasterWhisper {model_value} 模型..."
             )
 
-            def _download_snapshot():
-                from faster_whisper.utils import download_model
+            from subforge.core.utils.model_download import run_cancellable_model_download
 
-                return download_model(model_value, output_dir=str(staging))
-
-            await run_blocking(_download_snapshot)
-            task_manager.update_progress(task_id, 95, "正在校验 CTranslate2 模型...")
+            cancel_event = threading.Event()
+            await run_blocking(
+                partial(run_cancellable_model_download, progress_callback=lambda data: _report_download(task_id, data)),
+                "faster_whisper",
+                {"size_or_id": model_value, "output_dir": str(staging)},
+                cancel_event,
+                on_cancel=cancel_event.set,
+            )
+            task_manager.update_progress(task_id, 99, "正在校验 CTranslate2 模型...")
             if not is_faster_whisper_model_dir(staging):
                 raise RuntimeError(
                     "下载完成但 CTranslate2 模型不完整（缺少配置、权重或 tokenizer）"
@@ -1363,18 +1429,23 @@ async def _download_diarization_model(task_id: str, model_id: str, dest: Path):
                 return
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
-            task_manager.update_progress(task_id, 5, "正在验证 Hugging Face 授权...")
+            task_manager.update_progress(task_id, 0, "正在验证 Hugging Face 授权...")
 
-            def _snapshot_download():
-                from huggingface_hub import snapshot_download
+            from subforge.core.utils.model_download import run_cancellable_model_download
 
-                return snapshot_download(
-                    repo_id=DIARIZATION_MODELS[model_id]["repo"],
-                    token=token,
-                    local_dir=str(staging),
-                )
-
-            await run_blocking(_snapshot_download)
+            cancel_event = threading.Event()
+            await run_blocking(
+                partial(run_cancellable_model_download, progress_callback=lambda data: _report_download(task_id, data)),
+                "huggingface_snapshot",
+                {
+                    "repo_id": DIARIZATION_MODELS[model_id]["repo"],
+                    "token": token,
+                    "local_dir": str(staging),
+                },
+                cancel_event,
+                on_cancel=cancel_event.set,
+            )
+            task_manager.update_progress(task_id, 99, "正在校验模型文件…")
             if not is_diarization_model_dir(staging):
                 raise RuntimeError("下载完成但 Community-1 核心配置或权重文件缺失")
             if dest.exists():
@@ -1409,19 +1480,24 @@ async def _download_speaker_verification_model(task_id: str, model_id: str, dest
                 return
             if staging.exists():
                 shutil.rmtree(staging, ignore_errors=True)
-            task_manager.update_progress(task_id, 5, "正在下载独立声纹校验模型...")
+            task_manager.update_progress(task_id, 0, "正在下载独立声纹校验模型...")
 
-            def _snapshot_download():
-                from huggingface_hub import snapshot_download
+            from subforge.core.utils.model_download import run_cancellable_model_download
 
-                return snapshot_download(
-                    repo_id=info["repo"],
-                    revision=info["revision"],
-                    local_dir=str(staging),
-                    allow_patterns=[info["filename"], "README.md", "config.yaml"],
-                )
-
-            await run_blocking(_snapshot_download)
+            cancel_event = threading.Event()
+            await run_blocking(
+                partial(run_cancellable_model_download, progress_callback=lambda data: _report_download(task_id, data)),
+                "huggingface_snapshot",
+                {
+                    "repo_id": info["repo"],
+                    "revision": info["revision"],
+                    "local_dir": str(staging),
+                    "allow_patterns": [info["filename"], "README.md", "config.yaml"],
+                },
+                cancel_event,
+                on_cancel=cancel_event.set,
+            )
+            task_manager.update_progress(task_id, 99, "正在校验模型文件…")
             staged_model = staging / info["filename"]
             if not staged_model.is_file() or staged_model.stat().st_size < 20 * 1024 * 1024:
                 raise RuntimeError("下载完成但 ECAPA512-LM ONNX 权重缺失或不完整")

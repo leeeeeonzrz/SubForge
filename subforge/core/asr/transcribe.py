@@ -6,7 +6,7 @@ from subforge.core.asr.chunked_asr import ChunkedASR
 from subforge.core.asr.faster_whisper import FasterWhisperASR
 from subforge.core.asr.whisper_api import WhisperAPI
 from subforge.core.asr.whisper_cpp import WhisperCppASR
-from subforge.core.asr.whisperx_asr import WhisperXASR
+from subforge.core.asr.whisperx_asr import WhisperXASR, _compound_timing_candidates
 from subforge.core.entities import TranscribeConfig, TranscribeModelEnum
 
 logger = logging.getLogger(__name__)
@@ -71,7 +71,8 @@ def transcribe(
             if diarization_mode == "two":
                 min_speakers, max_speakers = 2, 4
             elif num_speakers is None:
-                min_speakers, max_speakers = 2, 10
+                # A two-speaker floor forces a solo narrator into artificial clusters.
+                min_speakers, max_speakers = 1, 10
             else:
                 min_speakers = max_speakers = None
 
@@ -118,7 +119,9 @@ def transcribe(
         logger.info("Multi-speaker mode retains original audio and skips enhancement")
         callback(22, "Using original audio to preserve all speakers...")
     elif preserve_language_switches:
-        logger.info("WhisperX language-switch detection retains original audio and skips enhancement")
+        logger.info(
+            "WhisperX language-switch detection retains original audio and skips enhancement"
+        )
         callback(8, "Using original audio to preserve language switches...")
     elif config.enable_audio_enhancement:
         try:
@@ -190,7 +193,33 @@ def transcribe(
                     removed,
                 )
 
+        # Remove obviously inflated alignment spans before VAD refinement.  A
+        # later cap would undo a valid acoustic extension on a short final word.
+        asr_data.cap_abnormal_word_durations()
+
+        if config.transcribe_model == TranscribeModelEnum.WHISPERX and _compound_timing_candidates(
+            asr_data
+        ):
+            callback(91, "Checking compact number timing against original audio...")
+            try:
+                # The normal factory returns a ChunkedASR wrapper. This check
+                # only aligns local contexts; it must not launch another decode.
+                timing_asr = WhisperXASR(
+                    audio_path, **_build_whisperx_kwargs(config, use_cache=False)
+                )
+                timing_asr.realign_compound_word_gaps(asr_data, audio_path)
+            except Exception:
+                if (
+                    getattr(config, "cancel_event", None) is not None
+                    and config.cancel_event.is_set()
+                ):
+                    raise
+                logger.warning("Original-audio compound timing check unavailable", exc_info=True)
+
         analysis_context = None
+        word_speech_segments: list[tuple[int, int]] | None = None
+        high_confidence_speech: list[tuple[int, int]] = []
+        corroborating_speech: list[tuple[int, int]] | None = None
         if asr_data.is_word_timestamp():
             try:
                 from subforge.core.asr.audio_analysis import AudioAnalysisContext
@@ -211,24 +240,63 @@ def transcribe(
                         min_silence_ms=180,
                         speech_pad_ms=0,
                     )
+                    word_speech_segments = speech_segments
                     asr_data.refine_word_edges_with_speech_segments(speech_segments)
+
+                    # The regular pass intentionally repairs only nearby edges.
+                    # A second, stricter pass handles the rarer WhisperX fallback
+                    # where a final word can end several seconds before the
+                    # acoustic utterance.  Requiring higher-confidence speech and
+                    # a following pause keeps continuous narration untouched.
+                    if analysis_context is not None:
+                        high_confidence_speech = detect_speech_segments(
+                            analysis_path,
+                            analysis_context=analysis_context,
+                            threshold=0.75,
+                            min_speech_ms=120,
+                            min_silence_ms=200,
+                            speech_pad_ms=0,
+                        )
+                        asr_data.refine_word_edges_with_speech_segments(
+                            high_confidence_speech,
+                            max_adjustment_ms=3200,
+                        )
+
+                        # TEN-VAD is fast and accurate on dialogue, but some
+                        # music transients can look briefly speech-like. A
+                        # sensitive Silero pass supplies independent evidence
+                        # used only for isolated word groups below.
+                        from subforge.core.asr import silero_vad, ten_vad
+
+                        if ten_vad.is_available() and silero_vad.is_available():
+                            corroborating_speech = silero_vad.run_vad_inference(
+                                analysis_context.samples(),
+                                sample_rate=16000,
+                                threshold=0.35,
+                                min_speech_ms=100,
+                                min_silence_ms=180,
+                                speech_pad_ms=0,
+                                audio_len_ms=len(analysis_context.audio_segment()),
+                            )
             except Exception as e:
                 logger.debug("Word-edge VAD refinement skipped: %s", e, exc_info=True)
-
-        asr_data.cap_abnormal_word_durations()
 
         # Fix boundary overlaps before text/energy post-processing sees the data.
         asr_data.fix_boundary_overlaps()
 
         # Filter hallucinated segments using audio energy analysis
         filter_audio_path = audio_path if preserve_original_signal else audio_for_asr
-        if analysis_context is None:
-            asr_data.filter_hallucinations(audio_path=filter_audio_path)
-        else:
-            asr_data.filter_hallucinations(
-                audio_path=filter_audio_path,
-                analysis_context=analysis_context,
-            )
+        asr_data.filter_hallucinations(
+            audio_path=filter_audio_path,
+            analysis_context=analysis_context,
+            speech_segments=word_speech_segments,
+            strict_speech_segments=(
+                high_confidence_speech if word_speech_segments is not None else None
+            ),
+            corroborating_speech_segments=corroborating_speech,
+            media_duration_ms=source_duration_ms,
+            defer_short_groups=config.transcribe_model == TranscribeModelEnum.WHISPERX,
+        )
 
         # Remove duplicate text emitted around VAD/chunk boundaries before the
         # final timing pass, so exports do not keep short repeated fragments.
@@ -250,6 +318,31 @@ def transcribe(
         # Keep the final exported timeline monotonic even if a post-processor
         # changed segment boundaries.
         asr_data.fix_boundary_overlaps()
+        asr_data.timing_speech_segments = high_confidence_speech
+        asr_data.media_duration_ms = source_duration_ms
+
+        if config.transcribe_model == TranscribeModelEnum.WHISPERX:
+            from subforge.core.asr.final_coverage import repair_final_coverage
+            from subforge.core.asr.non_speech_review import review_non_speech
+
+            asr_data = review_non_speech(
+                asr_data,
+                audio_path,
+                config,
+                callback,
+                _create_single_asr,
+                analysis_context=analysis_context,
+            )
+
+            callback(94, "Checking final subtitles against original speech...")
+            asr_data = repair_final_coverage(
+                asr_data,
+                audio_path,
+                config,
+                callback,
+                _create_single_asr,
+                analysis_context=analysis_context,
+            )
 
         if diarization_turns:
             from subforge.core.asr.speaker_diarization import (
@@ -315,12 +408,12 @@ def _transcribe_segments(
     """
     import tempfile
 
-    from pydub import AudioSegment
+    from subforge.core.asr.audio_io import export_audio_file, load_audio_file
 
     if callback is None:
         callback = _noop_callback
 
-    audio = AudioSegment.from_file(audio_path)
+    audio = load_audio_file(audio_path)
     audio_len_ms = len(audio)
     all_segments = []
     total = len(speech_segments)
@@ -333,7 +426,7 @@ def _transcribe_segments(
 
             chunk_audio = audio[ext_start:ext_end]
             chunk_path = str(Path(tmp_dir) / f"vad_{idx:04d}.wav")
-            chunk_audio.export(chunk_path, format="wav")
+            export_audio_file(chunk_audio, chunk_path, format="wav")
 
             logger.info(
                 f"Transcribing segment {idx + 1}/{total}: "
@@ -458,9 +551,7 @@ def _build_whisperx_kwargs(
         "missing_alignment_model_callback": getattr(
             config, "missing_alignment_model_callback", None
         ),
-        "detect_additional_languages": getattr(
-            config, "detect_additional_languages", False
-        ),
+        "detect_additional_languages": getattr(config, "detect_additional_languages", False),
         "cancel_event": getattr(config, "cancel_event", None),
     }
 

@@ -9,11 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple, cast
 
-from langdetect import LangDetectException, detect
-
 from ..entities import SubtitleLayoutEnum
 from ..utils.atomic_write import atomic_write_srt, atomic_write_text
+from ..utils.subtitle_parsing import parse_subtitle_text
+from ..utils.subtitle_text import finalize_chinese_translation_punctuation
 from ..utils.text_utils import is_mainly_cjk
+from .compound_numbers import parse_tire_size
 
 # 多语言分词模式(支持词级和字符级语言)
 _WORD_SPLIT_PATTERN = (
@@ -70,9 +71,7 @@ def infer_text_language(text: str) -> str:
     normalized = unicodedata.normalize("NFC", str(text or ""))
     has_latin = bool(re.search(r"[A-Za-z]", normalized))
     has_kana = bool(re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", normalized))
-    has_hangul = bool(
-        re.search(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]", normalized)
-    )
+    has_hangul = bool(re.search(r"[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]", normalized))
     if has_kana:
         return "mixed" if has_latin else "ja"
     if has_hangul:
@@ -265,6 +264,11 @@ class ASRData:
             if segment.timing_source != "unknown"
         }
         self.timing_source: TimestampSource = timing_source
+        self.timing_speech_segments: list[tuple[int, int]] = []
+        self.media_duration_ms: Optional[int] = None
+        self.coverage_issues: list[dict] = []
+        self.excluded_speech_ranges: list[dict] = []
+        self.confirmed_non_speech_ranges: list[dict] = []
         if timing_source == "unknown":
             if len(explicit_sources) == 1:
                 self.timing_source = next(iter(explicit_sources))
@@ -420,33 +424,7 @@ class ASRData:
         ASCII identifiers such as decimals, model names, and domain names.
         """
         for seg in self.segments:
-            translated = seg.translated_text
-            if not translated:
-                continue
-
-            has_han = bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", translated))
-            cleaned = []
-            for index, character in enumerate(translated):
-                if character in "，。":
-                    cleaned.append(" ")
-                    continue
-                if character in ",." and has_han:
-                    previous = translated[index - 1] if index > 0 else ""
-                    following = translated[index + 1] if index + 1 < len(translated) else ""
-                    if (
-                        previous.isascii()
-                        and previous.isalnum()
-                        and following.isascii()
-                        and following.isalnum()
-                    ):
-                        cleaned.append(character)
-                    else:
-                        cleaned.append(" ")
-                    continue
-                cleaned.append(character)
-            translated = "".join(cleaned)
-            translated = re.sub(r"、+\s*$", "", translated)
-            seg.translated_text = re.sub(r"[ \t]{2,}", " ", translated).strip()
+            seg.translated_text = finalize_chinese_translation_punctuation(seg.translated_text)
         return self
 
     def save(
@@ -490,6 +468,12 @@ class ASRData:
         path = Path(handle_long_path(subtitle_path))
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         return f"subtitle-language:v1:{digest}"
+
+    @staticmethod
+    def _timing_metadata_key(subtitle_path: str) -> str:
+        path = Path(handle_long_path(subtitle_path))
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return f"subtitle-timing:v1:{digest}"
 
     def save_language_metadata(self, subtitle_path: str) -> None:
         """Persist internal language labels without changing the user-visible SRT."""
@@ -540,6 +524,71 @@ class ASRData:
             for word in segment.words:
                 word.language_code = language_code
         return self
+
+    def save_timing_metadata(
+        self,
+        subtitle_path: str,
+        speech_segments: Optional[list[tuple[int, int]]] = None,
+        media_duration_ms: Optional[int] = None,
+    ) -> None:
+        """Cache acoustic boundaries for later subtitle processing.
+
+        The cache key includes the exact SRT bytes, so edited or replaced files
+        cannot reuse timing analysis from an older transcription.
+        """
+        speech = [
+            [max(0, int(start)), max(0, int(end))]
+            for start, end in (speech_segments or [])
+            if int(end) > int(start)
+        ]
+        duration = int(media_duration_ms) if media_duration_ms is not None else None
+        if not speech and not duration:
+            return
+
+        from ..utils.cache import get_subtitle_language_cache
+
+        get_subtitle_language_cache().set(
+            self._timing_metadata_key(subtitle_path),
+            {"speech_segments": speech, "media_duration_ms": duration},
+            expire=90 * 24 * 60 * 60,
+        )
+
+    @staticmethod
+    def load_timing_metadata(
+        subtitle_path: str,
+    ) -> tuple[list[tuple[int, int]], Optional[int]]:
+        """Load timing metadata only when it belongs to the exact SRT content."""
+        from ..utils.cache import get_subtitle_language_cache
+
+        try:
+            payload = get_subtitle_language_cache().get(
+                ASRData._timing_metadata_key(subtitle_path),
+                default=None,
+            )
+        except (OSError, ValueError):
+            payload = None
+        if not isinstance(payload, dict):
+            return [], None
+
+        speech: list[tuple[int, int]] = []
+        for item in payload.get("speech_segments") or []:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            try:
+                start, end = int(item[0]), int(item[1])
+            except (TypeError, ValueError):
+                continue
+            if end > start >= 0:
+                speech.append((start, end))
+
+        duration_value = payload.get("media_duration_ms")
+        try:
+            duration = int(duration_value) if duration_value is not None else None
+        except (TypeError, ValueError):
+            duration = None
+        if duration is not None and duration <= 0:
+            duration = None
+        return speech, duration
 
     def to_txt(
         self,
@@ -789,7 +838,15 @@ class ASRData:
         del self.segments[index + 1]
 
     def filter_hallucinations(
-        self, audio_path: Optional[str] = None, analysis_context=None
+        self,
+        audio_path: Optional[str] = None,
+        analysis_context=None,
+        *,
+        speech_segments: Optional[list[tuple[int, int]]] = None,
+        strict_speech_segments: Optional[list[tuple[int, int]]] = None,
+        corroborating_speech_segments: Optional[list[tuple[int, int]]] = None,
+        media_duration_ms: Optional[int] = None,
+        defer_short_groups: bool = False,
     ) -> "ASRData":
         """Remove segments likely caused by ASR hallucination.
 
@@ -815,7 +872,13 @@ class ASRData:
         )
 
         if self.is_word_timestamp():
-            logger.info("Skipping hallucination energy filter for word-level timestamps")
+            self._filter_word_hallucinations_by_speech(
+                speech_segments,
+                strict_speech_segments,
+                corroborating_speech_segments,
+                media_duration_ms=media_duration_ms,
+                defer_short_groups=defer_short_groups,
+            )
             return self
 
         if audio_path:
@@ -825,6 +888,177 @@ class ASRData:
             self._filter_by_text_heuristics()
 
         return self
+
+    def _filter_word_hallucinations_by_speech(
+        self,
+        speech_segments: Optional[list[tuple[int, int]]],
+        strict_speech_segments: Optional[list[tuple[int, int]]],
+        corroborating_speech_segments: Optional[list[tuple[int, int]]],
+        *,
+        media_duration_ms: Optional[int],
+        defer_short_groups: bool = False,
+        group_gap_ms: int = 1200,
+        isolation_ms: int = 3000,
+        short_group_isolation_ms: int = 10_000,
+    ) -> None:
+        """Remove isolated word runs rejected by independent speech evidence.
+
+        Word timestamps must remain atomic, so the sentence-level energy pass
+        cannot safely process them. This pass groups neighboring words only for
+        validation and removes a group only when regular VAD, strict VAD, and a
+        corroborating detector all reject it. One- and two-word groups require
+        much longer isolation and near-zero detector overlap. Missing detector
+        evidence fails open and leaves lexical content untouched.
+        """
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        retained_segments: list[ASRDataSeg] = []
+        punctuation_removed = 0
+        for index, segment in enumerate(self.segments):
+            if re.search(_WORD_SPLIT_PATTERN, segment.text):
+                retained_segments.append(segment)
+                continue
+            previous_end = self.segments[index - 1].end_time if index else 0
+            if index + 1 < len(self.segments):
+                following_start = self.segments[index + 1].start_time
+            elif media_duration_ms is not None:
+                following_start = int(media_duration_ms)
+            else:
+                following_start = segment.end_time
+            if (
+                segment.start_time - previous_end >= group_gap_ms
+                and following_start - segment.end_time >= group_gap_ms
+            ):
+                punctuation_removed += 1
+            else:
+                retained_segments.append(segment)
+        if punctuation_removed:
+            logger.info(
+                "Removed %d isolated punctuation-only word timestamp(s)",
+                punctuation_removed,
+            )
+        self.segments = retained_segments
+
+        if not self.segments:
+            return
+        if (
+            speech_segments is None
+            or strict_speech_segments is None
+            or corroborating_speech_segments is None
+        ):
+            logger.info(
+                "Word-level hallucination filtering skipped because complete speech "
+                "evidence is unavailable"
+            )
+            return
+
+        def _overlap_ms(
+            start_ms: int,
+            end_ms: int,
+            ranges: list[tuple[int, int]],
+        ) -> int:
+            overlaps: list[tuple[int, int]] = []
+            for range_start, range_end in ranges:
+                overlap_start = max(start_ms, int(range_start))
+                overlap_end = min(end_ms, int(range_end))
+                if overlap_end > overlap_start:
+                    overlaps.append((overlap_start, overlap_end))
+            if not overlaps:
+                return 0
+            overlaps.sort()
+            merged = [overlaps[0]]
+            for overlap_start, overlap_end in overlaps[1:]:
+                if overlap_start <= merged[-1][1]:
+                    merged[-1] = (
+                        merged[-1][0],
+                        max(merged[-1][1], overlap_end),
+                    )
+                else:
+                    merged.append((overlap_start, overlap_end))
+            return sum(overlap_end - overlap_start for overlap_start, overlap_end in merged)
+
+        groups: list[tuple[int, int]] = []
+        group_start = 0
+        for index in range(1, len(self.segments)):
+            gap_ms = self.segments[index].start_time - self.segments[index - 1].end_time
+            if gap_ms > group_gap_ms:
+                groups.append((group_start, index))
+                group_start = index
+        groups.append((group_start, len(self.segments)))
+
+        remove_indexes: set[int] = set()
+        for group_index, (start_index, end_index) in enumerate(groups):
+            group = self.segments[start_index:end_index]
+            group_start_ms = group[0].start_time
+            group_end_ms = group[-1].end_time
+            duration_ms = max(1, group_end_ms - group_start_ms)
+            lexical_units = sum(
+                len(re.findall(_WORD_SPLIT_PATTERN, segment.text)) for segment in group
+            )
+            if lexical_units < 1:
+                continue
+            is_short_group = lexical_units <= 2
+            if is_short_group and defer_short_groups:
+                # Production WhisperX uses bounded acoustic review after all
+                # timeline edits; VAD disagreement alone cannot delete a reply.
+                continue
+            required_isolation_ms = short_group_isolation_ms if is_short_group else isolation_ms
+
+            previous_end = (
+                self.segments[groups[group_index - 1][1] - 1].end_time if group_index else 0
+            )
+            if group_index + 1 < len(groups):
+                following_start = self.segments[groups[group_index + 1][0]].start_time
+            elif media_duration_ms is not None:
+                following_start = max(group_end_ms, int(media_duration_ms))
+            else:
+                following_start = group_end_ms
+            if (
+                group_start_ms - previous_end < required_isolation_ms
+                or following_start - group_end_ms < required_isolation_ms
+            ):
+                continue
+
+            regular_overlap = _overlap_ms(
+                group_start_ms,
+                group_end_ms,
+                speech_segments,
+            )
+            strict_overlap = _overlap_ms(
+                group_start_ms,
+                group_end_ms,
+                strict_speech_segments,
+            )
+            corroborating_overlap = _overlap_ms(
+                group_start_ms,
+                group_end_ms,
+                corroborating_speech_segments,
+            )
+            if is_short_group:
+                if regular_overlap >= 80 or strict_overlap >= 80 or corroborating_overlap >= 80:
+                    continue
+            else:
+                if regular_overlap / duration_ms >= 0.35:
+                    continue
+                if strict_overlap >= 120 or corroborating_overlap >= 120:
+                    continue
+
+            remove_indexes.update(range(start_index, end_index))
+            logger.warning(
+                "Removed isolated word-level ASR hallucination %.2fs-%.2fs: %r",
+                group_start_ms / 1000,
+                group_end_ms / 1000,
+                " ".join(segment.text.strip() for segment in group),
+            )
+
+        if remove_indexes:
+            self.segments = [
+                segment
+                for index, segment in enumerate(self.segments)
+                if index not in remove_indexes
+            ]
 
     def deduplicate_adjacent_text(self, max_gap_ms: int = 1500) -> "ASRData":
         """Remove duplicate text emitted around adjacent ASR/VAD boundaries.
@@ -1060,16 +1294,14 @@ class ASRData:
                 index += 1
                 continue
 
-            exact_echo = left_word == right_word and len(left_word) >= 5
+            exact_echo = left_word == right_word and len(left_word) >= 4
             suffix_echo = (
                 len(right_word) >= 2
                 and len(left_word) > len(right_word)
                 and left_word.endswith(right_word)
             )
             numeric_two_echo = (
-                right_word == "too"
-                and left_word.isdigit()
-                and left_word.endswith("2")
+                right_word == "too" and left_word.isdigit() and left_word.endswith("2")
             )
             if not (exact_echo or suffix_echo or numeric_two_echo):
                 index += 1
@@ -1081,6 +1313,13 @@ class ASRData:
                 right.text,
                 left.text,
             )
+            # The later alignment item often represents the acoustic release of
+            # the same spoken word. Keep its timing envelope when removing the
+            # duplicate text, otherwise sentence cues built from the surviving
+            # word disappear before the utterance has finished.
+            left.end_time = max(left.end_time, right.end_time)
+            if left.words:
+                left.words[-1].end_time = max(left.words[-1].end_time, right.end_time)
             del self.segments[index + 1]
             removed += 1
 
@@ -1382,7 +1621,9 @@ class ASRData:
 
         return self
 
-    def _filter_by_audio_energy(self, audio_path: str, analysis_context=None) -> None:
+    def _filter_by_audio_energy(  # noqa: C901
+        self, audio_path: str, analysis_context=None
+    ) -> None:
         """Filter segments using audio energy-based speech detection.
 
         Two-pass approach:
@@ -1394,7 +1635,7 @@ class ASRData:
         logger = logging.getLogger(__name__)
 
         try:
-            from pydub import AudioSegment
+            from subforge.core.asr.audio_io import load_audio_file
         except ImportError:
             logger.warning("pydub not available, falling back to text heuristics")
             self._filter_by_text_heuristics()
@@ -1405,7 +1646,7 @@ class ASRData:
             audio = (
                 analysis_context.audio_segment()
                 if analysis_context is not None
-                else AudioSegment.from_file(audio_path)
+                else load_audio_file(audio_path)
             )
             logger.info(f"Audio loaded: {len(audio) / 1000:.1f}s")
         except Exception as e:
@@ -1879,16 +2120,30 @@ class ASRData:
 
         def _max_duration(text: str) -> int:
             stripped = text.strip().strip(".,;:!?()[]{}，。！？；：")
+            tire = parse_tire_size(stripped)
+            if tire is not None:
+                # One display token can contain several seconds of spoken
+                # numbers/letters. Keep a bounded speech-sized allowance.
+                return max(numeric_max_ms, min(4200, tire.spoken_units * 450 + 250))
             if re.search(r"\d", stripped):
                 return numeric_max_ms
             return max(default_max_ms, reasonable_word_duration_ms(stripped))
 
+        compound_limits: dict[int, int] = {}
+        for index, (left, right) in enumerate(zip(self.segments, self.segments[1:])):
+            tire = parse_tire_size(f"{left.text} {right.text}")
+            if tire:
+                for offset, units in enumerate(tire.part_units):
+                    compound_limits[index + offset] = max(
+                        numeric_max_ms, min(4200, units * 450 + 250)
+                    )
+
         capped = 0
-        for seg in self.segments:
+        for index, seg in enumerate(self.segments):
             duration = seg.end_time - seg.start_time
             if duration <= 0:
                 continue
-            max_duration = _max_duration(seg.text)
+            max_duration = max(_max_duration(seg.text), compound_limits.get(index, 0))
             if duration <= max_duration + min_trim_ms:
                 continue
             candidate_end = seg.start_time + max_duration
@@ -1987,109 +2242,104 @@ class ASRData:
 
     def extend_sentence_tails_conservatively(
         self,
-        min_gap_ms: int = 600,
-        safety_gap_ms: int = 90,
-        min_extension_ms: int = 250,
+        speech_segments: Optional[list[tuple[int, int]]] = None,
+        media_duration_ms: Optional[int] = None,
+        min_gap_ms: int = 220,
+        safety_gap_ms: int = 80,
+        base_tail_pad_ms: int = 160,
+        min_extension_ms: int = 60,
+        max_vad_extension_ms: int = 3200,
+        max_crossing_vad_extension_ms: int = 1200,
+        vad_boundary_pad_ms: int = 30,
     ) -> "ASRData":
-        """Extend short final subtitle tails into a following gap.
+        """Give aligned sentence cues a safe acoustic/display tail.
 
-        This is a display/timing correction for sentence-level subtitles built
-        from word timestamps. It deliberately avoids global padding: subtitles
-        are only extended when they are shorter than a conservative readable
-        target and a real gap exists before the next segment.
+        Sentence cues inherit the exact end of their final aligned word. That is
+        useful as atomic timing data but too abrupt as a display boundary and it
+        can miss a short acoustic release. A small tail pad is therefore applied
+        only to cues that still retain atomic word timings. Longer corrections
+        require a nearby VAD boundary and are capped so music or continuous
+        background activity cannot pull a cue across a real pause.
         """
         import logging
 
         logger = logging.getLogger(__name__)
 
-        if len(self.segments) < 2 or self.is_word_timestamp():
+        if not self.segments or self.is_word_timestamp():
             return self
 
-        def _word_count(text: str) -> int:
-            return len(re.findall(_WORD_SPLIT_PATTERN, text))
-
-        def _cjk_count(text: str) -> int:
-            return len(re.findall(r"[\u4e00-\u9fff]", text))
-
-        def _has_timing_anchor(text: str) -> bool:
-            return bool(
-                re.search(r"\d", text)
-                or re.search(r"\b[A-Z]\d+[A-Za-z0-9.-]*\b", text)
-                or re.search(r"\b(?:RPM|U\.?S\.?)\b", text, flags=re.IGNORECASE)
-            )
-
-        def _ends_sentence(text: str) -> bool:
-            return bool(re.search(r"[.!?。！？]\s*$", text.strip()))
-
-        def _target_duration(seg: ASRDataSeg) -> int:
-            words = _word_count(seg.text)
-            cjk = _cjk_count(seg.translated_text)
-            if words <= 3:
-                word_target = 1700
-            elif words <= 6:
-                word_target = 2400
-            elif words <= 10:
-                word_target = 3700
-            else:
-                word_target = min(5300, words * 330 + 700)
-            if _has_timing_anchor(seg.text) and words >= 7:
-                word_target = max(word_target, min(5800, words * 390 + 1_000))
-            cjk_target = min(4600, cjk * 125 + 900) if cjk else 0
-            return max(word_target, cjk_target)
-
-        def _extension_cap(seg: ASRDataSeg, duration_ms: int) -> int:
-            has_anchor = _has_timing_anchor(seg.text)
-            if duration_ms < 1200:
-                return 2600 if has_anchor else 1200
-            if duration_ms < 2500:
-                return 2400 if has_anchor else 900
-            if duration_ms < 3500:
-                return 1500 if has_anchor else 0
-            if duration_ms < 4500:
-                return 900 if has_anchor else 0
-            return 0
-
         self.segments.sort(key=lambda s: (s.start_time, s.end_time))
+        speech = sorted(
+            (max(0, start), max(0, end)) for start, end in (speech_segments or []) if end > start
+        )
         extended = 0
+        vad_extended = 0
+        speech_cursor = 0
 
-        for i, seg in enumerate(self.segments[:-1]):
-            next_seg = self.segments[i + 1]
-            gap_ms = next_seg.start_time - seg.end_time
-            if gap_ms < min_gap_ms:
-                continue
-
-            duration_ms = seg.end_time - seg.start_time
-            if gap_ms < 900 or duration_ms >= 4500:
-                continue
-            if duration_ms >= 3500 and _ends_sentence(seg.text):
-                continue
-
-            cap_ms = _extension_cap(seg, duration_ms)
-            if cap_ms <= 0:
-                continue
-
-            target_ms = _target_duration(seg)
-            needed_ms = target_ms - duration_ms
-            if needed_ms < min_extension_ms:
-                continue
-
-            has_anchor = _has_timing_anchor(seg.text)
-            words = _word_count(seg.text)
-            if not has_anchor and _ends_sentence(seg.text):
-                if duration_ms >= 2500 or words < 7:
+        for i, seg in enumerate(self.segments):
+            next_seg = self.segments[i + 1] if i + 1 < len(self.segments) else None
+            if next_seg is not None:
+                gap_ms = next_seg.start_time - seg.end_time
+                if gap_ms < min_gap_ms:
                     continue
-                # Complete, non-technical sentences only receive a small display
-                # tail. This fixes under-covered speech without reintroducing
-                # broad silence coverage.
-                needed_ms = min(needed_ms, 900)
+            if not seg.words:
+                continue
 
-            extension_ms = min(needed_ms, cap_ms, gap_ms - safety_gap_ms)
+            word_end = max(word.end_time for word in seg.words)
+            if next_seg is not None:
+                maximum_end = next_seg.start_time - safety_gap_ms
+            elif media_duration_ms is not None:
+                maximum_end = int(media_duration_ms)
+            else:
+                maximum_end = seg.end_time
+            if maximum_end <= seg.end_time:
+                if next_seg is not None or not speech:
+                    continue
+
+            target_end = max(seg.end_time, word_end + base_tail_pad_ms)
+            used_vad = False
+            while speech_cursor < len(speech) and speech[speech_cursor][1] < word_end - 120:
+                speech_cursor += 1
+            for speech_start, speech_end in speech[speech_cursor:]:
+                if speech_start > word_end + 80:
+                    break
+                if speech_end < word_end - 120:
+                    continue
+                vad_extension = speech_end - word_end
+                if (
+                    next_seg is None
+                    and media_duration_ms is None
+                    and 0 < vad_extension <= max_vad_extension_ms
+                ):
+                    maximum_end = speech_end + vad_boundary_pad_ms
+                if base_tail_pad_ms < vad_extension <= max_vad_extension_ms:
+                    vad_target = speech_end + vad_boundary_pad_ms
+                    if speech_end > maximum_end and next_seg is not None:
+                        # Continuous background or a soft sentence boundary can
+                        # make one VAD region cross into the next cue. Retain a
+                        # bounded amount of confirmed speech instead of losing
+                        # the whole tail merely because the region crosses the
+                        # safe subtitle boundary.
+                        vad_target = min(
+                            maximum_end,
+                            word_end + max_crossing_vad_extension_ms,
+                        )
+                    elif speech_end > maximum_end:
+                        break
+                    if vad_target > word_end + base_tail_pad_ms:
+                        target_end = max(target_end, min(vad_target, maximum_end))
+                        used_vad = True
+                break
+
+            target_end = min(target_end, maximum_end)
+            extension_ms = target_end - seg.end_time
             if extension_ms < min_extension_ms:
                 continue
 
             old_end = seg.end_time
-            seg.end_time += int(extension_ms)
+            seg.end_time = int(target_end)
             extended += 1
+            vad_extended += int(used_vad)
             logger.debug(
                 "Extended subtitle tail %.2fs -> %.2fs (+%.2fs): %r",
                 old_end / 1000,
@@ -2099,7 +2349,11 @@ class ASRData:
             )
 
         if extended:
-            logger.info("Extended conservative subtitle tails: %s", extended)
+            logger.info(
+                "Extended conservative subtitle tails: %s (VAD-confirmed: %s)",
+                extended,
+                vad_extended,
+            )
         self.fix_boundary_overlaps()
         return self
 
@@ -2272,218 +2526,7 @@ class ASRData:
         srt_time_pattern = re.compile(
             r"(\d{2}):(\d{2}):(\d{1,2})[.,](\d{3})\s-->\s(\d{2}):(\d{2}):(\d{1,2})[.,](\d{3})"
         )
-        speaker_pattern = re.compile(r"^\[(说话人\d+|Speaker \d+)\]\s*")
         blocks = re.split(r"\n\s*\n", srt_str.strip())
-
-        def _line_family(text: str) -> str:
-            """Classify a subtitle text line without being fooled by model names.
-
-            A Chinese translation often contains Latin tokens such as W126,
-            AMG, Mercedes-Benz, or email addresses. Presence of meaningful CJK
-            text therefore wins over embedded Latin identifiers. Han, Japanese,
-            and Korean remain distinct so bilingual CJK cues can be separated.
-            """
-            stripped = text.strip()
-            if not stripped:
-                return "empty"
-
-            normalized = unicodedata.normalize("NFC", stripped)
-            counts = {
-                "han": len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", normalized)),
-                "kana": len(re.findall(r"[\u3040-\u30ff\u31f0-\u31ff]", normalized)),
-                "hangul": len(
-                    re.findall(
-                        r"[\u1100-\u11ff\u3130-\u318f\ua960-\ua97f\uac00-\ud7af\ud7b0-\ud7ff]",
-                        normalized,
-                    )
-                ),
-                "latin": len(re.findall(r"[A-Za-z]", normalized)),
-            }
-            non_latin = counts["han"] + counts["kana"] + counts["hangul"]
-            if counts["hangul"] >= 2 and counts["hangul"] >= counts["han"]:
-                return "hangul"
-            if counts["kana"]:
-                return "japanese"
-            if counts["han"] >= 2:
-                return "han"
-            if counts["latin"] >= 2 and non_latin == 0:
-                return "latin"
-            if counts["hangul"]:
-                return "hangul"
-            if counts["han"]:
-                return "han"
-            return "other"
-
-        def _group_family(lines: list[str]) -> str:
-            joined = " ".join(line.strip() for line in lines if line.strip())
-            family = _line_family(joined)
-            if family in {"han", "japanese", "hangul", "latin"}:
-                return family
-            families = [_line_family(line) for line in lines if line.strip()]
-            counts = {
-                family_name: families.count(family_name)
-                for family_name in ("han", "japanese", "hangul", "latin")
-            }
-            winner, winner_count = max(counts.items(), key=lambda item: item[1])
-            if winner_count > 0 and list(counts.values()).count(winner_count) == 1:
-                return winner
-            return "other"
-
-        def _fallback_different_language(left: str, right: str) -> bool:
-            try:
-                return detect(left) != detect(right)
-            except LangDetectException:
-                return False
-
-        def _split_bilingual_lines(text_lines: list[str]) -> tuple[str, str] | None:
-            non_empty = [line for line in text_lines if line.strip()]
-            if len(non_empty) < 2:
-                return None
-
-            dialogue_marked = all(re.match(r"^-\s+", line.strip()) for line in non_empty)
-            if dialogue_marked:
-                non_empty = [re.sub(r"^-\s+", "", line.strip()) for line in non_empty]
-
-            # Generated translated-on-top subtitles may contain language-neutral
-            # amounts or identical numeric lines. Keep these round-trippable even
-            # when speaker display markers are intentionally hidden.
-            if len(non_empty) == 2:
-                left_family = _line_family(non_empty[0])
-                right_family = _line_family(non_empty[1])
-                short_latin_line = re.compile(r"^[A-Za-z][.!?]?$", re.IGNORECASE)
-                left_title = re.fullmatch(r"[《“\"'](.+?)[》”\"']?[。.]?", non_empty[0].strip())
-                right_title = re.fullmatch(r"[《“\"'](.+?)[》”\"']?[。.]?", non_empty[1].strip())
-                if left_family == right_family == "latin":
-                    canonical_locator = re.compile(
-                        r"^(?:https?://)?[A-Za-z0-9._%+-]+"
-                        r"(?:@[A-Za-z0-9.-]+|(?:\.[A-Za-z0-9-]+)+)"
-                        r"(?:/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?[.!]?$",
-                        re.IGNORECASE,
-                    )
-                    spoken_locator = re.compile(
-                        r"\b(?:dot|slash|at)\b",
-                        re.IGNORECASE,
-                    )
-                    left_is_locator = bool(canonical_locator.fullmatch(non_empty[0].strip()))
-                    right_is_locator = bool(canonical_locator.fullmatch(non_empty[1].strip()))
-                    left_is_spoken = bool(spoken_locator.search(non_empty[0]))
-                    right_is_spoken = bool(spoken_locator.search(non_empty[1]))
-                    # A generated bilingual URL may remain Latin in both languages:
-                    # canonical target above, spoken ASR source below (or vice versa).
-                    # Preserve that pair instead of reopening it as one source-only cue.
-                    if left_is_locator and right_is_spoken:
-                        return non_empty[1], non_empty[0]
-                    if right_is_locator and left_is_spoken:
-                        return non_empty[0], non_empty[1]
-                    if (
-                        left_is_locator
-                        and right_is_locator
-                        and non_empty[0].rstrip(".!").casefold()
-                        == non_empty[1].rstrip(".!").casefold()
-                    ):
-                        return non_empty[1], non_empty[0]
-                    if (
-                        left_title
-                        and re.sub(r"\W+", "", left_title.group(1)).lower()
-                        == re.sub(r"\W+", "", non_empty[1]).lower()
-                    ):
-                        return non_empty[1], non_empty[0]
-                    if (
-                        right_title
-                        and re.sub(r"\W+", "", right_title.group(1)).lower()
-                        == re.sub(r"\W+", "", non_empty[0]).lower()
-                    ):
-                        return non_empty[0], non_empty[1]
-                if (
-                    left_family == "han"
-                    and right_family == "other"
-                    and (
-                        re.search(r"\d", non_empty[1])
-                        or short_latin_line.fullmatch(non_empty[1].strip())
-                    )
-                ):
-                    return non_empty[1], non_empty[0]
-                if (
-                    right_family == "han"
-                    and left_family == "other"
-                    and (
-                        re.search(r"\d", non_empty[0])
-                        or short_latin_line.fullmatch(non_empty[0].strip())
-                    )
-                ):
-                    return non_empty[0], non_empty[1]
-                normalized_left = re.sub(r"\s+", "", non_empty[0])
-                normalized_right = re.sub(r"\s+", "", non_empty[1])
-                neutral_left = re.sub(r"[^\w]+", "", normalized_left)
-                neutral_right = re.sub(r"[^\w]+", "", normalized_right)
-                if (
-                    left_family == right_family == "other"
-                    and re.search(r"\d", normalized_left + normalized_right)
-                    and (
-                        dialogue_marked
-                        or normalized_left == normalized_right
-                        or neutral_left == neutral_right
-                    )
-                ):
-                    return non_empty[1], non_empty[0]
-
-            best: tuple[int, int, str, str] | None = None
-            for split_index in range(1, len(non_empty)):
-                left = non_empty[:split_index]
-                right = non_empty[split_index:]
-                left_family = _group_family(left)
-                right_family = _group_family(right)
-
-                score = 0
-                language_pair = {left_family, right_family}
-                if language_pair in (
-                    {"han", "latin"},
-                    {"han", "hangul"},
-                    {"han", "japanese"},
-                ):
-                    score = 100
-                elif (
-                    left_family != right_family
-                    and left_family != "other"
-                    and right_family != "other"
-                ):
-                    score = 60
-                elif (
-                    left_family != right_family
-                    and len(left) == 1
-                    and len(right) == 1
-                    and _fallback_different_language(left[0], right[0])
-                ):
-                    score = 40
-
-                if score <= 0:
-                    continue
-                # Prefer balanced split points when multiple options look valid.
-                balance_penalty = abs(len(left) - len(right))
-                candidate = (score - balance_penalty, split_index, left_family, right_family)
-                if best is None or candidate > best:
-                    best = candidate
-
-            if best is None:
-                return None
-
-            _, split_index, left_family, right_family = best
-            left_text = "\n".join(non_empty[:split_index]).strip()
-            right_text = "\n".join(non_empty[split_index:]).strip()
-
-            language_pair = {left_family, right_family}
-            if language_pair in (
-                {"han", "latin"},
-                {"han", "hangul"},
-                {"han", "japanese"},
-            ):
-                # SubForge's bilingual SRT workflow translates source speech to
-                # Chinese. Resolve either display order back to source/target.
-                if left_family != "han":
-                    return left_text, right_text
-                return right_text, left_text
-
-            return left_text, right_text
 
         # Process all blocks based on detected mode
         for block in blocks:
@@ -2513,37 +2556,10 @@ class ASRData:
                 ]
             )
 
-            text_lines = lines[2:]
-
-            # Extract speaker_id from the first text line if present
-            speaker_id = ""
-            if text_lines:
-                speaker_match = speaker_pattern.match(text_lines[0])
-                if speaker_match:
-                    speaker_id = speaker_match.group(1)
-                    text_lines[0] = text_lines[0][speaker_match.end() :]
-
-            bilingual = _split_bilingual_lines(text_lines)
-            if bilingual:
-                original, translated = bilingual
-                segments.append(
-                    ASRDataSeg(
-                        original,
-                        start_time,
-                        end_time,
-                        translated,
-                        speaker_id=speaker_id,
-                    )
-                )
-            elif len(text_lines) == 1:
-                segments.append(
-                    ASRDataSeg(text_lines[0], start_time, end_time, speaker_id=speaker_id)
-                )
-            else:
-                # Multi-line subtitle: preserve line breaks with \n
-                segments.append(
-                    ASRDataSeg("\n".join(text_lines), start_time, end_time, speaker_id=speaker_id)
-                )
+            original, translated, speaker_id = parse_subtitle_text("\n".join(lines[2:]))
+            segments.append(
+                ASRDataSeg(original, start_time, end_time, translated, speaker_id=speaker_id)
+            )
 
         return ASRData.from_imported_segments(segments)
 
@@ -2623,7 +2639,10 @@ class ASRData:
             cleaned_text = cleaned_text.strip()
 
             if cleaned_text and cleaned_text != " ":
-                segments.append(ASRDataSeg(cleaned_text, start_time, end_time))
+                original, translated, speaker = parse_subtitle_text(cleaned_text)
+                segments.append(
+                    ASRDataSeg(original, start_time, end_time, translated, speaker_id=speaker)
+                )
 
         return ASRData.from_imported_segments(segments)
 
@@ -2757,7 +2776,12 @@ class ASRData:
                                 segment.translated_text = text
                             temp_segments[time_key] = segment
                     else:
-                        segments.append(ASRDataSeg(text, start_time, end_time))
+                        original, translated, speaker = parse_subtitle_text(text)
+                        segments.append(
+                            ASRDataSeg(
+                                original, start_time, end_time, translated, speaker_id=speaker
+                            )
+                        )
 
         for segment in temp_segments.values():
             segments.append(segment)

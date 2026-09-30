@@ -8,7 +8,7 @@ export interface Toast {
   message: string;
   type: "success" | "error" | "info";
 }
-export type ActiveView = "workflow" | "settings" | "llm-logs";
+export type ActiveView = "workflow" | "settings" | "llm-logs" | "free-models";
 
 interface AppState {
   // Current workflow step
@@ -30,6 +30,15 @@ interface AppState {
   setSubtitleFile: (path: string | null) => void;
   subtitles: SubtitleSegment[];
   setSubtitles: (segments: SubtitleSegment[]) => void;
+  documentLoading: boolean;
+  subtitleSaving: boolean;
+  setPreviewSubtitles: (segments: SubtitleSegment[]) => void;
+  savedSubtitles: SubtitleSegment[];
+  subtitleDocumentRevision: number;
+  markSubtitlesSaved: (segments: SubtitleSegment[], revision: number, path?: string) => void;
+  subtitleHistory: SubtitleSegment[][];
+  commitSubtitles: (segments: SubtitleSegment[]) => void;
+  undoSubtitleEdit: () => void;
   updateSubtitle: (id: number, field: "text" | "translated", value: string) => void;
   selectedIds: Set<number>;
   toggleSelect: (id: number) => void;
@@ -113,15 +122,35 @@ export const useAppStore = create<AppState>((set) => ({
   setFileInfo: (info) => set({ fileInfo: info }),
 
   subtitleFile: null,
-  setSubtitleFile: (path) => set({ subtitleFile: path }),
+  setSubtitleFile: (path) => set((state) => ({ subtitleFile: path, subtitleDocumentRevision: state.subtitleDocumentRevision + 1 })),
   subtitles: [],
-  setSubtitles: (segments) => set({ subtitles: segments }),
+  subtitleHistory: [],
+  documentLoading: false,
+  subtitleSaving: false,
+  setPreviewSubtitles: (segments) => set({ subtitles: segments, subtitleHistory: [], selectedIds: new Set() }),
+  savedSubtitles: [],
+  subtitleDocumentRevision: 0,
+  markSubtitlesSaved: (segments, revision, path) => set((state) => revision === state.subtitleDocumentRevision ? { savedSubtitles: segments, ...(path ? { subtitleFile: path } : {}) } : state),
+  setSubtitles: (segments) => set((state) => ({ subtitles: segments, savedSubtitles: segments, subtitleDocumentRevision: state.subtitleDocumentRevision + 1, subtitleHistory: [], selectedIds: new Set() })),
+  commitSubtitles: (segments) => set((state) => (state.isProcessing || state.documentLoading) ? state : ({
+    subtitles: segments,
+    subtitleHistory: [...state.subtitleHistory.slice(-29), state.subtitles],
+    selectedIds: new Set(),
+  })),
+  undoSubtitleEdit: () => set((state) => !state.isProcessing && !state.documentLoading && state.subtitleHistory.length ? ({
+    subtitles: state.subtitleHistory[state.subtitleHistory.length - 1],
+    subtitleHistory: state.subtitleHistory.slice(0, -1),
+    selectedIds: new Set(),
+  }) : state),
   updateSubtitle: (id, field, value) =>
-    set((state) => ({
-      subtitles: state.subtitles.map((s) =>
-        s.id === id ? { ...s, [field]: value } : s
-      ),
-    })),
+    set((state) => {
+      if (state.isProcessing || state.documentLoading) return state;
+      if (!state.subtitles.some((s) => s.id === id && s[field] !== value)) return state;
+      return {
+        subtitleHistory: [...state.subtitleHistory.slice(-29), state.subtitles],
+        subtitles: state.subtitles.map((s) => s.id === id ? { ...s, [field]: value } : s),
+      };
+    }),
   selectedIds: new Set(),
   toggleSelect: (id) =>
     set((state) => {

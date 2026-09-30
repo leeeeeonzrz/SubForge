@@ -1,5 +1,328 @@
 # Changelog
 
+## v1.3.7 - 2026-10-17
+
+### Native import panel and localization
+
+- Own and explicitly close each macOS import panel before returning a selected path, including cancel and error paths. A dismissed panel is no longer retained with its media preview. Prevent concurrent import panels while preserving the native all-files filter.
+- Declare Simplified Chinese in the macOS bundle and configure only the current process's native UI language before AppKit starts. Import titles, buttons and file-type filters use Chinese without changing system language preferences.
+
+### Validation and limitations
+
+- 3037 local Python tests passed, with 35 external integration tests deselected; 68 frontend tests and frontend lint passed. Ruff passed and Pyright reported 0 errors with 29 existing warnings. Regression coverage includes preview lifetime, cancellation, exceptions, repeat import, concurrent picker requests, main-thread dispatch and process-local localization.
+- Verified the packaged macOS panel's Chinese sidebar, search, buttons and file types, video import metadata, repeat open/cancel, all-files filtering and subtitle selection. Preview cleanup and failure paths have lifecycle regression coverage; no system audio loopback measurement was performed.
+- macOS Apple Silicon DMG is built and verified locally. GitHub Actions builds the standard Windows x64 EXE and checks both the packaged and installed runtime. Model weights remain separate; macOS signing is ad hoc, without Apple notarization.
+
+## v1.3.6 - 2026-10-15
+
+### Chinese subtitle boundary repair
+
+- Detect stranded Chinese focus markers such as 甚至, 尤其是 and 特别是, including punctuation that previously concealed an incomplete cue. Require these boundaries to enter repair and reject rewrites that leave them unresolved.
+- Relocate an existing focus marker only with explicit English support and the existing speaker, language, adjacency and pause protections. Boundaries across visible pauses still require validated contextual rewriting.
+- Report only subtitles whose text actually changed as corrected; an unchanged accepted window is no longer logged as a successful correction.
+
+### Validation and limitations
+
+- 3021 local Python tests passed, with 35 external integration tests deselected. Ruff passed; Pyright reported 0 errors and 30 existing warnings. Regressions cover the reported GLC boundary, punctuation, quoted words, lossless relocation, protected pauses/turns/languages, and overlapping repair windows.
+- Reviewed all 697 cues in the reported GLC bilingual subtitle and manually corrected 19 groups affecting 37 Chinese cues. Cue numbers, timings and English were preserved. This subtitle review is distinct from the automated regression tests; it does not establish universal translation accuracy. No paid translation API was called.
+- macOS Apple Silicon DMG is built and verified locally; the standard Windows x64 EXE is built and installation-smoke-tested by GitHub Actions. Model weights remain separate; macOS signing is ad hoc, without Apple notarization.
+
+## v1.3.5 - 2026-10-14
+
+### Short missing-speech recovery
+
+- Nominate short internal speech gaps with at least one second of strict VAD evidence and 50% voiced coverage. The previous two-second floor missed a complete sentence in a 2.094-second exported gap.
+- Preserve the broader context repair by default. When unrelated context differs, retry with shared nearby three-word anchors whose word edges agree within 200 ms. A filler difference in the next sentence no longer rejects an independently corroborated missing sentence.
+- Permit one additional wider context decode when the initial decodes disagree, within the existing 180-second total audio budget. Added words still require two independent decodes agreeing on text, quantities and audio position; unresolved or budget-limited candidates retain review warnings.
+- Compare explicit dollar amounts and thousand-dollar spellings as one acoustic quantity while preserving exact values and the `-ish` approximation. Do not equate approximate amounts with precise amounts, or ignore changed pronouns, negation, signs or decimals.
+
+### Validation and limitations
+
+- 2980 local Python tests passed with 35 external integration tests deselected. All 68 frontend tests and frontend lint passed. Repository Ruff passed; Pyright reported 0 errors and 30 warnings.
+- 133 targeted regression tests passed, covering real GX omission fixtures, timing anchors, amount approximation, conflicting decodes, retry budgets, cancellation, non-speech exclusions and transcription recovery APIs.
+- Original-audio MLX Large V3 decoding, production WhisperX alignment and final coverage recovery repaired the two reported GX omissions. The bilingual output added two cues and adjusted four adjacent cues; all other subtitle text and timings were preserved.
+- No paid translation API was called. This is sample-specific missing-speech validation, not a guarantee of universal ASR accuracy. Other uncertain timing or acoustic candidates remain review items.
+- macOS Apple Silicon DMG is built locally; the standard Windows x64 EXE is built and installation-smoke-tested by GitHub Actions. Model weights remain separate from installers; macOS signing is ad hoc, without Apple notarization.
+
+## v1.3.4 - 2026-10-05
+
+### Transcription and translation recovery
+
+- Complete transcription with an advisory when isolated short words need acoustic review. Keep the words and timestamped review notice, and allow translation to continue; actual unresolved speech gaps retain recovery/error handling.
+- Establish the saved editor baseline from persisted recovery snapshots and revision-only completion events. Generated subtitles no longer appear as unsaved user edits and block the next processing task.
+- Preserve protection against processing genuinely unsaved edits, stale task updates, and late file loads. Added regression coverage for transcription-to-translation handoff through saved output and recovery files.
+
+### Speech coverage and isolated short replies
+
+- Audit WhisperX word coverage against original audio after final timing, filtering and deduplication. Detect speech hidden by stretched lexical timestamps without mutating the exported timeline.
+- Attempt bounded context recovery with matching surrounding anchors and independent decode agreement. Reject native timestamp fallback that crosses a gap boundary or repeats a nearby phrase.
+- Choose shared splice-safe anchors and accept equivalent kilometre number/unit spellings while preserving values, signs, decimal points, pronouns and negation.
+- Review isolated one- or two-word subtitles using independent speech detectors, native no-speech probability and forced alignment. Repeated decoded text alone does not clear a candidate; missing or conflicting evidence preserves it for review.
+- Keep intentionally excluded foreign-language ranges and confirmed non-speech evidence through chunk merging and final gap checks. Reject repairs that reinsert words into confirmed non-speech intervals.
+- Bound isolated-short-speech review to three local windows of up to 30 seconds each. Automatic deletion currently requires the local MLX backend; other backends retain uncertain candidates. Keep at most 20 lightweight diagnostic reports without audio copies or LLM calls.
+
+### Validation and limitations
+
+- 2969 local Python tests passed with 35 integration tests deselected, using the checksum-pinned bundled FFmpeg runtime. All 68 frontend tests, frontend lint and production build passed. Repository Ruff passed; Pyright reported 0 errors and 30 warnings.
+- Regression tests cover advisory completion, saved recovery baselines, genuine unsaved edits, actual coverage failures, and persisted transcription output continuing through translation without external API calls.
+- The installed Apple Silicon app passed backend HTTP startup checks; the reported 6735-segment subtitle file was preserved unchanged and restored with a clean saved state. This check did not run a paid translation or repeat the complete transcription.
+- Earlier local audio development cases exercised missing-speech recovery and music/short-reply controls. Uncertain or conflicting evidence remains a review item; these cases do not establish universal ASR accuracy or recovery success.
+
+## v1.3.3 - 2026-09-18
+
+- Repair source-backed structural dependencies before translation, including cleaned text mapped conservatively to unchanged word timing. Preserve raw words and speaker evidence, honor configured length limits, and report dependencies that cannot be repaired safely.
+- Add atomic historical bilingual boundary repair with bounded windows, contextual translation, semantic validation and per-window rollback. Include an opt-in GLM whole-file review tool that writes separate artifacts.
+- Accept Chinese enumeration punctuation in preserved numeric lists and source-supported Chinese localization of EV, while retaining checks for altered numbers and omitted model identifiers.
+
+### Validation and limitations
+
+- 2913 local Python tests and 62 frontend tests passed. Repository-wide Ruff and frontend lint passed; Pyright reported 0 errors and 30 warnings.
+- GLM development validation accepted 17 historical repair windows and rolled back 3, producing 706 cues from 713. All resulting cues were reviewed in 30 overlapping windows. This is historical repair and whole-file review, not an ASR or end-to-end production rerun.
+- Complex dependencies remain unresolved and model audits can miss errors. Local detection consumes no LLM tokens; total pipeline token savings are not established.
+
+## v1.3.2 - 2026-09-17
+
+### Subtitle processing
+
+- Protect repeated model identifiers, charging levels and compact technical phrases at subtitle boundaries. Preserve word timing and speaker ownership; refuse reconstruction when cleaned text no longer matches its word alignment.
+- Repair stranded deadline clauses and quantity/unit requirement lists without importing the following cue's facts. Protect generation labels such as Mark V and restore percentage-triggered translation guidance.
+- Add source-scoped semantic review candidates for charging levels, trim names, remaining range, reversed action/protection roles and negative observations. Reject malformed formatting residue in translation output.
+
+### Workspace and model downloads
+
+- Replace overflowing quality tiles with a responsive subtitle-check list, translation coverage and selectable issue groups. Separate timeline/reading/missing-translation checks from advisory continuous/long cues; local checks are not semantic quality scores.
+- Show model-download bytes, measured speed and smoothed remaining-time ranges. Handle warm-up, cache/resume, unknown totals and stalled connections without stale estimates; keep verification separate from successful completion.
+- Clear download telemetry on task termination and retain cancellation support for multi-file model downloads.
+
+### Validation and known limitations
+
+- 2863 Python tests passed (35 integration tests deselected); 62 frontend tests passed. Ruff and frontend lint passed; Pyright reported no errors and 29 warnings.
+- Full GLM-5.3-flash paired development test: 732 new-rule cues versus 719 ablated-control cues, all translated and reviewed across 53 blinded windows. GLM flagged 21 versus 28 candidates; 14 windows favored the new rules, 11 the control, and 28 tied. These are model judgments, not confirmed error rates or holdout accuracy.
+- The new pipeline used 832170 tokens versus 847915 for the control in this single run. Neither general token savings nor semantic completeness is guaranteed: observation-to-requirement changes and cross-cue repetition still occur, and GLM also missed clear defects.
+- The domain-precision prompt experiment remains development-only and disabled by default. Source subtitles, credentials and evaluation logs are not distributed with installers.
+- Apple Silicon DMG and standard Windows x64 EXE; no separate CUDA installer. macOS signing remains ad hoc, without Apple notarization or App Store distribution.
+
+## v1.3.1 - 2026-09-08
+
+### Desktop experience
+
+- Unified the native macOS window material and sidebar navigation, keeping subtitle content opaque and readable. Fixed dark toolbar appearance and replaced nested navigation bezels with a single animated selection surface.
+- Standardized inspector grouping, rounded hover surfaces, selector sizing, long engine names, and nested control padding. Current model names, precision variants and availability are visible; advanced options and model paths use progressive disclosure.
+- Consolidated shared controls and added a development-only inspection gallery excluded from production. Added keyboard subtitle editing, persistent save status, accessible error messages, actual backend progress messages and cancellation feedback.
+
+### Document and task safety
+
+- Promote uploaded subtitles to durable app-data storage on save so session cleanup cannot delete saved edits. Native-opened files retain save-in-place, and subsequent saves follow the returned persistent path.
+- Atomically import subtitle paths and contents; preserve the old document on read failure, block replacement during tasks or unsaved edits, and detach prior task updates.
+- Keep task previews separate from the saved baseline. Block processing stale files while edits are unsaved, and protect running previews from editing, structural changes and undo.
+- Keep the save lock across navigation and track saved snapshots without clearing newer edits.
+- Serialize configuration writes and wait for successful persistence before task startup; workspace controls reflect confirmed values.
+
+### Verification and distribution
+
+- Local regression: 2792 Python tests passed, 11 skipped; 54 frontend tests passed. Ruff, ESLint and production build passed. Pyright reported no errors and 29 warnings.
+- Packaged UI checks covered upload, edit, repeated save and persistence after application exit. Concurrency and failure cases use controlled regression tests; no paid transcription/translation calls were made for this release.
+- macOS Apple Silicon DMG and GitHub Actions Windows x64 EXE. No separate CUDA installer; local macOS signing is ad hoc, not notarization or App Store submission.
+
+## v1.3.0 - 2026-09-06
+
+### Desktop Experience
+
+- Redesigned the import, transcription, and subtitle workspace with a consistent sidebar, clearer task status, collapsible processing options, and a readable, opaque subtitle editor.
+- Added a native macOS toolbar for import, processing options, cancellation, and export. macOS 26 uses system Liquid Glass controls; older systems retain native fallback controls, and Windows retains the web toolbar.
+- Added system/light/dark appearance, short transitions, and support for reduced motion, reduced transparency, and increased contrast. Bundled Solar icons locally with attribution so the interface does not depend on an external icon service.
+- Reworked settings into grouped categories and diagnostic logs into a task/detail view. Added loading, empty, error, and retry states, deferred request-body rendering, and protection against stale detail responses.
+- Added up to 30 undo steps for subtitle editing, deletion, and merging, plus import/save/undo/settings shortcuts that preserve normal text-field editing behavior.
+
+### Subtitle And Transcription Fixes
+
+- Expanded compact and spaced tire specifications into their spoken form for English forced alignment, then restored the original display text. Restoration now requires evidence for both ends of expanded tokens.
+- Applied bounded timing budgets to recognized tire specifications. When enhanced-audio alignment ends a specification too early, a short original-audio alignment can extend its tail with confidence and neighboring-onset checks; it does not move the following word or run another Whisper decode.
+- Checked cancellation before loading optional alignment dependencies, so cancelling a local timing repair still works on a minimal installation without WhisperX.
+- Protected numeric compound modifiers such as `six-speed`, standalone quantities before capitalized plural population names, and ambiguous prepositions followed by explicit object pronouns. Complete clauses, meaningful pauses, and protected speaker boundaries retain their safeguards.
+- Prevented boundary normalization from rebuilding partially translated input and losing existing translations.
+- Made preservation diagnostics deterministic, accepted narrowly evidenced Chinese DCT/RPM equivalents, and retained exact gear-count/unit checks. Successful identical fidelity verdicts can be reused within a task; changed inputs, rejected verdicts, and cancellation remain protected.
+- Added narrowly scoped completed-phrase exclusions to Chinese boundary diagnostics. These local tests do not establish independent semantic non-inferiority of the full translation pipeline.
+
+### Guides And Validation
+
+- Updated the LLM-facing subtitle post-editing protocol and optimization guides to separate source corrections, stylistic edits, deterministic bug fixes, and quality/cost experiments.
+- Local Python regression: `2789 passed, 11 skipped`; frontend: `32 passed`. Release checks also cover static analysis, a production frontend build, and packaged runtime verification.
+- Real-audio tire-specification checks ended at 1:50.010 without enhancement and 1:49.993 with enhancement plus local correction, before the next word at 1:50.090 and 1:50.083 respectively. These are sample-specific timing results.
+- The latest airport replay preserves atomic word text, timestamps, and speaker ownership. Across five development videos and 3492 machine/reference boundary records, only its two targeted boundaries change.
+- No general translation-quality or token-saving claim is made. Earlier GLM experiments had mixed semantic results; a rejected price-equivalence extension is excluded. The final retained subset has offline regression evidence, but has not received a new paired full-pipeline live-cost validation. No paid translation API was called for this release build.
+
+### Packaging
+
+- macOS Apple Silicon: `SubForge-1.3.0-macos-arm64.dmg`, built locally with a verified sealed app inside the image.
+- Windows x64: `SubForge-1.3.0-windows-x64-setup.exe`, built and installation-smoke-tested by GitHub Actions. No separate CUDA installer is produced.
+- Pinned PyInstaller to 6.20.0 for CI and the SDK 26 native bootloader. Synchronized frontend, runtime, and bundle versions, including the settings credits.
+- Installers exclude user credentials, local subtitle files, and separately downloaded model weights. macOS signing remains ad hoc, not Apple notarization or App Store distribution. Older macOS appearance fallback is implemented but has not been visually tested on an older physical system.
+
+## v1.2.1 - 2026-09-04
+
+### Fixed
+
+- Closed the 3.5–6 second gap between short and long MLX speech-recovery checks. Strong speech evidence now triggers a bounded neighboring-utterance confirmation when ordinary context decodes disagree or the next subtitle starts too early. Added text requires matching words and audio positions from two local decodes; no new model is needed.
+- Preserved unresolved short-gap warnings through ASR caching, chunk merging, desktop previews, and CLI output. Partial transcripts are saved separately as `_recovery.srt` with the affected time ranges instead of silently reporting completion or overwriting a previous transcript. Existing long-gap adaptive retries remain in place.
+- Removed the two-speaker minimum from automatic diarization, so a single narrator is no longer forced into multiple clusters. Fixed-count and two-primary-speaker modes retain their separate policies.
+- Fixed semantic-repair requests losing the current subtitle's identity and contextual evidence, and unified grouped-number handling to avoid false rejections of equivalent quantities.
+- Expanded boundary checks for place names, coordination, incomplete predicates, connective ownership, pronoun objects, and comparative phrases. Chinese repair checks preserve subjects, semantic roles, and complete reading units without allowing cross-speaker or cross-language text movement.
+
+### Improved
+
+- Added evidence-backed semantic-action and recurring-place checks, including negative examples and preservation tests. Repairs remain selective; this does not enable full-document high-effort reasoning or replace the validated translation pipeline.
+- Added a scoped local Qwen 3.8 adapter for loopback OpenAI-compatible servers, tested with LM Studio: bounded context, one concurrent request, batches of at most ten, and model-specific output/reasoning controls. Cloud model workloads and adapters are unchanged; local-model quality is not claimed to match the cloud baselines.
+- Refined evaluation admission criteria, sample provenance, rule-level diagnostics, and single-speaker/dialogue safeguards in the optimization guide and benchmark tooling.
+
+### Validation And Limits
+
+- Local Python regression: `2591 passed, 35 deselected`; frontend tests: `26 passed`.
+- Two complete runs of the 19:46 Toronto sample recovered the same 24 missing words, producing 3351 words instead of 3327. Other text and timestamps outside the target region were unchanged; exports had zero overlaps, invalid durations, or unresolved speech-coverage warnings. Runs took 198.42 and 210.82 seconds on the development machine.
+- This is a measured omission repair, not a claim of zero recognition errors. The quoted speaker's opening five words still have a late diarization transition; that separate boundary issue is not presented as fixed.
+- Existing translation regression evidence and targeted tests are retained. Release packaging does not rerun paid translation APIs or establish a new universal translation-quality score.
+
+### Packaging
+
+- macOS Apple Silicon: `SubForge-1.2.1-macos-arm64.dmg`, built locally.
+- Windows x64: `SubForge-1.2.1-windows-x64-setup.exe`, built and installation-smoke-tested by GitHub Actions. No separate CUDA installer is produced.
+- Frontend, Python runtime, and bundle version are synchronized. Installers exclude user credentials, subtitle samples, and separately downloaded large model weights.
+
+## v1.2.0 - 2026-08-31
+
+### Added
+
+- Adds a dedicated free-model availability page for NVIDIA's hosted catalog, with bounded, cancellable probes and separate results for responding, rate-limited, restricted, incompatible, and unavailable models. A successful probe is an availability check, not a translation-quality or quota guarantee.
+- Adds model-specific NVIDIA adapters for DeepSeek V4, GLM-5.3, Kimi K3, and Nemotron 3 Ultra. Model-family translation rules remain shared where appropriate, while endpoint-specific reasoning controls, output budgets, timeouts, and retry policies stay isolated.
+- Adds reproducible translation-quality manifests, offline replays, boundary diagnostics, evidence checks, repair planning, and task-level request/token/retry telemetry for evaluating future changes without replacing the validated production pipeline.
+- Expands the SRT post-editing protocol and contributor optimization guides, including source/timing preservation, single-speaker versus dialogue checks, sample provenance, and acceptance gates.
+
+### Improved
+
+- Extracts English and Chinese boundary detectors into focused modules with shared features and registries, preserving the existing production selection policy instead of enabling an unvalidated candidate workflow.
+- Removes keyword-triggered canned sentence rewrites that could introduce facts or delete qualifiers. Remaining local repairs require evidence from the current text and respect target language, speaker changes, language changes, and meaningful timing gaps.
+- Preserves validated translations when a later semantic-repair request fails, prevents overlapping repair windows from overwriting newer content, and avoids rerunning the complete finalizer when recovery has already failed once.
+- Keeps DeepSeek and switchable-reasoning models selective: routine translation and format checks do not become whole-document thinking passes. GLM/Kimi effort and Nemotron thinking are handled by their own adapters.
+- Preserves durable evaluation reports under `artifacts/` during a clean desktop build and continues to keep a single managed macOS app output.
+
+### Fixed
+
+- Fixed task start/cancel races, duplicate starts, stale cancellation responses clearing newer tasks, and delayed file loads overwriting edits made in the subtitle editor.
+- Fixed live preview updates becoming inconsistent after missing or out-of-order WebSocket messages; version gaps now recover from complete snapshots, and terminal results are protected from later mutable updates.
+- Fixed chunked transcription previews showing only a local chunk instead of cumulative subtitles on the global timeline.
+- Fixed failed or cancelled translation tasks losing usable recovery output when the requested folder was not writable. Recovery falls back to a task-specific application work directory and retains an existing temporary checkpoint if both persistent saves fail.
+- Fixed cleanup releasing same-file task locks while cancelled blocking workers were still running.
+- Fixed bilingual SRT, VTT, and ASS re-import handling, Unicode download filenames, and exact-file authorization for generated outputs.
+- Fixed the disabled text-optimization option still entering optimization paths.
+- Fixed packaged FasterWhisper missing its Silero VAD data on macOS, while allowing Intel builds that intentionally omit this optional engine. Packaged WhisperX smoke checks now match each platform's actual ASR runtime.
+
+### Validation
+
+- Python offline regression: `2414 passed, 35 deselected`; frontend: `26 passed`.
+- Ruff, TypeScript, ESLint, Next.js production build, and whitespace checks passed. Pyright reports `0 errors` with 29 existing warnings.
+- Regression coverage includes translation preservation, retry isolation, recovery finalization, task lifecycle races, preview revisions, bilingual parsing, and packaging resources.
+- The final safety audit used existing development samples only; this release does not claim a new end-to-end translation accuracy score or a measured API-token reduction.
+
+### Packaging
+
+- macOS Apple Silicon: `SubForge-1.2.0-macos-arm64.dmg`, built locally.
+- Windows x64: `SubForge-1.2.0-windows-x64-setup.exe`, built and installation-smoke-tested by GitHub Actions. No separate CUDA installer is produced.
+- Release assets are collected in a draft and published only after verification; historical release notes are retained.
+- Large ASR, forced-alignment, and speaker models remain separate downloads. Existing settings and model directories are not included in the installers.
+
+## v1.1.18 - 2026-08-27
+
+### Improved
+
+- Adds first-class GLM-5.3 and GLM-5.3-Flash request handling on Zhipu's official endpoint while keeping provider-specific controls isolated from other OpenAI-compatible services.
+- Maps SubForge's selective reasoning policy onto GLM-5.3's always-on thinking contract: routine translation and validation use low effort, while confirmed semantic repairs use high effort.
+- Keeps task-wide translation instructions and global context in a stable prompt prefix for GLM requests, improving automatic context-cache reuse across subtitle batches.
+- Applies the existing wait-and-retry policy to temporary Zhipu GLM API throttling instead of failing an otherwise recoverable subtitle task.
+
+### Fixed
+
+- Fixed GLM-5.3 requests failing when generic translation paths attempted to disable thinking, which this model family does not support.
+- Fixed source-dependent style guidance fragmenting the reusable GLM prompt prefix and reducing cache effectiveness.
+
+### Validation
+
+- Python: `1795 passed, 11 skipped`.
+- Focused GLM provider, retry, prompt-layout, and translation validation coverage: `647 passed`.
+- Ruff and whitespace validation passed; desktop packaging verification completed for the release build.
+
+### Packaging
+
+- macOS Apple Silicon: `SubForge-1.1.18-macos-arm64.dmg`.
+- Windows x64: `SubForge-1.1.18-windows-x64-setup.exe`, built and smoke-tested by GitHub Actions.
+- Whisper, forced-alignment, Community-1, ECAPA, and DeepFilterNet models remain separate on-demand downloads.
+
+## v1.1.17 - 2026-08-25
+
+### Improved
+
+- Audits word-level MLX coverage against high-confidence speech activity and restores short omissions only when two differently sized context windows decode the same new words.
+- Carries exact-content timing metadata from transcription into subtitle processing, allowing final sentence cues to receive bounded acoustic tail extension without reanalyzing unchanged media.
+- Expands spoken English amounts, currency ranges, percentages, years, models, and units before forced alignment, then restores display tokens with character-level mapping that tolerates contractions, sentence splits, and isolated unaligned words.
+- Extends cross-cue boundary review for subjects, predicates, complements, comparison phrases, sentence adverbials, names, numeric heads, and dialogue continuations while retaining selective reasoning for confirmed semantic risks.
+- Isolates third-party model downloads in cancellable worker processes and closes decoded audio resources deterministically.
+- Stores configured API credentials in the operating-system credential store when available and resolves only the secret needed by the active operation.
+
+### Fixed
+
+- Fixed short spoken phrases disappearing inside otherwise covered MLX transcription ranges.
+- Fixed compact numeric tokens receiving only a fraction of their spoken duration when one unrelated alignment word was missing or tokenized differently.
+- Fixed duplicate word cleanup shortening the surviving subtitle instead of retaining the later acoustic end time.
+- Fixed sentence cues ending before sustained speech, including cases where VAD continuation crosses one short following cue; extension remains bounded and never creates timeline overlap.
+- Fixed isolated word-level hallucinations over music surviving without corroborating speech evidence.
+- Fixed translation progress overcounting repeated preview updates and final subtitle processing losing access to the source media timing context.
+- Fixed repeated macOS Keychain prompts caused by resolving every saved provider credential during application startup.
+- Fixed DMG staging replacing an explicitly configured stable macOS signing identity with an ad-hoc signature.
+- Fixed long-running model downloads retaining uncancellable workers after the user cancels a task.
+
+### Validation
+
+- Python: `1786 passed, 11 skipped`.
+- Ruff and whitespace validation passed.
+- Regression coverage includes MLX omission recovery, mixed-language alignment, spoken-number restoration, conservative sentence-tail extension, cross-cue boundary ownership, credential persistence, and cancellable model downloads.
+- The corrected Heathrow sample exports 303 cues with zero overlaps and zero empty translations; reported amount, date, comparative, political-subject, and sentence-tail cases were checked against the source audio.
+
+### Packaging
+
+- macOS Apple Silicon: `SubForge-1.1.17-macos-arm64.dmg`.
+- Windows x64: `SubForge-1.1.17-windows-x64-setup.exe`, built and smoke-tested by GitHub Actions.
+- Whisper, forced-alignment, Community-1, ECAPA, and DeepFilterNet models remain separate on-demand downloads.
+
+## v1.1.16 - 2026-08-22
+
+### Improved
+
+- Protects open complements, fixed expressions, and cross-cue dependency pairs during sentence boundary selection so semantic units are not split merely to satisfy a preferred subtitle length.
+- Uses document-level evidence before correcting recurring ASR homophones, keeping genuine acoustic terms intact when the surrounding transcript does not support a correction.
+- Detects manufacturer-introduced product identifiers and carries their canonical form into later translation and validation windows.
+- Distinguishes audio demonstrations from visual demonstrations and expands automotive guidance for vents, one-touch windows, equipment parity, and figurative reviewer language.
+- Keeps native reasoning selective: ordinary translation and format validation remain non-reasoning operations, while confirmed ownership, word-order, and proper-name risks receive focused review.
+
+### Fixed
+
+- Fixed phrase fragments such as `write home about`, `sound system`, and open `put` complements being separated across subtitle boundaries.
+- Fixed recurring `bass/base` ASR ambiguity being corrected without sufficient document evidence.
+- Fixed official seat, package, and system names drifting between adjacent translation batches.
+- Fixed quiet components being translated as human behavior, audio playback being described as something shown on screen, and automatic window controls losing their established meaning.
+- Fixed Traditional Chinese characters and Latin proper names not owned by the source or confirmed context leaking into Simplified Chinese output.
+
+### Validation
+
+- Python: `1682 passed, 11 skipped`.
+- Ruff and Pyright passed with `0 errors`; whitespace validation passed.
+- Full DeepSeek V4 Flash regression: 618 bilingual cues with zero empty translations, placeholders, untranslated cues, Traditional-script leakage, or timeline overlaps.
+- The full regression completed 351 successful API requests with a 66.6% prompt-cache hit ratio; native reasoning remained confined to confirmed high-risk review windows.
+
+### Packaging
+
+- macOS Apple Silicon: `SubForge-1.1.16-macos-arm64.dmg`.
+- Windows x64: `SubForge-1.1.16-windows-x64-setup.exe`, built and smoke-tested by GitHub Actions.
+- Whisper, forced-alignment, Community-1, ECAPA, and DeepFilterNet models remain separate on-demand downloads.
+
 ## v1.1.15 - 2026-08-19
 
 ### Improved

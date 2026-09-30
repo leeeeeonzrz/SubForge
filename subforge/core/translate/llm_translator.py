@@ -14,10 +14,16 @@ import openai
 
 from subforge.core.llm import (
     call_llm,
+    get_response_history_message,
     get_response_text,
+    is_glm_53_model,
+    is_kimi_k3_model,
+    is_lmstudio_qwen_38_request,
+    is_nemotron_3_ultra_model,
     parse_json_object,
     prefers_native_reasoning,
 )
+from subforge.core.llm.client import LLMRequestCancelled
 from subforge.core.prompts import get_prompt
 from subforge.core.split.boundary import assess_english_boundary
 from subforge.core.translate.base import (
@@ -26,79 +32,57 @@ from subforge.core.translate.base import (
     SubtitleProcessData,
     logger,
 )
-from subforge.core.translate.context import TranslationContext
+from subforge.core.translate.context import TranslationContext, is_unsafe_global_term_source
 from subforge.core.translate.guidance import (
     repair_mode_guidance,
     target_language_style_rules,
 )
-from subforge.core.translate.quality import is_untranslated_output
+from subforge.core.translate.quality import (
+    ORDERED_CHINESE_BOUNDARY_DETECTORS,
+    CanonicalEvidenceSummary,
+    ChineseBoundaryFeatures,
+    PlannedReasoningMode,
+    ProviderCapabilities,
+    QualityDiagnostic,
+    RepairPlan,
+    RepairStrategy,
+    ShadowRepairComparison,
+    ShadowRepairObservation,
+    ShadowRepairRecorder,
+    ShadowRepairSummary,
+    TranslationModePolicy,
+    TranslationSession,
+    boundary_diagnostic_from_legacy_message,
+    build_translation_session,
+    collect_canonical_evidence,
+    detect_document_shortened_place,
+    detect_semantic_action_mismatch,
+    detect_visible_pause_boundary,
+    inspect_placeholders,
+    inspect_reasoning_leaks,
+    inspect_reflect_value_schema,
+    inspect_response_schema,
+    inspect_target_script,
+    is_untranslated_output,
+    legacy_diagnostic_message,
+    legacy_preserved_token_message,
+    select_translation_mode_policy,
+    translation_metadata_guidance,
+)
+from subforge.core.translate.quality.chinese_boundary_detectors.discourse_bridge import (
+    split_stranded_scope_adverb,
+)
+from subforge.core.translate.quality.closed_boundary import is_closed_soft_boundary
+from subforge.core.translate.quality.numbers import normalize_grouped_numbers
+from subforge.core.translate.quality.preservation import (
+    _CHINESE_ENTITY_ALIASES,
+    _CHINESE_TOKEN_EQUIVALENTS,
+    _SOURCE_TOKEN_EQUIVALENTS,
+    inspect_preserved_tokens,
+)
+from subforge.core.translate.quality.verdict_cache import PositiveVerdictCache
 from subforge.core.translate.types import TargetLanguage
 from subforge.core.utils.cache import generate_cache_key
-
-# Established Chinese names are semantic equivalents, not dropped source
-# tokens. Keep this table shared by the normal token validator and the
-# alignment-repair validator so the two stages cannot disagree.
-_CHINESE_ENTITY_ALIASES: Dict[str, Tuple[str, ...]] = {
-    "acura": ("讴歌",),
-    "bmw": ("宝马",),
-    "buick": ("别克",),
-    "civic": ("思域",),
-    "ford": ("福特",),
-    "gm": ("通用", "通用汽车"),
-    "honda": ("本田",),
-    "infiniti": ("英菲尼迪",),
-    "lexus": ("雷克萨斯",),
-    "mazda": ("马自达",),
-    "mercedes": ("奔驰", "梅赛德斯"),
-    "mercedes-benz": ("奔驰", "梅赛德斯奔驰", "梅赛德斯-奔驰"),
-    "nissan": ("日产",),
-    "toyota": ("丰田",),
-    "zf": ("采埃孚",),
-}
-
-# Standard localized forms are valid preservation of the source fact. Keep
-# these aliases deterministic so natural Chinese translations do not trigger
-# repeated LLM retries merely because they omit the original abbreviation.
-_CHINESE_TOKEN_EQUIVALENTS: Dict[str, Tuple[str, ...]] = {
-    "CO2": ("二氧化碳",),
-    "EU": ("欧盟", "欧洲联盟"),
-    "HD": ("高清", "高精", "高精度"),
-    "IAEA": ("国际原子能机构",),
-    "IRL": ("现实中", "现实生活中", "现实路况", "实际场景", "实际道路"),
-    "JFK": ("肯尼迪", "约翰肯尼迪", "约翰·肯尼迪"),
-    "NATO": ("北约", "北大西洋公约组织"),
-    "QR": ("二维码", "二维条码"),
-    "REM": ("快速眼动",),
-    "RPM": ("转/分", "每分钟转数", "转速"),
-    "SMR": ("小型模块化反应堆",),
-    "TV": ("电视", "电视节目", "影视节目"),
-    "UAE": ("阿联酋", "阿拉伯联合酋长国"),
-    "UK": ("英国", "联合王国"),
-    "UN": ("联合国",),
-    "WWII": ("二战", "第二次世界大战"),
-}
-
-# Expanded English forms own the same fact as their acronym. This prevents an
-# acronym introduced in one cue and expanded in the next from looking like a
-# cross-key leak merely because natural Chinese uses the expanded form.
-_SOURCE_TOKEN_EQUIVALENTS: Dict[str, Tuple[str, ...]] = {
-    "CO2": ("carbon dioxide",),
-    "EU": ("european union",),
-    "HD": ("high definition", "high-definition"),
-    "IAEA": ("international atomic energy agency",),
-    "IRL": ("in real life",),
-    "JFK": ("john f kennedy", "john fitzgerald kennedy", "kennedy airport"),
-    "NATO": ("north atlantic treaty organization",),
-    "QR": ("quick response code",),
-    "REM": ("rapid eye movement",),
-    "RPM": ("revolutions per minute",),
-    "SMR": ("small modular reactor", "small modular reactors"),
-    "TV": ("television",),
-    "UAE": ("united arab emirates",),
-    "UK": ("united kingdom", "britain", "british"),
-    "UN": ("united nations",),
-    "WWII": ("world war ii", "second world war"),
-}
 
 
 class LLMTranslator(BaseTranslator):
@@ -116,6 +100,8 @@ class LLMTranslator(BaseTranslator):
     REASONING_REWRITE_MAX_OUTPUT_TOKENS = 6144
     ALIGNMENT_REPAIR_CONTEXT = 1
     MULTISPEAKER_HANDOFF_MAX_GAP_MS = 450
+    CONTINUOUS_DISPLAY_GAP_MS = 120
+    SEPARATED_DISPLAY_GAP_MS = 300
     REASONING_METRIC_KEYS = (
         "audit_requests",
         "rewrite_requests",
@@ -138,6 +124,8 @@ class LLMTranslator(BaseTranslator):
         use_cache: bool = True,
         translation_context: Optional[TranslationContext] = None,
         llm_client: Any = None,
+        cache_namespace: str = "",
+        collect_canonical_evidence_telemetry: bool = False,
     ):
         super().__init__(
             thread_num=thread_num,
@@ -145,6 +133,7 @@ class LLMTranslator(BaseTranslator):
             target_language=target_language,
             update_callback=update_callback,
             use_cache=use_cache,
+            cache_namespace=cache_namespace,
         )
 
         self.model = model
@@ -157,13 +146,20 @@ class LLMTranslator(BaseTranslator):
         self._all_speaker_by_index: Dict[int, str] = {}
         self._all_language_by_index: Dict[int, str] = {}
         self._gap_after_index: Dict[int, int] = {}
+        self._translation_session: Optional[TranslationSession] = None
+        self._active_translation_policy: Optional[TranslationModePolicy] = None
         self.llm_client = llm_client
+        self._collect_canonical_evidence_telemetry = bool(collect_canonical_evidence_telemetry)
+        self._canonical_evidence_summary = CanonicalEvidenceSummary()
         self._fatal_provider_error = threading.Event()
         self._fatal_provider_message = ""
         self._pending_alignment_repair_keys: set[int] = set()
         self._pending_alignment_repair_lock = threading.Lock()
         self._reasoning_metrics_lock = threading.Lock()
         self._reasoning_metrics = self._empty_reasoning_metrics()
+        self._shadow_repair_recorder = ShadowRepairRecorder()
+        self._shadow_repair_context = threading.local()
+        self._positive_fidelity_verdicts = PositiveVerdictCache()
 
     @classmethod
     def _empty_reasoning_metrics(cls) -> Dict[str, int]:
@@ -183,6 +179,72 @@ class LLMTranslator(BaseTranslator):
         """Return one task's selective-reasoning counters."""
         with self._reasoning_metrics_lock:
             return dict(self._reasoning_metrics)
+
+    def _record_shadow_repair_plan(
+        self,
+        diagnostics: tuple[QualityDiagnostic, ...],
+    ) -> RepairPlan:
+        """Record a reproducible plan without changing legacy control flow."""
+        plan = self._shadow_repair_recorder.plan_and_record(
+            diagnostics,
+            capabilities=ProviderCapabilities(supports_reasoning=self._prefers_native_reasoning()),
+            session=self._translation_session,
+            cancelled=not self.is_running,
+        )
+        self._shadow_repair_context.last_plan = plan
+        return plan
+
+    def _last_shadow_repair_plan(self) -> RepairPlan | None:
+        plan = getattr(self._shadow_repair_context, "last_plan", None)
+        return plan if isinstance(plan, RepairPlan) else None
+
+    def _record_shadow_action_for_plan(
+        self,
+        plan: RepairPlan,
+        *,
+        strategy: RepairStrategy,
+        reasoning_mode: PlannedReasoningMode,
+    ) -> None:
+        """Record an explicitly executed candidate action for one captured plan."""
+        if self._last_shadow_repair_plan() == plan:
+            self._shadow_repair_context.last_plan = None
+        self._shadow_repair_recorder.record_legacy_action(
+            plan,
+            strategy=strategy,
+            reasoning_mode=reasoning_mode,
+        )
+
+    def _record_shadow_legacy_action(
+        self,
+        *,
+        strategy: RepairStrategy,
+        reasoning_mode: PlannedReasoningMode,
+    ) -> None:
+        plan = getattr(self._shadow_repair_context, "last_plan", None)
+        if not isinstance(plan, RepairPlan):
+            return
+        self._shadow_repair_context.last_plan = None
+        self._shadow_repair_recorder.record_legacy_action(
+            plan,
+            strategy=strategy,
+            reasoning_mode=reasoning_mode,
+        )
+
+    def shadow_repair_observations(self) -> tuple[ShadowRepairObservation, ...]:
+        """Return aggregated, text-free Phase 5 shadow evidence."""
+        return self._shadow_repair_recorder.snapshot()
+
+    def shadow_repair_comparisons(self) -> tuple[ShadowRepairComparison, ...]:
+        """Return aggregated planner-versus-legacy decisions without subtitle text."""
+        return self._shadow_repair_recorder.comparison_snapshot()
+
+    def shadow_repair_summary(self) -> ShadowRepairSummary:
+        """Return bounded, text-free evidence for candidate admission checks."""
+        return self._shadow_repair_recorder.summary()
+
+    def canonical_evidence_summary(self) -> CanonicalEvidenceSummary:
+        """Return text-free evidence about context canonicalization ownership."""
+        return self._canonical_evidence_summary
 
     def _log_reasoning_metrics(self) -> None:
         metrics = self.reasoning_metrics()
@@ -204,9 +266,26 @@ class LLMTranslator(BaseTranslator):
         self._fatal_provider_error.clear()
         self._fatal_provider_message = ""
         self._reset_reasoning_metrics()
+        self._positive_fidelity_verdicts.clear()
+        self._shadow_repair_recorder = ShadowRepairRecorder()
+        self._shadow_repair_context = threading.local()
+        self._canonical_evidence_summary = CanonicalEvidenceSummary()
         with self._pending_alignment_repair_lock:
             self._pending_alignment_repair_keys.clear()
         self._all_source_by_index = {i: seg.text for i, seg in enumerate(subtitle_data.segments, 1)}
+        if self._collect_canonical_evidence_telemetry:
+            self._canonical_evidence_summary = collect_canonical_evidence(
+                self.translation_context.terminology,
+                self._all_source_by_index,
+                parse_mapping=self._parse_context_asr_mapping,
+                has_document_support=self._context_mapping_has_document_support,
+            )
+        self._translation_session = build_translation_session(
+            subtitle_data,
+            target_language=self.target_language,
+            model=self.model,
+        )
+        self._active_translation_policy = select_translation_mode_policy(self._translation_session)
         self._all_language_by_index = {
             i: seg.language_code
             for i, seg in enumerate(subtitle_data.segments, 1)
@@ -235,15 +314,48 @@ class LLMTranslator(BaseTranslator):
             self._all_speaker_by_index = {}
             self._all_language_by_index = {}
             self._gap_after_index = {}
+            self._translation_session = None
+            self._active_translation_policy = None
+
+    def _translation_mode_policy(self) -> TranslationModePolicy:
+        if self._active_translation_policy is not None:
+            return self._active_translation_policy
+        return select_translation_mode_policy(
+            speakers=self._all_speaker_by_index.values(),
+            languages=self._all_language_by_index.values(),
+        )
 
     def _is_multispeaker_document(self) -> bool:
-        return len({speaker for speaker in self._all_speaker_by_index.values() if speaker}) > 1
+        return self._translation_mode_policy().is_dialogue
 
     def _batch_translation_prompt_name(self, *, reflect: bool) -> str:
         """Keep the proven monologue prompt separate from dialogue tuning."""
+        if is_lmstudio_qwen_38_request(self.model, self.llm_client):
+            return "translate/qwen_38_local"
+        if reflect and is_kimi_k3_model(self.model):
+            return "translate/reflect_kimi_k3"
         base = "reflect" if reflect else "standard"
-        suffix = "_multi" if self._is_multispeaker_document() else ""
-        return f"translate/{base}{suffix}"
+        return f"translate/{base}{self._translation_mode_policy().prompt_suffix}"
+
+    def _prefers_native_reasoning(self) -> bool:
+        """Select sparse reasoning with both model and endpoint capabilities."""
+        return prefers_native_reasoning(self.model) or is_lmstudio_qwen_38_request(
+            self.model,
+            self.llm_client,
+        )
+
+    def _assistant_followup_message(
+        self,
+        response: Any,
+        fallback_content: str,
+    ) -> Dict[str, Any]:
+        """Preserve K3 thinking history without changing other model flows."""
+        if is_kimi_k3_model(self.model):
+            try:
+                return get_response_history_message(response)
+            except ValueError:
+                pass
+        return {"role": "assistant", "content": fallback_content}
 
     def _is_edited_speaker_handoff(
         self,
@@ -274,6 +386,119 @@ class LLMTranslator(BaseTranslator):
                 right.original_text,
             ).risk
             >= 24
+        )
+
+    def _display_boundary_metadata(self, index: int) -> Dict[str, Any]:
+        """Describe whether adjacent cues are perceived as one display sequence."""
+        if index not in self._gap_after_index:
+            return {}
+        gap_ms = self._gap_after_index[index]
+        if gap_ms <= self.CONTINUOUS_DISPLAY_GAP_MS:
+            continuity = "continuous"
+        elif gap_ms >= self.SEPARATED_DISPLAY_GAP_MS:
+            continuity = "separated"
+        else:
+            continuity = "brief_pause"
+        return {
+            "gap_after_ms": gap_ms,
+            "display_continuity": continuity,
+        }
+
+    @staticmethod
+    def _dependent_boundary_repeats_meaning(left: str, right: str) -> bool:
+        """Detect repeated Chinese content inside an already proven source dependency."""
+
+        def bigrams(text: str) -> set[str]:
+            compact = re.sub(r"[^\u3400-\u9fff]", "", str(text or ""))
+            return {
+                compact[position : position + 2]
+                for position in range(len(compact) - 1)
+                if compact[position : position + 2]
+                not in {
+                    "一个",
+                    "一种",
+                    "这个",
+                    "那个",
+                    "这是",
+                    "就是",
+                    "亿美",
+                    "美元",
+                    "万元",
+                    "公里",
+                    "平方",
+                }
+            }
+
+        shared = bigrams(left) & bigrams(right)
+        return len(shared) >= 2
+
+    def _long_gap_chinese_boundary_signal(
+        self,
+        index: int,
+        left: str,
+        right: str,
+    ) -> str:
+        """Return only target fragments that become misleading across a real pause."""
+        features = ChineseBoundaryFeatures.from_text(
+            left,
+            right,
+            gap_ms=self._gap_after_index.get(index, 0),
+        )
+        match = detect_visible_pause_boundary(
+            features,
+            separated_gap_ms=self.SEPARATED_DISPLAY_GAP_MS,
+        )
+        return match.message if match is not None else ""
+
+    def _target_boundary_signal(self, index: int, left: str, right: str) -> str:
+        diagnostic = self._target_boundary_diagnostic(index, left, right)
+        return diagnostic.message if diagnostic is not None else ""
+
+    @staticmethod
+    def _source_ends_with_parallel_plural_attributes(source: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:all(?:\s+different)?|different|various)\s+"
+                r"[a-z][a-z'’-]*s\s+(?:and|or)\s+[a-z][a-z'’-]*s[,;:]?$",
+                str(source or "").strip(),
+                re.IGNORECASE,
+            )
+        )
+
+    def _target_boundary_diagnostic(
+        self,
+        index: int,
+        left: str,
+        right: str,
+    ) -> QualityDiagnostic | None:
+        message = self._long_gap_chinese_boundary_signal(
+            index,
+            left,
+            right,
+        ) or self._chinese_boundary_signal(left, right)
+        source = getattr(self, "_all_source_by_index", {}).get(index, "").strip()
+        if (
+            message == "possible function-word split"
+            and re.search(r"的[\s，。！？；：、,.!?;:…]*$", left)
+            and self._source_ends_with_parallel_plural_attributes(source)
+        ):
+            # English plural lists are complete nominal objects. A Chinese
+            # rendering ending in 的 has instead turned that object into an
+            # attributive phrase without a head noun.
+            message = "nominal modifier is stranded"
+        if (
+            getattr(getattr(self, "target_language", None), "value", None)
+            in {"简体中文", "繁体中文", "粤语"}
+            and self._gap_after_index.get(index, 0) < self.SEPARATED_DISPLAY_GAP_MS
+            and is_closed_soft_boundary(
+                source, self._all_source_by_index.get(index + 1, ""), left, right, message
+            )
+        ):
+            return None
+        return boundary_diagnostic_from_legacy_message(
+            message,
+            cue_keys=(index, index + 1),
+            evidence=(("left", left), ("right", right)),
         )
 
     def _translate_chunk(
@@ -351,6 +576,8 @@ class LLMTranslator(BaseTranslator):
         source_items: Optional[List[SubtitleProcessData]] = None,
     ) -> bool:
         """Audit reflective runs and explicitly non-English source subtitles."""
+        if is_lmstudio_qwen_38_request(self.model, self.llm_client):
+            return False
         if self.is_reflect:
             return True
         return bool(
@@ -381,7 +608,7 @@ class LLMTranslator(BaseTranslator):
             def audit_items(keys, translations=translated_dict):
                 items = {}
                 for key in keys:
-                    item = {
+                    item: Dict[str, Any] = {
                         "source": subtitle_dict[key],
                         "translation": translations[key],
                     }
@@ -390,12 +617,21 @@ class LLMTranslator(BaseTranslator):
                         speaker = self._all_speaker_by_index.get(numeric_key, "")
                         if speaker:
                             item["speaker"] = speaker
+                        item.update(self._display_boundary_metadata(numeric_key))
                         previous_source = self._all_source_by_index.get(numeric_key - 1, "")
                         next_source = self._all_source_by_index.get(numeric_key + 1, "")
                         if previous_source:
                             item["previous_source"] = previous_source
                         if next_source:
                             item["next_source"] = next_source
+                            source_signal = self._source_boundary_signal(
+                                subtitle_dict[key],
+                                next_source,
+                                translations[key],
+                                translations.get(str(numeric_key + 1), ""),
+                            )
+                            if source_signal:
+                                item["source_boundary_signal"] = source_signal
                     items[key] = item
                 return items
 
@@ -409,8 +645,19 @@ class LLMTranslator(BaseTranslator):
                 subtitle_dict,
                 translated_dict,
             )
+            prose_candidates = self._strong_chinese_prose_candidates(
+                subtitle_dict,
+                translated_dict,
+            )
             initial_flags = list(
-                dict.fromkeys([*first_flags, *strong_outliers, *semantic_candidates])
+                dict.fromkeys(
+                    [
+                        *first_flags,
+                        *strong_outliers,
+                        *semantic_candidates,
+                        *prose_candidates,
+                    ]
+                )
             )
             if not initial_flags:
                 return translated_dict
@@ -430,10 +677,16 @@ class LLMTranslator(BaseTranslator):
                 audit_items(key for key in ordered_keys if key in focus_keys),
                 focused=True,
             )
+            audit_flags = (
+                set(first_flags) | set(confirmed_flags)
+                if is_nemotron_3_ultra_model(self.model)
+                else set(first_flags) & set(confirmed_flags)
+            )
             confirmed = (
-                (set(first_flags) & set(confirmed_flags))
+                audit_flags
                 | set(strong_outliers)
                 | set(semantic_candidates)
+                | set(prose_candidates)
             )
             misaligned_keys = self._expand_confirmed_alignment_keys(
                 ordered_keys,
@@ -458,18 +711,27 @@ class LLMTranslator(BaseTranslator):
             for key in dict.fromkeys(misaligned_keys):
                 position = ordered_keys.index(key)
                 numeric_key = int(key) if key.isdigit() else None
+                previous_source = (
+                    subtitle_dict.get(ordered_keys[position - 1], "")
+                    if position > 0
+                    else self._all_source_by_index.get((numeric_key or 1) - 1, "")
+                )
+                next_source = (
+                    subtitle_dict.get(ordered_keys[position + 1], "")
+                    if position + 1 < len(ordered_keys)
+                    else self._all_source_by_index.get((numeric_key or -1) + 1, "")
+                )
                 try:
                     candidate[key] = self._translate_alignment_item(
                         subtitle_dict[key],
-                        previous_source=(
-                            subtitle_dict.get(ordered_keys[position - 1], "")
-                            if position > 0
-                            else self._all_source_by_index.get((numeric_key or 1) - 1, "")
-                        ),
-                        next_source=(
-                            subtitle_dict.get(ordered_keys[position + 1], "")
-                            if position + 1 < len(ordered_keys)
-                            else self._all_source_by_index.get((numeric_key or -1) + 1, "")
+                        source_key=key,
+                        previous_source=previous_source,
+                        next_source=next_source,
+                        repair_hint=self._selective_semantic_repair_hint(
+                            subtitle_dict[key],
+                            translated_dict.get(key, ""),
+                            previous_source=previous_source,
+                            next_source=next_source,
                         ),
                     )
                     repaired_keys.append(key)
@@ -490,6 +752,10 @@ class LLMTranslator(BaseTranslator):
                 require_reflect=False,
             )
             if not valid:
+                self._record_shadow_legacy_action(
+                    strategy=RepairStrategy.BATCH_REBUILD,
+                    reasoning_mode=PlannedReasoningMode.DISABLED,
+                )
                 recovery_chunk = [
                     SubtitleProcessData(
                         index=int(key),
@@ -511,6 +777,10 @@ class LLMTranslator(BaseTranslator):
                     require_reflect=False,
                 )
                 if not valid:
+                    self._record_shadow_legacy_action(
+                        strategy=RepairStrategy.NONE,
+                        reasoning_mode=PlannedReasoningMode.DISABLED,
+                    )
                     raise ValueError(error)
 
             residual_flags = self._request_alignment_flags(
@@ -521,7 +791,9 @@ class LLMTranslator(BaseTranslator):
                 focused=True,
             )
             unresolved_repairs = sorted(
-                (set(residual_flags) & set(repaired_keys)) - set(semantic_candidates)
+                (set(residual_flags) & set(repaired_keys))
+                - set(semantic_candidates)
+                - set(prose_candidates)
             )
             if unresolved_repairs:
                 for key in unresolved_repairs:
@@ -535,6 +807,10 @@ class LLMTranslator(BaseTranslator):
                     require_reflect=False,
                 )
                 if not valid:
+                    self._record_shadow_legacy_action(
+                        strategy=RepairStrategy.NONE,
+                        reasoning_mode=PlannedReasoningMode.DISABLED,
+                    )
                     raise ValueError(error)
                 fallback_flags = self._request_alignment_flags(
                     audit_items(unresolved_repairs, candidate),
@@ -663,6 +939,19 @@ class LLMTranslator(BaseTranslator):
             ):
                 candidates.append(key)
                 continue
+            semantic_action = detect_semantic_action_mismatch(
+                source,
+                translated,
+                previous_source=(
+                    self._all_source_by_index.get(int(key) - 1, "") if key.isdigit() else ""
+                ),
+                next_source=(
+                    self._all_source_by_index.get(int(key) + 1, "") if key.isdigit() else ""
+                ),
+            )
+            if semantic_action:
+                candidates.append(key)
+                continue
             if key.isdigit() and self._all_source_by_index:
                 numeric_key = int(key)
                 neighborhood = " ".join(
@@ -768,6 +1057,157 @@ class LLMTranslator(BaseTranslator):
                     candidates.append(key)
         return candidates
 
+    def _strong_chinese_prose_candidates(
+        self,
+        subtitle_dict: Dict[str, str],
+        translated_dict: Dict[str, str],
+    ) -> List[str]:
+        """Select sparse, high-confidence calques for the existing reasoning repair path."""
+        if self.target_language.value not in {"简体中文", "繁体中文", "粤语"}:
+            return []
+        return [
+            str(key)
+            for key, source in subtitle_dict.items()
+            if self._chinese_prose_repair_hint(
+                str(source or ""),
+                str(translated_dict.get(key, "") or ""),
+            )
+        ]
+
+    def _chinese_prose_repair_hint(self, source: str, translated: str) -> str:
+        """Explain a confirmed Chinese calque without prescribing one fixed translation."""
+        if self.target_language.value not in {"简体中文", "繁体中文", "粤语"}:
+            return ""
+
+        source_text = str(source or "")
+        compact_target = re.sub(r"[\s，。！？；：、,.!?;:]+", "", str(translated or ""))
+        if re.search(r"\bon\s+paper\b", source_text, re.IGNORECASE) and (
+            "纸面" in compact_target
+            or (
+                re.search(r"\bon\s+social\s+media\b", source_text, re.IGNORECASE)
+                and "理论" in compact_target
+            )
+        ):
+            return (
+                "The current Chinese is a literal 'on paper' calque. Infer whether the source "
+                "means accounts, apparent evidence, or theoretical feasibility, then use the "
+                "natural Chinese expression for that meaning. When it is coordinated with social "
+                "media as evidence of apparent success, use a shared evidence/perspective frame "
+                "and do not interpret it as 理论上. Do not retain 纸面 or 纸面上."
+            )
+        if re.search(
+            r"\b(?:economic|financial|commercial)\s+sense\b",
+            source_text,
+            re.IGNORECASE,
+        ) and re.search(r"(?:经济|财务|商业)(?:意义|含义)", compact_target):
+            return (
+                "Express practical economic or commercial viability as a natural Chinese "
+                "predicate, not the nominal calque 经济/财务/商业意义 or 含义."
+            )
+        if re.search(
+            r"\b(?:spark|ignite|inspire|awaken)\b.{0,100}"
+            r"\b(?:family|children|kids|audience|community|team)\b",
+            source_text,
+            re.IGNORECASE,
+        ) and re.search(
+            r"用.{0,10}(?:家人|孩子|观众|社区|团队).{0,10}(?:点燃|激发|唤起)",
+            compact_target,
+        ):
+            return (
+                "The animate participant is the experiencer or beneficiary of the emotion, not "
+                "an instrument used to create it. Preserve that semantic role in natural Chinese."
+            )
+        if re.search(
+            r"\b(?:approach|architecture|design|concept|strategy|technology)\b.{0,100}"
+            r"\b(?:product|delivered|delivery|implementation|implemented)\b",
+            source_text,
+            re.IGNORECASE,
+        ) and re.search(r"(?:交付方式|进行交付|作为一种(?:产品|商品)|建筑作为)", compact_target):
+            return (
+                "Rewrite the abstract English noun chain as a direct Chinese verb or state "
+                "describing how the idea is realized, deployed, or productized. Do not retain "
+                "交付方式, 进行交付, or 作为一种产品."
+            )
+        if (
+            re.search(r"\bhome\s+run\b", source_text, re.IGNORECASE)
+            and re.search(r"\bball\s+game\b", source_text, re.IGNORECASE)
+            and not (re.search(r"全垒打", translated) and re.search(r"(?:赛场|球场)", translated))
+        ):
+            return (
+                "The source deliberately links 'home run' and 'ball game'. Preserve both halves "
+                "as one natural Chinese sports image; keeping only the venue/field image or "
+                "reducing the home run to generic success loses the rhetoric."
+            )
+        if re.search(r"\broaring\s+success\b", source_text, re.IGNORECASE) and (
+            re.search(r"(?:轰动性成功|巨大成功|取得成功)", translated)
+            or not re.search(r"(?:大获成功|引起轰动|风靡|一炮而红)", translated)
+        ):
+            return (
+                "Preserve the emphatic force of 'roaring success' with concise vivid Chinese; "
+                "a flat generic 巨大成功/取得成功 or unnatural 轰动性成功 rendering is insufficient."
+            )
+        if re.search(r"\bwith\s+a\s+vengeance\b", source_text, re.IGNORECASE) and not re.search(
+            r"(?:来势|汹汹|猛烈|卷土重来|变本加厉)", translated
+        ):
+            return (
+                "Preserve the forceful return or escalation conveyed by 'with a vengeance'; "
+                "do not flatten it into a neutral return."
+            )
+        if re.search(r"\bDM\s+me\b", source_text, re.IGNORECASE) and re.search(
+            r"(?:DM私信|私信DM)",
+            compact_target,
+            re.IGNORECASE,
+        ):
+            return (
+                "DM is already expressed by the Chinese verb 私信. Use 私信我 or 给我发私信 "
+                "once; do not duplicate the same action as DM私信 or 私信DM."
+            )
+        return ""
+
+    def _deterministic_chinese_prose_fallback(self, source: str, translated: str) -> str:
+        """Apply semantic-safe idiom cleanup only after sparse LLM repair is exhausted."""
+        if self.target_language != TargetLanguage.SIMPLIFIED_CHINESE:
+            return translated
+
+        source_text = str(source or "")
+        repaired = str(translated or "")
+        if re.search(
+            r"\bon\s+paper\s+and\s+on\s+social\s+media\b",
+            source_text,
+            re.IGNORECASE,
+        ):
+            repaired = re.sub(
+                r"(?:从)?纸面(?:上)?和社交媒体(?:上)?(?:来)?看",
+                "从账面和社交媒体来看",
+                repaired,
+                count=1,
+            )
+        if re.search(r"\broaring\s+success\b", source_text, re.IGNORECASE):
+            repaired = re.sub(
+                r"(?:取得|获得)(?:了)?巨大成功",
+                "大获成功",
+                repaired,
+                count=1,
+            )
+            repaired = re.sub(
+                r"是(?:一场|一次)?轰动性成功",
+                "引起轰动",
+                repaired,
+                count=1,
+            )
+        if (
+            re.search(r"\bhome\s+run\b", source_text, re.IGNORECASE)
+            and re.search(r"\bball\s+game\b", source_text, re.IGNORECASE)
+            and re.search(r"(?:赛场|球场)", repaired)
+        ):
+            repaired = re.sub(
+                r"再(?:次)?创佳绩",
+                "再打出一记全垒打",
+                repaired,
+                count=1,
+            )
+        return repaired
+
     @staticmethod
     def _is_disfluent_alignment_fragment(source: str) -> bool:
         """Avoid rewriting short ASR fragments dominated by repeated words."""
@@ -796,6 +1236,15 @@ class LLMTranslator(BaseTranslator):
         system_prompt = f"""You are a conservative bilingual subtitle fidelity auditor for {self.target_language.value}.
 Compare every source with the translation under the SAME key. Read the ordered items as a continuous transcript so you can detect a run shifted forward or backward by one key. Flag a key only when its translation clearly omits material source meaning, contains a clause owned by another key, or belongs to a neighboring key. A sentence fragment can have a fragmentary translation and is not an error. Different word order, natural compression, pronoun omission, and stylistic quality are not alignment errors. Names, numbers, negation, comparisons, and conclusions are strong ownership anchors. The optional speaker field is anonymous metadata and speaker changes are hard boundaries. Do not write translations or judge style.{focus_instruction} You MUST evaluate every input key and return ONLY {{\"alignment\": {{\"key\": true_or_false}}, \"misaligned_keys\": [\"key\"]}}. The alignment object must contain every input key exactly once; true means ownership is correct. misaligned_keys must contain exactly the keys marked false."""
         system_prompt += (
+            "\nIf one source key ends inside a modifier, list, or other open phrase, distinguish "
+            "legitimate minimal Chinese reordering within that adjacent pair from a real shift. "
+            "Do not flag a pair when its combined meaning is complete exactly once and both cues "
+            "remain readable; do flag duplicated, omitted, unrelated, or prematurely concluded "
+            "material. Also flag an objectively wrong semantic-role assignment, such as turning "
+            "the person who experiences an emotion into the instrument that causes it."
+            " A source_boundary_signal is a deterministic dependency shortlist, not a verdict; "
+            "when it identifies a modifier-head or other indivisible phrase, verify that material "
+            "meaning from the following source was not moved into the current key."
             "\nIn addition to boundary alignment, mark a key false when its translation "
             "blindly follows an ASR rendering whose literal meaning is impossible in the "
             "explicit local topic. High-confidence cases include incompatible currency or "
@@ -829,6 +1278,7 @@ Compare every source with the translation under the SAME key. Read the ordered i
             model=self.model,
             temperature=0.1,
             use_cache=self.use_cache,
+            cache_namespace=self.cache_namespace,
             client=self.llm_client,
             # Classification needs a short exhaustive JSON verdict. Native
             # reasoning is reserved for the sparse rewrites selected below.
@@ -866,6 +1316,9 @@ Compare every source with the translation under the SAME key. Read the ordered i
         *,
         previous_source: str = "",
         next_source: str = "",
+        repair_hint: str = "",
+        source_key: str = "1",
+        allow_reasoning: bool = True,
     ) -> str:
         """Translate one flagged key with read-only context, then verify it separately."""
         system_prompt = f"""Translate the exact intended spoken meaning of current_source into {self.target_language.value}.
@@ -901,12 +1354,15 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
             "trade accuracy for polish. Keep the internal analysis concise and reserve enough "
             "output budget for the final answer. Return only the final translation."
         )
+        system_prompt += self._target_language_style_rules([source])
         role_hint = self._alignment_role_hint(source, previous_source, next_source)
         payload: Dict[str, Any] = {
             "previous_source": previous_source,
             "current_source": source,
             "next_source": next_source,
         }
+        if repair_hint:
+            payload["confirmed_repair_requirement"] = repair_hint
         if role_hint:
             payload["role_hint"] = role_hint
         reference_hint = self._alignment_reference_hint(source, previous_source)
@@ -921,6 +1377,8 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
             payload["current_source"] = asr_hint["normalized_source"]
             payload["high_confidence_asr_hint"] = asr_hint
             canonical = self._confirmed_context_canonical(source)
+            if asr_hint.get("kind") == "document_repeated_place_variant":
+                canonical = str(asr_hint.get("canonical") or "").strip()
             if canonical:
                 payload["confirmed_canonical_name"] = canonical
         messages = [
@@ -929,21 +1387,44 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
         ]
         last_error = "alignment item translation was invalid"
         for attempt in range(2):
-            use_reasoning = attempt == 0 and prefers_native_reasoning(self.model)
+            use_reasoning = allow_reasoning and attempt == 0 and self._prefers_native_reasoning()
             if use_reasoning:
                 self._record_reasoning_metric("rewrite_requests")
-            response = call_llm(
-                messages=messages,
-                model=self.model,
-                temperature=0.1,
-                use_cache=self.use_cache,
-                client=self.llm_client,
-                reasoning_mode="enabled" if use_reasoning else "disabled",
-                max_output_tokens=(
-                    self.REASONING_REWRITE_MAX_OUTPUT_TOKENS if use_reasoning else 4096
-                ),
-                **({"reasoning_effort": "low"} if use_reasoning else {}),
-            )
+            try:
+                response = call_llm(
+                    messages=messages,
+                    model=self.model,
+                    temperature=0.1,
+                    use_cache=self.use_cache,
+                    cache_namespace=self.cache_namespace,
+                    client=self.llm_client,
+                    reasoning_mode="enabled" if use_reasoning else "disabled",
+                    max_output_tokens=(
+                        self.REASONING_REWRITE_MAX_OUTPUT_TOKENS if use_reasoning else 4096
+                    ),
+                    **({"reasoning_effort": "low"} if use_reasoning else {}),
+                )
+            except Exception as error:
+                if self._is_fatal_provider_error(error):
+                    raise
+                last_error = str(error).strip() or error.__class__.__name__
+                if attempt == 0:
+                    if use_reasoning:
+                        self._record_reasoning_metric("no_final_answers")
+                        self._record_reasoning_metric("rejected_repairs")
+                        self._record_reasoning_metric("fallback_requests")
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous selective repair request failed temporarily: "
+                                f"{last_error}. Retry the same exact task without reasoning and "
+                                "return only the complete final translation."
+                            ),
+                        }
+                    )
+                    continue
+                raise ValueError(last_error) from error
             try:
                 translated = get_response_text(response).strip()
                 if use_reasoning:
@@ -966,21 +1447,36 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
                         str(asr_hint.get("normalized_source") or source) if asr_hint else source
                     )
                     valid, error = self._validate_llm_response(
-                        {"1": translated},
-                        {"1": validation_source},
+                        {source_key: translated},
+                        {source_key: validation_source},
                         require_reflect=False,
                     )
+                    if valid:
+                        remaining_issue = self._selective_semantic_repair_hint(
+                            source,
+                            translated,
+                            previous_source=previous_source,
+                            next_source=next_source,
+                        )
+                        if repair_hint and remaining_issue:
+                            last_error = remaining_issue
+                            valid = False
                     if valid:
                         if use_reasoning:
                             self._record_reasoning_metric("accepted_repairs")
                         return translated
-                    last_error = error
+                    self._record_shadow_legacy_action(
+                        strategy=(RepairStrategy.RETRY if attempt == 0 else RepairStrategy.NONE),
+                        reasoning_mode=PlannedReasoningMode.DISABLED,
+                    )
+                    if error:
+                        last_error = error
             if attempt == 0:
                 if use_reasoning:
                     self._record_reasoning_metric("rejected_repairs")
                     self._record_reasoning_metric("fallback_requests")
                 if translated:
-                    messages.append({"role": "assistant", "content": translated})
+                    messages.append(self._assistant_followup_message(response, translated))
                 messages.append(
                     {
                         "role": "user",
@@ -1069,7 +1565,8 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
                 continue
             if not re.search(rf"(?<!\w){re.escape(heard)}(?!\w)", source, re.IGNORECASE):
                 continue
-            if self._all_source_by_index and not self._context_variant_has_document_support(
+            if self._all_source_by_index and not self._context_mapping_has_document_support(
+                heard,
                 canonical,
                 source,
             ):
@@ -1109,6 +1606,69 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
             return ""
         return canonical
 
+    def _confirmed_context_epithet_target(self, source: str) -> str:
+        """Return the reviewed target rendering for an explicit contextual epithet."""
+        for raw_line in self.translation_context.terminology.splitlines():
+            line = str(raw_line or "").lstrip("- ").strip()
+            if " -> " not in line or not re.search(
+                r"(?:epithet|nickname|non-?literal|别称|別稱|绰号|綽號|非字面)",
+                line,
+                flags=re.IGNORECASE,
+            ):
+                continue
+            heard, target_with_note = line.split(" -> ", 1)
+            heard = heard.strip()
+            target = re.sub(r"\s+\(.*$", "", target_with_note).strip()
+            if (
+                heard
+                and target
+                and re.search(rf"(?<!\w){re.escape(heard)}(?!\w)", source, re.IGNORECASE)
+            ):
+                return target
+        return ""
+
+    def _confirmed_context_official_identifier_target(self, source: str) -> str:
+        """Return a manufacturer label deterministically confirmed in document context."""
+        for raw_line in self.translation_context.terminology.splitlines():
+            line = str(raw_line or "").lstrip("- ").strip()
+            if " -> " not in line or not re.search(
+                r"official\s+manufacturer\s+identifier",
+                line,
+                flags=re.IGNORECASE,
+            ):
+                continue
+            heard, target_with_note = line.split(" -> ", 1)
+            heard = heard.strip()
+            target = re.sub(r"\s+\(.*$", "", target_with_note).strip()
+            if (
+                heard
+                and target
+                and re.search(
+                    rf"(?<!\w){re.escape(heard)}(?!\w)",
+                    source,
+                    flags=re.IGNORECASE,
+                )
+            ):
+                return target
+        return ""
+
+    def _confirmed_context_acronym_target(self, source: str) -> tuple[str, str] | None:
+        """Return a CJK expansion for an acronym explicitly mapped in context."""
+        for raw_line in self.translation_context.terminology.splitlines():
+            line = str(raw_line or "").lstrip("- ").strip()
+            if " -> " not in line:
+                continue
+            acronym, target_with_note = line.split(" -> ", 1)
+            acronym = acronym.strip()
+            target = re.sub(r"\s+\(.*$", "", target_with_note).strip()
+            if (
+                re.fullmatch(r"[A-Z][A-Z0-9&-]{1,9}", acronym)
+                and re.search(r"[㐀-鿿]", target)
+                and re.search(rf"(?<!\w){re.escape(acronym)}(?!\w)", source)
+            ):
+                return acronym, target
+        return None
+
     @staticmethod
     def _parse_context_asr_mapping(raw_line: str) -> tuple[str, str] | None:
         """Read one ASR terminology line without treating its note as a name.
@@ -1129,6 +1689,8 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
             return None
         heard, target_with_note = line.split(" -> ", 1)
         heard = heard.strip()
+        if is_unsafe_global_term_source(heard):
+            return None
         explicit = re.search(
             r"(?:for|intended(?:\s+as)?|should\s+be|"
             r"correct(?:ed)?(?:\s+as|\s+to)?)\s+['\"]([^'\"]{2,80})['\"]",
@@ -1205,6 +1767,14 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
                 if phrase in evidence:
                     return True
         return len(tokens) <= 1 and cleaned.casefold() in evidence
+
+    def _context_mapping_has_document_support(
+        self,
+        heard: str,
+        canonical: str,
+        source: str,
+    ) -> bool:
+        return self._context_variant_has_document_support(canonical, source)
 
     def _document_model_asr_variant(self, source: str) -> Dict[str, str]:
         """Reconcile a phonetic model mention with a repeated document subject."""
@@ -1346,6 +1916,22 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
         document_variant = self._document_model_asr_variant(source)
         if document_variant:
             return document_variant
+        shortened_place = detect_document_shortened_place(
+            source,
+            self._all_source_by_index.values(),
+        )
+        if shortened_place:
+            canonical, normalized = shortened_place
+            return {
+                "kind": "document_repeated_place_variant",
+                "canonical": canonical,
+                "instruction": (
+                    "The document explicitly names this numbered road elsewhere. The shortened "
+                    "plural form in a return-to navigation phrase refers to that same unique "
+                    "place, not a remaining distance."
+                ),
+                "normalized_source": normalized,
+            }
         if re.search(r"\bElantra\s+M\b", source, re.IGNORECASE) and any(
             re.search(r"\bElantra\s+N\b", value, re.IGNORECASE)
             for value in self._all_source_by_index.values()
@@ -1380,6 +1966,42 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
         if context_variant:
             return context_variant
 
+        construction_products = re.search(
+            r"\b(?P<count>\d{1,3})\s+"
+            r"(?P<modifier>(?:[a-z][a-z-]*\s+){0,3})"
+            r"construction\s+products\b",
+            source,
+            flags=re.IGNORECASE,
+        )
+        if (
+            construction_products
+            and re.search(
+                r"\b(?:called|named|titled)\b",
+                previous_source,
+                flags=re.IGNORECASE,
+            )
+            and re.search(
+                rf"\b{re.escape(construction_products.group('count'))}\s+projects\b",
+                next_source,
+                flags=re.IGNORECASE,
+            )
+        ):
+            return {
+                "kind": "locally_confirmed_common_noun_variant",
+                "instruction": (
+                    "The previous cue introduces a title and the next cue independently "
+                    "repeats the same count as projects. In this title, ASR rendered "
+                    "'construction projects' as 'construction products'."
+                ),
+                "normalized_source": re.sub(
+                    r"\bconstruction\s+products\b",
+                    "construction projects",
+                    source,
+                    count=1,
+                    flags=re.IGNORECASE,
+                ),
+            }
+
         lexical_repairs = (
             (
                 r"\bhot\s+hat\b",
@@ -1400,6 +2022,24 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
                 r"\bdealer\s+accessory\s+matte\b",
                 "dealer accessory mat",
                 "The opened cargo-area accessory is a mat; 'matte' is an ASR homophone.",
+            ),
+            (
+                r"\bstick\s+the\s+car\s+in\s+the\s+car\b",
+                "stick the key in the car",
+                "The physical action is inserting the key into the car; repeating 'car' as "
+                "both the inserted object and container is an impossible ASR rendering.",
+            ),
+            (
+                r"\bnot\s+an\s+up\s+badge\b",
+                "not an M badge",
+                "The comparison is with a recognizable BMW M badge; 'up badge' is a "
+                "letter-name ASR error in this automotive context.",
+            ),
+            (
+                r"\bdine[ -]in\s+bits\b",
+                "Dinan bits",
+                "Dealer-installed performance parts and their D identifiers refer to Dinan; "
+                "the restaurant phrase 'dine-in' is a phonetic ASR error.",
             ),
         )
         for pattern, replacement, instruction in lexical_repairs:
@@ -1670,6 +2310,7 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
         elif hint.get("kind") in {
             "context_confirmed_asr_variant",
             "document_repeated_model_variant",
+            "document_repeated_place_variant",
             "known_automotive_name_asr_variant",
         }:
             canonical = str(hint.get("canonical") or "").strip()
@@ -1720,6 +2361,19 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
                 not re.search(r"(?:脚垫|地垫|垫)", translated) or "哑光" in translated
             ):
                 return "The confirmed cargo accessory is a mat, not a matte finish."
+            if "stick the key in the car" in normalized and "钥匙" not in translated:
+                return "The confirmed inserted object is the car key, not the car itself."
+            if "not an m badge" in normalized and not re.search(
+                r"(?:M|m).{0,4}(?:徽章|标识|标志)", translated
+            ):
+                return "The confirmed comparison is with an M badge."
+            if "dinan bits" in normalized and (
+                not re.search(r"(?:Dinan|迪南)", translated, re.IGNORECASE) or "堂食" in translated
+            ):
+                return "The confirmed dealer-installed parts are Dinan parts, not dine-in items."
+        elif hint.get("kind") == "locally_confirmed_common_noun_variant":
+            if "产品" in translated or not re.search(r"(?:工程|项目)", translated):
+                return "The context-confirmed title names construction projects, not products."
         elif hint.get("kind") == "reverse_control_punctuation":
             if not re.search(r"(?:挂|切换|切)入?倒挡|倒挡", translated) or re.search(
                 r"倒车(?:.{0,6})(?:离开|驶出)(?:市区|城市)|"
@@ -1731,6 +2385,38 @@ Translate ONLY current_source. Use previous_source and next_source solely to res
             if not re.search(r"(?:车身|结构).{0,4}(?:胶|粘合剂)|车身粘合剂", translated):
                 return "The confirmed material is structural body adhesive, not generic goop."
         return ""
+
+    def _semantic_action_repair_hint(
+        self,
+        source: str,
+        translated: str,
+        *,
+        previous_source: str = "",
+        next_source: str = "",
+    ) -> str:
+        signal = detect_semantic_action_mismatch(
+            source,
+            translated,
+            previous_source=previous_source,
+            next_source=next_source,
+        )
+        return signal.hint if signal else ""
+
+    def _selective_semantic_repair_hint(
+        self,
+        source: str,
+        translated: str,
+        *,
+        previous_source: str = "",
+        next_source: str = "",
+    ) -> str:
+        """Combine independent high-confidence hints for one sparse repair request."""
+        return self._semantic_action_repair_hint(
+            source,
+            translated,
+            previous_source=previous_source,
+            next_source=next_source,
+        ) or self._chinese_prose_repair_hint(source, translated)
 
     def _clean_alignment_item(self, source: str, candidate: str) -> str:
         """Remove context-borrowed clauses without losing valid disambiguation."""
@@ -1753,6 +2439,7 @@ Delete every fact, action, object, name, number, or clause that current_source d
             model=self.model,
             temperature=0.0,
             use_cache=self.use_cache,
+            cache_namespace=self.cache_namespace,
             client=self.llm_client,
             reasoning_mode="disabled",
             max_output_tokens=2048,
@@ -1766,6 +2453,10 @@ Delete every fact, action, object, name, number, or clause that current_source d
             require_reflect=False,
         )
         if not valid:
+            self._record_shadow_legacy_action(
+                strategy=RepairStrategy.NONE,
+                reasoning_mode=PlannedReasoningMode.DISABLED,
+            )
             raise ValueError(error)
         return cleaned
 
@@ -1813,7 +2504,9 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 else f"{system_prompt}\n\n{compact_output}"
             )
         system_prompt += self._dialogue_prompt_rules(subtitle_dict)
-        system_prompt += self._target_language_style_rules(subtitle_dict.values())
+        style_rules = self._target_language_style_rules(subtitle_dict.values())
+        if not is_glm_53_model(self.model):
+            system_prompt += style_rules
         context_text = self.translation_context.render()
         if context_text:
             system_prompt = (
@@ -1825,6 +2518,10 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 "Translate ONLY the current_subtitles keys. "
                 "previous_context and next_context are context only; do not output them."
             )
+        if is_glm_53_model(self.model):
+            # GLM caches the stable task-wide prefix. Append batch-specific
+            # source hints only after the shared global context.
+            system_prompt += style_rules
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -1848,6 +2545,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 model=self.model,
                 temperature=self.TRANSLATION_TEMPERATURE,
                 use_cache=self.use_cache,
+                cache_namespace=self.cache_namespace,
                 client=self.llm_client,
                 # The main batch is broad generation, not a confirmed defect.
                 # Reserve native thinking for sparse semantic/fluency rewrites.
@@ -1865,6 +2563,8 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     self.MAX_STEPS,
                     exc,
                 )
+                if is_kimi_k3_model(self.model):
+                    messages.append(self._assistant_followup_message(response, content or ""))
                 messages.append(
                     {
                         "role": "user",
@@ -1881,11 +2581,17 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             if is_valid:
                 return cast(Dict[str, Any], response_dict)
             else:
+                self._record_shadow_legacy_action(
+                    strategy=(
+                        RepairStrategy.RETRY if step + 1 < self.MAX_STEPS else RepairStrategy.NONE
+                    ),
+                    reasoning_mode=PlannedReasoningMode.DISABLED,
+                )
                 messages.append(
-                    {
-                        "role": "assistant",
-                        "content": json.dumps(response_dict, ensure_ascii=False),
-                    }
+                    self._assistant_followup_message(
+                        response,
+                        json.dumps(response_dict, ensure_ascii=False),
+                    )
                 )
                 messages.append(
                     {
@@ -1904,6 +2610,10 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         # Validate last attempt before returning
         is_valid, error_msg = self._validate_llm_response(last_response_dict, subtitle_dict)
         if not is_valid:
+            self._record_shadow_legacy_action(
+                strategy=RepairStrategy.NONE,
+                reasoning_mode=PlannedReasoningMode.DISABLED,
+            )
             logger.warning(
                 f"LLM translation failed validation after {self.MAX_STEPS} retries: {error_msg}"
             )
@@ -1948,16 +2658,37 @@ Return exactly one JSON object with all and only the current_subtitles keys:
     ) -> None:
         if self.target_language.value not in {"简体中文", "繁体中文", "粤语"}:
             return
+
+        def normalize(key: str, translated: str) -> str:
+            result = self._normalize_stacked_chinese_connectives(translated)
+            source = self._all_source_by_index.get(int(key), "") if str(key).isdigit() else ""
+            mapping = self._confirmed_context_acronym_target(source)
+            if not mapping:
+                return result
+            acronym, target = mapping
+            result = re.sub(
+                rf"{re.escape(acronym)}\s*[（(]?\s*{re.escape(target)}\s*[）)]?",
+                target,
+                result,
+                flags=re.IGNORECASE,
+            )
+            return re.sub(
+                rf"{re.escape(target)}\s*[（(]?\s*{re.escape(acronym)}\s*[）)]?",
+                target,
+                result,
+                flags=re.IGNORECASE,
+            )
+
         for key, value in list(response_dict.items()):
             if isinstance(value, str):
-                response_dict[key] = self._normalize_stacked_chinese_connectives(value)
+                response_dict[key] = normalize(key, value)
                 continue
             if not isinstance(value, dict):
                 continue
             for field in ("native_translation", "initial_translation", "translation"):
                 translated = value.get(field)
                 if isinstance(translated, str):
-                    value[field] = self._normalize_stacked_chinese_connectives(translated)
+                    value[field] = normalize(key, translated)
 
     def _neighbor_context(
         self, subtitle_dict: Dict[str, str], before: bool
@@ -2012,36 +2743,12 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             self._all_speaker_by_index.get(int(key)) for key in subtitle_dict if str(key).isdigit()
         )
         has_languages = any(
-            self._all_language_by_index.get(int(key))
-            for key in subtitle_dict
-            if str(key).isdigit()
+            self._all_language_by_index.get(int(key)) for key in subtitle_dict if str(key).isdigit()
         )
-        rules = []
-        if has_speakers:
-            rules.append(
-                "<dialogue_metadata>\n"
-                "current_subtitles values may include an anonymous speaker field. Use speaker "
-                "changes and neighboring turns only to resolve who is responding, pronouns, "
-                "ellipsis, intent, tone, and register. The speaker value is metadata, not "
-                "subtitle text. Never translate, repeat, rename, or output speaker labels. "
-                "Never merge dialogue turns or move meaning between keys.\n"
-                "</dialogue_metadata>"
-            )
-        if has_languages:
-            rules.append(
-                "<source_language_metadata>\n"
-                "source_language is authoritative ASR metadata: en means English, ja means "
-                "Japanese, and mixed means that the key contains more than one source language. "
-                "Translate every source-language span into the requested target language. "
-                "Do not normalize a Japanese span into English, omit it, or leave kana copied "
-                "into a Chinese translation. If an isolated Japanese cue ends with a connective "
-                "such as ので or のに and the following cue changes language, render it as a "
-                "complete natural target-language sentence rather than a dangling 'because' or "
-                "'although' fragment. Language metadata is read-only and must not appear "
-                "in the output.\n"
-                "</source_language_metadata>"
-            )
-        return "\n\n" + "\n".join(rules) if rules else ""
+        return translation_metadata_guidance(
+            include_speakers=has_speakers,
+            include_languages=has_languages,
+        )
 
     def _target_language_style_rules(self, source_texts=()) -> str:
         return target_language_style_rules(
@@ -2061,34 +2768,17 @@ Return exactly one JSON object with all and only the current_subtitles keys:
 
         Returns: (is_valid, error_feedback)
         """
-        if not isinstance(response_dict, dict):
-            return (
-                False,
-                f"Output must be a dict, got {type(response_dict).__name__}. Use format: {{'0': 'text', '1': 'text'}}",
-            )
-
+        self._shadow_repair_context.last_plan = None
         expected_keys = set(subtitle_dict.keys())
+        schema_diagnostics = inspect_response_schema(response_dict, expected_keys)
+        if schema_diagnostics:
+            self._record_shadow_repair_plan(schema_diagnostics)
+            return False, legacy_diagnostic_message(schema_diagnostics)
+        response_dict = cast(Dict[str, Any], response_dict)
         actual_keys = set(response_dict.keys())
 
         def sort_keys(keys):
-            return sorted(keys, key=lambda x: int(x) if x.isdigit() else x)
-
-        # 检查键是否匹配
-        if expected_keys != actual_keys:
-            missing = expected_keys - actual_keys
-            extra = actual_keys - expected_keys
-            error_parts = []
-
-            if missing:
-                error_parts.append(
-                    f"Missing keys {sort_keys(missing)} - you must translate these items"
-                )
-            if extra:
-                error_parts.append(
-                    f"Extra keys {sort_keys(extra)} - these keys are not in input, remove them"
-                )
-
-            return (False, "; ".join(error_parts))
+            return sorted(keys, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
 
         # Helper: extract translated text from a response value
         def _extract_text(val):
@@ -2100,26 +2790,66 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         _cjk_langs = {"简体中文", "繁体中文", "日本語", "韩语", "粤语"}
         _is_cjk_target = self.target_language.value in _cjk_langs
         if _is_cjk_target:
-            untranslated = []
-            for key in sort_keys(actual_keys):
-                if key not in expected_keys:
-                    continue
-                text = _extract_text(response_dict[key])
-                original = subtitle_dict.get(key, "")
-                source_language = (
-                    self._all_language_by_index.get(int(key), "")
-                    if str(key).isdigit()
-                    else ""
-                )
-                if self._looks_untranslated_for_cjk(text, original, source_language):
-                    untranslated.append(key)
-            if untranslated:
-                return (
-                    False,
-                    f"Translation to {self.target_language.value} failed: {len(untranslated)}/{len(expected_keys)} entries are still in the source language. "
-                    f"You MUST translate ALL entries to {self.target_language.value}. Output target-language characters, not English. "
-                    f"Untranslated keys: {untranslated[:20]}",
-                )
+            source_languages = {
+                key: self._all_language_by_index.get(int(key), "")
+                for key in actual_keys
+                if str(key).isdigit()
+            }
+            untranslated_diagnostic = inspect_target_script(
+                response_dict,
+                subtitle_dict,
+                target_language=self.target_language,
+                source_language_by_key=source_languages,
+            )
+            if untranslated_diagnostic is not None:
+                self._record_shadow_repair_plan((untranslated_diagnostic,))
+                return False, untranslated_diagnostic.message
+
+        reasoning_leak_diagnostic = inspect_reasoning_leaks(
+            response_dict,
+            subtitle_dict,
+        )
+        if reasoning_leak_diagnostic is not None:
+            self._record_shadow_repair_plan((reasoning_leak_diagnostic,))
+            return False, reasoning_leak_diagnostic.message
+
+        script_ok, script_error = self._validate_target_chinese_script(
+            response_dict,
+            subtitle_dict,
+            _extract_text,
+        )
+        if not script_ok:
+            return False, script_error
+
+        missing_epithets = []
+        for key in sort_keys(actual_keys):
+            source = subtitle_dict.get(key, "")
+            target = self._confirmed_context_epithet_target(source)
+            translated = _extract_text(response_dict[key])
+            if target and target not in translated:
+                missing_epithets.append(f"{key}:{target}")
+        if missing_epithets:
+            return (
+                False,
+                "Use each reviewed cultural or geographic epithet target exactly in the key "
+                "that contains its source phrase. Do not replace it with a literal calque. "
+                f"Missing contextual epithet targets: {missing_epithets[:20]}",
+            )
+
+        missing_identifiers = []
+        for key in sort_keys(actual_keys):
+            source = subtitle_dict.get(key, "")
+            target = self._confirmed_context_official_identifier_target(source)
+            translated = _extract_text(response_dict[key])
+            if target and target not in translated:
+                missing_identifiers.append(f"{key}:{target}")
+        if missing_identifiers:
+            return (
+                False,
+                "Preserve each manufacturer-introduced official identifier exactly as supplied "
+                "by global terminology. Translate only its generic head noun, such as seat, "
+                f"system, package, or mode. Missing identifiers: {missing_identifiers[:20]}",
+            )
 
         editorial_ok, editorial_error = self._validate_no_added_editorial_labels(
             response_dict,
@@ -2173,6 +2903,14 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         if not natural_chinese_ok:
             return False, natural_chinese_error
 
+        technical_terms_ok, technical_terms_error = self._validate_no_weakened_technical_compounds(
+            response_dict,
+            subtitle_dict,
+            _extract_text,
+        )
+        if not technical_terms_ok:
+            return False, technical_terms_error
+
         contextual_chinese_ok, contextual_chinese_error = (
             self._validate_natural_chinese_contextual_constructions(
                 response_dict,
@@ -2182,6 +2920,30 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         )
         if not contextual_chinese_ok:
             return False, contextual_chinese_error
+
+        idiom_ok, idiom_error = self._validate_contextual_idioms(
+            response_dict,
+            subtitle_dict,
+            _extract_text,
+        )
+        if not idiom_ok:
+            return False, idiom_error
+
+        medium_ok, medium_error = self._validate_contextual_demonstration_medium(
+            response_dict,
+            subtitle_dict,
+            _extract_text,
+        )
+        if not medium_ok:
+            return False, medium_error
+
+        automotive_ok, automotive_error = self._validate_contextual_automotive_terms(
+            response_dict,
+            subtitle_dict,
+            _extract_text,
+        )
+        if not automotive_ok:
+            return False, automotive_error
 
         automotive_numbers_ok, automotive_numbers_error = (
             self._validate_elliptical_automotive_numbers(
@@ -2211,6 +2973,14 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         if not residue_ok:
             return False, residue_error
 
+        latin_names_ok, latin_names_error = self._validate_no_unowned_latin_names(
+            response_dict,
+            subtitle_dict,
+            _extract_text,
+        )
+        if not latin_names_ok:
+            return False, latin_names_error
+
         boundary_ok, boundary_error = self._validate_cross_key_boundaries(
             response_dict,
             subtitle_dict,
@@ -2224,24 +2994,125 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         if require_reflect is None:
             require_reflect = self.is_reflect
         if require_reflect:
-            for key, value in response_dict.items():
-                if isinstance(value, str) and value.strip():
-                    continue
-                if not isinstance(value, dict):
-                    return (
-                        False,
-                        f"Key '{key}': value must be a translation string or a dict with "
-                        f"'native_translation'. Got {type(value).__name__}.",
-                    )
-
-                if "native_translation" not in value:
-                    available_keys = list(value.keys())
-                    return (
-                        False,
-                        f"Key '{key}': missing 'native_translation' field. Found keys: {available_keys}. Must include 'native_translation'.",
-                    )
+            reflect_diagnostic = inspect_reflect_value_schema(response_dict)
+            if reflect_diagnostic is not None:
+                self._record_shadow_repair_plan((reflect_diagnostic,))
+                return False, reflect_diagnostic.message
 
         return True, ""
+
+    def _validate_target_chinese_script(
+        self,
+        response_dict: Dict[str, Any],
+        subtitle_dict: Dict[str, str],
+        extract_text,
+    ) -> Tuple[bool, str]:
+        """Keep an explicitly Simplified-Chinese task in the requested script."""
+        if self.target_language != TargetLanguage.SIMPLIFIED_CHINESE:
+            return True, ""
+
+        # These forms are unambiguous Traditional-script variants of common subtitle
+        # vocabulary. A compact rejection list avoids a runtime conversion dependency
+        # and lets the model rewrite the complete sentence instead of altering names.
+        traditional_only = re.compile(
+            r"[為這開來個裡麼說應會點無體總聲轉檔覺給過從們實經變讓較並進發現後時別將區見萬僅與還車種臺輛學]"
+        )
+        leaked = [
+            str(key)
+            for key in subtitle_dict
+            if traditional_only.search(str(extract_text(response_dict.get(key, "")) or ""))
+        ]
+        if not leaked:
+            return True, ""
+        return (
+            False,
+            "The target is Simplified Chinese, but Traditional Chinese characters leaked into "
+            "the final subtitle text. Rewrite the complete affected values in Simplified "
+            f"Chinese while preserving names, numbers, and meaning. Keys: {leaked[:20]}",
+        )
+
+    def _validate_contextual_demonstration_medium(
+        self,
+        response_dict: Dict[str, Any],
+        subtitle_dict: Dict[str, str],
+        extract_text,
+    ) -> Tuple[bool, str]:
+        """Reject a vague visual-show calque when local source proves an audio demo."""
+        if self.target_language.value not in {"简体中文", "繁体中文", "粤语"}:
+            return True, ""
+
+        invalid: list[str] = []
+        generic_demo = re.compile(
+            r"\bshow\s+(?:you|everyone|them)\s+what\s+(?:this|that|it)(?:'s|\s+is)\s+all\s+about\b",
+            flags=re.IGNORECASE,
+        )
+        audio_context = re.compile(
+            r"\b(?:audio|listen|music|sound(?:\s+system|\s+test)?|speaker|stereo|volume)\b",
+            flags=re.IGNORECASE,
+        )
+        concrete_audio_target = re.compile(
+            r"(?:听|聽|声音|聲音|音响|音響|音质|音質|声效|聲效|效果|表现|表現)"
+        )
+        for key, source in subtitle_dict.items():
+            if not generic_demo.search(str(source or "")) or not str(key).isdigit():
+                continue
+            index = int(key)
+            local_source = " ".join(
+                self._all_source_by_index.get(position, "")
+                for position in range(max(1, index - 4), index + 1)
+            )
+            if not audio_context.search(local_source):
+                continue
+            translated = str(extract_text(response_dict.get(key, "")) or "")
+            if not concrete_audio_target.search(translated):
+                invalid.append(str(key))
+        if not invalid:
+            return True, ""
+        return (
+            False,
+            "Local source explicitly establishes an audio demonstration. Render the audience "
+            "as hearing/listening to the sound or its performance; do not use a vague visual "
+            f"'show what this is about' calque. Keys: {invalid[:20]}",
+        )
+
+    def _validate_contextual_automotive_terms(
+        self,
+        response_dict: Dict[str, Any],
+        subtitle_dict: Dict[str, str],
+        extract_text,
+    ) -> Tuple[bool, str]:
+        """Require established Chinese for unambiguous vehicle controls and operating noise."""
+        if self.target_language.value not in {"简体中文", "繁体中文", "粤语"}:
+            return True, ""
+
+        quiet_component: list[str] = []
+        one_touch_window: list[str] = []
+        for key, source in subtitle_dict.items():
+            source_text = str(source or "")
+            translated = str(extract_text(response_dict.get(key, "")) or "")
+            if (
+                re.search(r"\bquiet\s+(?:air\s+)?vents?\b", source_text, re.IGNORECASE)
+                and re.search(r"出风口.{0,8}(?:安静|安靜)", translated)
+                and not re.search(r"(?:风噪|風噪|噪音|声音|聲音)", translated)
+            ):
+                quiet_component.append(str(key))
+            if re.search(
+                r"\bauto[- ]down\s+windows?\b", source_text, re.IGNORECASE
+            ) and not re.search(r"一[键鍵]", translated):
+                one_touch_window.append(str(key))
+
+        problems: list[str] = []
+        if quiet_component:
+            problems.append(
+                "A quiet vent describes low operating or wind noise, not an anthropomorphically "
+                f"quiet component. State the noise property explicitly. Keys: {quiet_component[:20]}"
+            )
+        if one_touch_window:
+            problems.append(
+                "Use the established one-touch-down Chinese term for an auto-down window; do "
+                f"not use the literal generic 'automatic lowering' wording. Keys: {one_touch_window[:20]}"
+            )
+        return (False, " ".join(problems)) if problems else (True, "")
 
     def _validate_elliptical_automotive_numbers(
         self,
@@ -2297,6 +3168,64 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         if problems:
             return False, " ".join(problems)
         return True, ""
+
+    def _validate_contextual_idioms(
+        self,
+        response_dict: Dict[str, Any],
+        subtitle_dict: Dict[str, str],
+        extract_text,
+    ) -> Tuple[bool, str]:
+        """Reject literal or polarity-shifting readings of explicit common constructions."""
+        if self.target_language.value not in {"简体中文", "繁体中文", "粤语"}:
+            return True, ""
+
+        literal_archetype: list[str] = []
+        overstated_equality: list[str] = []
+        literal_traffic: list[str] = []
+        for key, source in subtitle_dict.items():
+            source_text = str(source or "")
+            translated = str(extract_text(response_dict.get(key, "")) or "")
+            if re.search(r"\bbiblically\s+accurate\b", source_text, re.IGNORECASE) and re.search(
+                r"(?:圣经|聖經|宗教)",
+                translated,
+            ):
+                literal_archetype.append(str(key))
+            if (
+                re.search(r"\bon\s+par\s+with\b", source_text, re.IGNORECASE)
+                and re.search(r"(?:不错|不錯|优秀|優秀|出色|很好)", translated)
+                and not re.search(
+                    r"(?:同一水平|同等|不相上下|相若|持平|差不多|基本一致)",
+                    translated,
+                )
+            ):
+                overstated_equality.append(str(key))
+            if re.search(
+                r"\btraffic\s+situation\b.{0,100}\bget\s+(?:get\s+)?through\s+it\b",
+                source_text,
+                re.IGNORECASE,
+            ) and re.search(r"(?:通过|通過)(?:车辆|車輛|它|这个|這個)", translated):
+                literal_traffic.append(str(key))
+
+        problems: list[str] = []
+        if literal_archetype:
+            problems.append(
+                "'Biblically accurate' is figurative here: express fidelity to the archetype "
+                "or category, without introducing the Bible or religion. "
+                f"Keys: {literal_archetype[:20]}"
+            )
+        if overstated_equality:
+            problems.append(
+                "'On par with' is a neutral equality comparison. Express the same level or "
+                "broad comparability without upgrading it to praise. "
+                f"Keys: {overstated_equality[:20]}"
+            )
+        if literal_traffic:
+            problems.append(
+                "In a traffic situation, render 'get through it' as maneuvering or threading "
+                "through congestion, not literally passing a vehicle or demonstrative. "
+                f"Keys: {literal_traffic[:20]}"
+            )
+        return (False, " ".join(problems)) if problems else (True, "")
 
     def _validate_no_added_editorial_labels(
         self,
@@ -2421,7 +3350,55 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             f"Unnatural degree keys: {awkward[:20]}",
         )
 
-    def _validate_natural_chinese_contextual_constructions(
+    def _validate_no_weakened_technical_compounds(
+        self,
+        response_dict: Dict[str, Any],
+        subtitle_dict: Dict[str, str],
+        extract_text,
+    ) -> Tuple[bool, str]:
+        """Reject vague Chinese placeholders for explicit technical compounds."""
+        if self.target_language.value not in {"简体中文", "繁体中文", "粤语"}:
+            return True, ""
+
+        concrete_compound = re.compile(
+            r"\b(?:[a-z][a-z-]*\s+){1,3}"
+            r"(?:assembly|beam|core|corridor|damper|foundation|podium|sensor|"
+            r"shaft|system|wall)\b",
+            flags=re.IGNORECASE,
+        )
+        explicit_vagueness = re.compile(
+            r"(?:特定|某种|某个|一般|普通)(?:的)?"
+            r"[\u3400-\u9fff]{0,8}"
+            r"(?:系统|裝置|装置|組件|组件|結構|结构|牆|墙|阻尼器|核心筒|"
+            r"樑|梁|豎井|竖井|感測器|传感器|走廊|基礎|基础|裙樓|裙楼)"
+        )
+        source_allows_vagueness = re.compile(
+            r"\b(?:a\s+kind\s+of|a\s+sort\s+of|certain|common|general|generic|"
+            r"ordinary|particular|some\s+kind\s+of|specific)\b",
+            flags=re.IGNORECASE,
+        )
+        weakened: list[str] = []
+        for key, source in subtitle_dict.items():
+            source_text = str(source or "")
+            translated = str(extract_text(response_dict.get(key, "")) or "")
+            if (
+                concrete_compound.search(source_text)
+                and not source_allows_vagueness.search(source_text)
+                and explicit_vagueness.search(translated)
+            ):
+                weakened.append(str(key))
+
+        if not weakened:
+            return True, ""
+        return (
+            False,
+            "The source names a concrete technical compound, but the translation weakens its "
+            "modifier into an unsupported vague label such as 特定的/某种/一般的. Use the "
+            "established professional target-language term and preserve the compound's exact "
+            f"technical sense. Keys: {weakened[:20]}",
+        )
+
+    def _validate_natural_chinese_contextual_constructions(  # noqa: C901
         self,
         response_dict: Dict[str, Any],
         subtitle_dict: Dict[str, str],
@@ -2919,7 +3896,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             return False, " ".join(problems)
         return True, ""
 
-    def _validate_cross_key_boundaries(
+    def _validate_cross_key_boundaries(  # noqa: C901
         self,
         response_dict: Dict[str, Any],
         subtitle_dict: Dict[str, str],
@@ -3083,6 +4060,52 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 "An adjacent translation anticipates and repeats a quantity that belongs "
                 "to only one source key. Keep the number and unit under its owning key. "
                 f"Repeated quantities: {duplicated_quantities[:10]}",
+            )
+
+        misplaced_quantities: list[str] = []
+        source_quantities = {
+            key: self._source_quantity_tokens(source) for key, source in subtitle_dict.items()
+        }
+        for position, key in enumerate(ordered_keys):
+            if not key.isdigit():
+                continue
+            translated_quantities = self._localized_quantity_tokens(
+                extract_text(response_dict.get(key, ""))
+            )
+            if not translated_quantities:
+                continue
+            current_source_quantities = source_quantities.get(key, set())
+            current_values = {value for value, _unit in current_source_quantities}
+            neighbor_keys = [
+                neighbor
+                for neighbor in (
+                    ordered_keys[position - 1] if position else "",
+                    ordered_keys[position + 1] if position + 1 < len(ordered_keys) else "",
+                )
+                if neighbor and neighbor.isdigit() and abs(int(neighbor) - int(key)) == 1
+            ]
+            current_speaker = self._all_speaker_by_index.get(int(key), "")
+            for quantity in sorted(translated_quantities):
+                if quantity in current_source_quantities:
+                    continue
+                adjacent_owner = any(
+                    quantity in source_quantities.get(neighbor, set())
+                    and (
+                        not current_speaker
+                        or not self._all_speaker_by_index.get(int(neighbor), "")
+                        or self._all_speaker_by_index.get(int(neighbor), "") == current_speaker
+                    )
+                    for neighbor in neighbor_keys
+                )
+                if quantity[0] in current_values or adjacent_owner:
+                    misplaced_quantities.append(f"{key}:{quantity[0]}{quantity[1]}")
+        if misplaced_quantities:
+            return (
+                False,
+                "A translated number was paired with a semantic unit owned by a different "
+                "source key. Keep each number-unit or number-counted-noun atom under the key "
+                "that contains that complete source fact. "
+                f"Misplaced quantities: {misplaced_quantities[:10]}",
             )
 
         anticipated_conditions: list[str] = []
@@ -3398,6 +4421,8 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         "十": 10,
     }
     _QUANTITY_UNITS = {
+        "年": ("year", "years"),
+        "项目": ("project", "projects"),
         "秒": ("second", "seconds", "sec", "secs"),
         "分钟": ("minute", "minutes", "min", "mins"),
         "小时": ("hour", "hours", "hr", "hrs"),
@@ -3418,6 +4443,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         quantities: set[tuple[int, str]] = set()
         for match in re.finditer(
             rf"(?<![A-Za-z0-9])(?P<number>\d+|[零〇一二两三四五六七八九十])\s*"
+            rf"(?:个|项|座|条|段|家|名|辆)?\s*"
             rf"(?P<unit>{unit_pattern})(?:钟)?",
             str(text or ""),
         ):
@@ -3430,29 +4456,39 @@ Return exactly one JSON object with all and only the current_subtitles keys:
 
     @classmethod
     def _source_mentions_quantity(cls, source: str, quantity: tuple[int, str]) -> bool:
-        value, unit = quantity
-        number_words = {
-            0: "zero",
-            1: "one",
-            2: "two",
-            3: "three",
-            4: "four",
-            5: "five",
-            6: "six",
-            7: "seven",
-            8: "eight",
-            9: "nine",
-            10: "ten",
+        return quantity in cls._source_quantity_tokens(source)
+
+    @classmethod
+    def _source_quantity_tokens(cls, source: str) -> set[tuple[int, str]]:
+        """Extract source number-unit atoms using the target unit's canonical key."""
+        source_text = str(source or "")
+        number_values = {
+            "zero": 0,
+            "one": 1,
+            "two": 2,
+            "three": 3,
+            "four": 4,
+            "five": 5,
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
         }
-        number_pattern = rf"(?:{value}|{number_words.get(value, str(value))})"
-        unit_pattern = "|".join(map(re.escape, cls._QUANTITY_UNITS[unit]))
-        return bool(
-            re.search(
-                rf"\b{number_pattern}\s*(?:{unit_pattern})\b",
-                str(source or ""),
+        number_pattern = r"(?P<number>\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten)"
+        quantities: set[tuple[int, str]] = set()
+        for canonical_unit, aliases in cls._QUANTITY_UNITS.items():
+            unit_pattern = "|".join(sorted(map(re.escape, aliases), key=len, reverse=True))
+            for match in re.finditer(
+                rf"\b{number_pattern}\s*[-–—]?\s*"
+                rf"(?:{unit_pattern})\b",
+                source_text,
                 flags=re.IGNORECASE,
-            )
-        )
+            ):
+                raw_number = match.group("number").lower()
+                value = int(raw_number) if raw_number.isdigit() else number_values[raw_number]
+                quantities.add((value, canonical_unit))
+        return quantities
 
     @staticmethod
     def _boundary_tokens(text: str) -> set[str]:
@@ -3461,7 +4497,10 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             match.group().lower()
             for match in re.finditer(
                 r"\b(?:[A-Za-z][A-Za-z0-9]*[-/]\d+[A-Za-z0-9.-]*|"
-                r"[A-Za-z]+\d+[A-Za-z0-9.-]*|\d+[A-Za-z]+[A-Za-z0-9.-]*|\d{2,4})\b",
+                r"[A-Za-z]+\d+[A-Za-z0-9.-]*|"
+                r"\d+(?:\.\d+)+[A-Za-z]+[A-Za-z0-9.-]*|"
+                r"(?<![\w.])\d+[A-Za-z]+[A-Za-z0-9.-]*|"
+                r"(?<![\d.])\d{2,4}(?![\d.]))\b",
                 str(text or ""),
             )
         }
@@ -3499,6 +4538,12 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 normalized,
             ):
                 return True
+        if token.upper() == "RPM" and re.search(
+            r"\b(?:power|torque|everything)\s+"
+            r"(?:comes?|kicks?)\s+(?:in|on)\s+(?:(?:kind\s+of|really)\s+)?low\s+down\b",
+            normalized,
+        ):
+            return True
         return False
 
     @classmethod
@@ -3540,11 +4585,79 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         if cls._numeric_token_belongs_to_compound_model(token, source, translated):
             return True
 
+        if token.isdigit() and 1 <= int(token) <= 12:
+            months = (
+                "january",
+                "february",
+                "march",
+                "april",
+                "may",
+                "june",
+                "july",
+                "august",
+                "september",
+                "october",
+                "november",
+                "december",
+            )
+            if re.search(rf"(?<!\d){re.escape(token)}月", translated) and re.search(
+                rf"\b{months[int(token) - 1]}\b",
+                source,
+                flags=re.IGNORECASE,
+            ):
+                return True
+
+        if token.isdigit() and len(token) in {2, 4}:
+            decade = token[-2:]
+            source_decades = {
+                match.group(1)[-2:]
+                for match in re.finditer(
+                    r"\b((?:\d{2}|\d{4}))s\b",
+                    source,
+                    flags=re.IGNORECASE,
+                )
+            }
+            if decade in source_decades and re.search(
+                rf"(?:19|20)?{re.escape(decade)}\s*年代",
+                translated,
+            ):
+                return True
+
+        if token.isdigit():
+            target_value = Decimal(token)
+            normalized_source_numbers = normalize_grouped_numbers(source)
+            for source_number in re.findall(
+                r"(?<!\d)\d+(?:\.\d+)?(?!\d)", normalized_source_numbers
+            ):
+                try:
+                    source_value = Decimal(source_number)
+                except InvalidOperation:
+                    continue
+                for multiplier, unit in (
+                    (Decimal(100000000), "亿"),
+                    (Decimal(10000), "万"),
+                    (Decimal(1000), "千"),
+                ):
+                    if source_value == target_value * multiplier and re.search(
+                        rf"(?<!\d){re.escape(token)}\s*{unit}", translated
+                    ):
+                        return True
+
         source_tokens = cls._context_ownership_tokens(source)
         token_compact = re.sub(r"[^a-z0-9]", "", token.lower())
         translated_compact = re.sub(r"[^a-z0-9]", "", translated.lower())
         if not token_compact or token_compact not in translated_compact:
             return False
+
+        if re.search(r"[a-z]", token_compact) and re.search(r"\d", token_compact):
+            identifier_parts = re.findall(r"[a-z]+|\d+", token_compact)
+            identifier_pattern = r"[\s./_-]*".join(re.escape(part) for part in identifier_parts)
+            if identifier_parts and re.search(
+                rf"(?<![A-Za-z0-9]){identifier_pattern}(?![A-Za-z0-9])",
+                source,
+                flags=re.IGNORECASE,
+            ):
+                return True
 
         def is_identifier(value: str) -> bool:
             return bool(re.search(r"[a-z]", value) and re.search(r"\d", value))
@@ -3587,23 +4700,60 @@ Return exactly one JSON object with all and only the current_subtitles keys:
     @staticmethod
     def _localized_magnitude_rendered(source: str, token: str, translated: str) -> bool:
         """Detect an exact Chinese rendering of a source-owned magnitude."""
-        if not re.fullmatch(r"\d+(?:\.\d+)?", token):
-            return False
-        match = re.search(
-            rf"\b{re.escape(token)}\s+(hundred|thousand|million|billion|trillion)\b",
-            source,
+        compact_match = re.fullmatch(
+            r"(\d+(?:\.\d+)?)(K|M|MM|B|BN|T)",
+            token,
             flags=re.IGNORECASE,
         )
-        if not match:
-            return False
-        multipliers = {
-            "hundred": Decimal(100),
-            "thousand": Decimal(1000),
-            "million": Decimal(1000000),
-            "billion": Decimal(1000000000),
-            "trillion": Decimal(1000000000000),
-        }
-        value = Decimal(token) * multipliers[match.group(1).lower()]
+        if compact_match:
+            token_match = re.search(
+                rf"\b{re.escape(token)}\b",
+                source,
+                flags=re.IGNORECASE,
+            )
+            if not token_match:
+                return False
+            prefix = source[max(0, token_match.start() - 2) : token_match.start()]
+            has_currency = bool(re.search(r"[$€£¥]\s*$", prefix))
+            has_financial_context = bool(
+                re.search(
+                    r"\b(?:cost|costing|funding|finance|financing|investment|invested|"
+                    r"budget|price|priced|worth|revenue|spending|expenditure|loan|debt)\b",
+                    source,
+                    flags=re.IGNORECASE,
+                )
+            )
+            if not has_currency and not has_financial_context:
+                return False
+            raw_value = compact_match.group(1)
+            suffix = compact_match.group(2).upper()
+            multiplier = {
+                "K": Decimal(1000),
+                "M": Decimal(1000000),
+                "MM": Decimal(1000000),
+                "B": Decimal(1000000000),
+                "BN": Decimal(1000000000),
+                "T": Decimal(1000000000000),
+            }[suffix]
+        else:
+            if not re.fullmatch(r"\d+(?:\.\d+)?", token):
+                return False
+            match = re.search(
+                rf"\b{re.escape(token)}\s+(hundred|thousand|million|billion|trillion)\b",
+                source,
+                flags=re.IGNORECASE,
+            )
+            if not match:
+                return False
+            raw_value = token
+            multiplier = {
+                "hundred": Decimal(100),
+                "thousand": Decimal(1000),
+                "million": Decimal(1000000),
+                "billion": Decimal(1000000000),
+                "trillion": Decimal(1000000000000),
+            }[match.group(1).lower()]
+        value = Decimal(raw_value) * multiplier
 
         def render(number: Decimal) -> str:
             text = format(number, "f")
@@ -3617,9 +4767,8 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         ):
             coefficient = value / divisor
             exponent = coefficient.as_tuple().exponent
-            if (
-                coefficient == coefficient.to_integral_value()
-                or (isinstance(exponent, int) and exponent >= -3)
+            if coefficient == coefficient.to_integral_value() or (
+                isinstance(exponent, int) and exponent >= -3
             ):
                 candidates.add(f"{render(coefficient)}{unit}")
         compact = re.sub(r"[\s,，。-]+", "", translated).lower()
@@ -3698,6 +4847,104 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             )
         return True, ""
 
+    def _validate_no_unowned_latin_names(
+        self,
+        response_dict: Dict[str, Any],
+        subtitle_dict: Dict[str, str],
+        extract_text,
+    ) -> Tuple[bool, str]:
+        """Prevent a global proper noun from leaking into an unrelated subtitle key."""
+        if self.target_language.value not in {"简体中文", "繁体中文", "粤语"}:
+            return True, ""
+
+        leaked: list[str] = []
+        latin_name_pattern = (
+            r"(?<![A-Za-z0-9])(?:[A-Z][a-z]{2,}|"
+            r"(?=[A-Za-z0-9-]*[A-Za-z])(?=[A-Za-z0-9-]*\d)"
+            r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)(?![A-Za-z0-9])"
+        )
+        source_name_pattern = (
+            r"[A-Za-z][A-Za-z0-9'’-]*|"
+            r"(?=[A-Za-z0-9-]*[A-Za-z])(?=[A-Za-z0-9-]*\d)"
+            r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*"
+        )
+        for key, source in subtitle_dict.items():
+            source_text = str(source or "")
+            original_source = source_text
+            if str(key).isdigit():
+                original_source = self._all_source_by_index.get(int(key), source_text)
+            source_tokens = {
+                token.casefold() for token in re.findall(source_name_pattern, original_source)
+            }
+            source_tokens.update(
+                part
+                for token in tuple(source_tokens)
+                for part in re.split(r"[-'’]", token)
+                if len(part) >= 2
+            )
+            allowed_context = " ".join(
+                value
+                for value in (
+                    self._confirmed_context_canonical(original_source),
+                    self._confirmed_context_official_identifier_target(original_source),
+                )
+                if value
+            ).casefold()
+            translated = str(extract_text(response_dict.get(key, "")) or "")
+            translated_tokens = re.findall(latin_name_pattern, translated)
+            compact_source_text = re.sub(r"[^a-z0-9]", "", original_source.casefold())
+            for token in translated_tokens:
+                folded = token.casefold()
+                compact = re.sub(r"[^a-z0-9]", "", folded)
+                forms = {folded, folded.removesuffix("s"), compact}
+                source_forms = source_tokens | {item.removesuffix("s") for item in source_tokens}
+                source_forms.update(re.sub(r"[^a-z0-9]", "", item) for item in source_tokens)
+                allowed_compact = re.sub(r"[^a-z0-9]", "", allowed_context)
+                if forms & source_forms or folded in allowed_context or compact in allowed_compact:
+                    continue
+                if re.search(r"\d", compact) and compact in compact_source_text:
+                    continue
+                if str(key).isdigit() and re.search(
+                    r"\b(?:it|this|that|these|those|they|one|car|truck|vehicle|thing|model)\b",
+                    original_source,
+                    flags=re.IGNORECASE,
+                ):
+                    index = int(key)
+                    adjacent_source = " ".join(
+                        self._all_source_by_index.get(neighbor, "")
+                        for neighbor in (index - 1, index + 1)
+                    )
+                    adjacent_tokens = {
+                        re.sub(r"[^a-z0-9]", "", item.casefold())
+                        for item in re.findall(source_name_pattern, adjacent_source)
+                    }
+                    if compact in adjacent_tokens:
+                        continue
+                if str(key).isdigit():
+                    index = int(key)
+                    previous_source = self._all_source_by_index.get(index - 1, "")
+                    next_source = self._all_source_by_index.get(index + 1, "")
+                    dependent_adjacent = (
+                        assess_english_boundary(previous_source, original_source).unstable
+                        or assess_english_boundary(original_source, next_source).unstable
+                    )
+                    adjacent_source = f"{previous_source} {next_source}"
+                    adjacent_tokens = {
+                        re.sub(r"[^a-z0-9]", "", item.casefold())
+                        for item in re.findall(source_name_pattern, adjacent_source)
+                    }
+                    if dependent_adjacent and compact in adjacent_tokens:
+                        continue
+                leaked.append(f"{key}:{token}")
+        if not leaked:
+            return True, ""
+        return (
+            False,
+            "A Latin proper name appears in a subtitle whose source does not own it. Global "
+            "context is read-only and must not leak a nearby model, person, or product into the "
+            f"current key. Remove or replace these unowned names: {leaked[:20]}",
+        )
+
     @staticmethod
     def _looks_like_placeholder_translation(text: str) -> bool:
         return BaseTranslator._looks_like_placeholder_translation(text)
@@ -3708,17 +4955,10 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         subtitle_dict: Dict[str, str],
         extract_text,
     ) -> Tuple[bool, str]:
-        placeholders: list[str] = []
-        for key in subtitle_dict:
-            translated = extract_text(response_dict.get(key, ""))
-            if self._looks_like_placeholder_translation(translated):
-                placeholders.append(key)
-        if placeholders:
-            return (
-                False,
-                "Placeholder translations are not allowed. Every key must contain a real translation of its own source text. "
-                f"Placeholder keys: {placeholders[:20]}",
-            )
+        diagnostics = inspect_placeholders(response_dict, subtitle_dict)
+        if diagnostics:
+            self._record_shadow_repair_plan(diagnostics)
+            return False, diagnostics[0].message
         return True, ""
 
     def _looks_untranslated_for_cjk(
@@ -3738,935 +4978,30 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             source_language,
         )
 
-    @staticmethod
-    def _is_cjk_no_script_exempt(original: str, translated: str) -> bool:
-        """Allow brand/model-only captions such as BMW M2 CS to remain Latin."""
-        if re.search(r"[一-鿿぀-ヿ가-힯]", translated):
-            return True
-        source_tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9.+#&/-]*", original)
-        if not source_tokens:
-            return True
-        if len(source_tokens) > 3:
-            return False
-
-        stopwords = {
-            "a",
-            "an",
-            "and",
-            "are",
-            "as",
-            "at",
-            "but",
-            "for",
-            "from",
-            "in",
-            "is",
-            "it",
-            "its",
-            "it's",
-            "of",
-            "on",
-            "or",
-            "so",
-            "that",
-            "the",
-            "this",
-            "to",
-            "today",
-            "tomorrow",
-            "was",
-            "well",
-            "with",
-            "you",
-        }
-
-        def is_name_like(token: str) -> bool:
-            stripped = token.strip(".,;:!?()[]{}")
-            if not stripped:
-                return False
-            lower = stripped.lower()
-            if lower in stopwords:
-                return False
-            if re.search(r"\d", stripped):
-                return True
-            if re.fullmatch(r"[A-Z]{2,}", stripped):
-                return True
-            if stripped != lower and stripped[0].isupper():
-                return True
-            return False
-
-        return all(is_name_like(token) for token in source_tokens)
+    def _inspect_preserved_tokens(
+        self, response_dict: Dict[str, Any], subtitle_dict: Dict[str, str], extract_text
+    ) -> tuple[QualityDiagnostic, ...]:
+        """Delegate exact-value checks to the focused preservation module."""
+        return inspect_preserved_tokens(
+            response_dict,
+            subtitle_dict,
+            extract_text,
+            target_language_value=self.target_language.value,
+            localized_magnitude_rendered=self._localized_magnitude_rendered,
+        )
 
     def _validate_preserved_tokens(
         self, response_dict: Dict[str, Any], subtitle_dict: Dict[str, str], extract_text
     ) -> Tuple[bool, str]:
-        """Catch likely dropped model names, years, specs, and alphanumeric terms."""
-        missing: list[str] = []
-
-        def important_tokens(text: str) -> set[str]:
-            tokens = set()
-            uppercase_stopwords = {
-                "AM",
-                "AS",
-                "AT",
-                "BE",
-                "DO",
-                "IF",
-                "IN",
-                "IS",
-                "IT",
-                "NO",
-                "OF",
-                "ON",
-                "OR",
-                "TO",
-                "US",
-                "WE",
-            }
-            spoken_interjections = {
-                "HEY",
-                "HI",
-                "OK",
-                "OKAY",
-                "WOW",
-                "YEAH",
-                "YES",
-            }
-            collapsed_large_numbers = re.sub(r"(?<=\d),\s*(?=\d{3}\b)", "", text)
-            pattern = (
-                r"\b[A-Za-z]+\d+[A-Za-z0-9.-]*\b"
-                r"|\b\d+[A-Za-z]+[A-Za-z0-9.-]*\b"
-                r"|\b(?:19|20)\d{2}\b"
-                r"|\b\d{2,}\b"
-                r"|\b[A-Z]{2,}\b"
-            )
-            for match in re.finditer(pattern, collapsed_large_numbers):
-                token = match.group().strip(".,;:!?()[]{}")
-                if len(token) < 2 or token in uppercase_stopwords:
-                    continue
-                if token in spoken_interjections and re.search(
-                    rf"^\s*{re.escape(token)}\b(?:\s*[,!.?;:]|\s+)",
-                    collapsed_large_numbers,
-                    flags=re.IGNORECASE,
-                ):
-                    continue
-                tokens.add(token)
-            return tokens
-
-        def normalized_text(text: str) -> str:
-            return re.sub(r"[\s,，.。-]+", "", text).lower()
-
-        def _world_war_roman_preserved(
-            original: str,
-            token: str,
-            translated_norm: str,
-        ) -> bool:
-            roman = token.upper()
-            if roman not in {"I", "II"}:
-                return False
-            if not re.search(
-                rf"\bWorld\s+War\s+{roman}\b",
-                original,
-                flags=re.IGNORECASE,
-            ):
-                return False
-            equivalents = {"一战", "第一次世界大战"} if roman == "I" else {"二战", "第二次世界大战"}
-            return any(normalized_text(value) in translated_norm for value in equivalents)
-
-        def _is_decade_token(token: str) -> bool:
-            return bool(re.fullmatch(r"(?:\d{2}|\d{4})s", token, flags=re.IGNORECASE))
-
-        def _is_ordinal_token(token: str) -> bool:
-            return bool(re.fullmatch(r"\d+(?:st|nd|rd|th)", token, flags=re.IGNORECASE))
-
-        def _ordinal_preserved(token: str, translated_norm: str) -> bool:
-            if not _is_ordinal_token(token):
-                return False
-            number = re.match(r"\d+", token)
-            if not number:
-                return False
-            digits = number.group()
-            candidates = {
-                digits,
-                f"第{digits}",
-                *(f"第{form}" for form in _integer_chinese_forms(digits)),
-            }
-            return any(normalized_text(candidate) in translated_norm for candidate in candidates)
-
-        def _integer_chinese_forms(token: str) -> set[str]:
-            if not re.fullmatch(r"\d+", token):
-                return set()
-            digits = "零一二三四五六七八九"
-            digit_form = "".join(digits[int(character)] for character in token)
-            value = int(token)
-            if value == 0:
-                return {"零"}
-            if value >= 10000:
-                return {digit_form}
-
-            units = ((1000, "千"), (100, "百"), (10, "十"))
-            remaining = value
-            parts: list[str] = []
-            pending_zero = False
-            for unit_value, unit_name in units:
-                quotient, remaining = divmod(remaining, unit_value)
-                if quotient:
-                    if pending_zero:
-                        parts.append("零")
-                        pending_zero = False
-                    if unit_value != 10 or quotient != 1 or parts:
-                        parts.append(digits[quotient])
-                    parts.append(unit_name)
-                elif parts and remaining:
-                    pending_zero = True
-            if remaining:
-                if pending_zero:
-                    parts.append("零")
-                parts.append(digits[remaining])
-            return {digit_form, "".join(parts)}
-
-        def _integer_preserved(token: str, translated_norm: str) -> bool:
-            return any(
-                normalized_text(candidate) in translated_norm
-                for candidate in _integer_chinese_forms(token)
-            )
-
-        def _absolute_number_candidates(value: Decimal) -> set[str]:
-            """Return exact Arabic and natural Chinese magnitude renderings."""
-
-            def decimal_text(number: Decimal) -> str:
-                rendered = format(number, "f")
-                return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
-
-            candidates = {decimal_text(value)}
-            for divisor, unit in (
-                (Decimal(100000000), "亿"),
-                (Decimal(10000), "万"),
-                (Decimal(1000), "千"),
-                (Decimal(100), "百"),
-            ):
-                coefficient = value / divisor
-                exponent = coefficient.as_tuple().exponent
-                if coefficient != coefficient.to_integral_value() and not (
-                    isinstance(exponent, int) and exponent >= -3
-                ):
-                    continue
-                rendered = decimal_text(coefficient)
-                forms = {rendered}
-                if coefficient == coefficient.to_integral_value() and 0 <= coefficient < 10000:
-                    integer = str(int(coefficient))
-                    forms.update(_integer_chinese_forms(integer))
-                    if integer == "2":
-                        forms.add("两")
-                candidates.update(f"{form}{unit}" for form in forms)
-            return candidates
-
-        def _shared_magnitude_range_preserved(
-            original: str,
-            token: str,
-            translated: str,
-        ) -> bool:
-            """Accept a magnitude or grouped suffix shared by both range bounds."""
-            if not re.fullmatch(r"\d+(?:\.\d+)?", token):
-                return False
-
-            def exact_candidate_present(candidate: str) -> bool:
-                compact_target = re.sub(r"[\s,，。-]+", "", translated)
-                compact_candidate = re.sub(r"[\s,，。-]+", "", candidate)
-                number_chars = r"0-9零〇一二两三四五六七八九十百千万亿点."
-                return bool(
-                    re.search(
-                        rf"(?<![{number_chars}]){re.escape(compact_candidate)}"
-                        rf"(?![{number_chars}])",
-                        compact_target,
-                    )
-                )
-
-            magnitude_match = re.search(
-                r"\b(\d+(?:\.\d+)?)\s*(?:to|or|[-–—])\s*"
-                r"(\d+(?:\.\d+)?)\s+"
-                r"(hundred|thousand|million|billion|trillion)\b",
-                original,
-                flags=re.IGNORECASE,
-            )
-            if magnitude_match and token in magnitude_match.group(1, 2):
-                multipliers = {
-                    "hundred": Decimal(100),
-                    "thousand": Decimal(1000),
-                    "million": Decimal(1000000),
-                    "billion": Decimal(1000000000),
-                    "trillion": Decimal(1000000000000),
-                }
-                value = Decimal(token) * multipliers[magnitude_match.group(3).lower()]
-                return any(
-                    exact_candidate_present(candidate)
-                    for candidate in _absolute_number_candidates(value)
-                )
-
-            grouped_match = re.search(
-                r"\b(\d{1,3})\s*(?:to|or|[-–—])\s*"
-                r"(\d{1,3}),\s*(\d{3})\b",
-                original,
-                flags=re.IGNORECASE,
-            )
-            if not grouped_match:
-                return False
-            left, right_head, right_tail = grouped_match.groups()
-            collapsed_right = f"{right_head}{right_tail}"
-            if token == left:
-                value = Decimal(left) * Decimal(1000)
-            elif token == collapsed_right:
-                value = Decimal(collapsed_right)
-            else:
-                return False
-            return any(
-                exact_candidate_present(candidate)
-                for candidate in _absolute_number_candidates(value)
-            )
-
-        def _measurement_preserved(
-            original: str,
-            token: str,
-            translated: str,
-            translated_norm: str,
-        ) -> bool:
-            """Accept exact quantities whose abbreviated unit was localized."""
-            match = re.fullmatch(
-                r"(\d+(?:\.\d+)?)(kmh|kph|km|mph|mpg|rpm|hp|lbs?|ft)",
-                token,
-                flags=re.IGNORECASE,
-            )
-            if not match:
-                return False
-            raw_value, raw_unit = match.groups()
-            value_candidates = {raw_value}
-            if re.fullmatch(r"\d+", raw_value):
-                value_candidates.update(_integer_chinese_forms(raw_value))
-            compact_target = re.sub(r"[\s,，。-]+", "", translated)
-            number_chars = r"0-9零〇一二两三四五六七八九十百千万亿点."
-            value_present = False
-            for candidate in value_candidates:
-                compact_candidate = re.sub(r"[\s,，。-]+", "", candidate)
-                if re.search(
-                    rf"(?<![{number_chars}]){re.escape(compact_candidate)}"
-                    rf"(?![{number_chars}])",
-                    compact_target,
-                ):
-                    value_present = True
-                    break
-            if not value_present:
-                return False
-
-            unit = raw_unit.lower()
-            unit_patterns = {
-                "km": r"(?:公里|千米)",
-                "kmh": r"(?:公里|千米)(?:每小时|/小时)?|时速",
-                "kph": r"(?:公里|千米)(?:每小时|/小时)?|时速",
-                "mph": r"(?:英里)(?:每小时|/小时)?|时速",
-                "mpg": r"(?:英里每加仑|英里/加仑|mpg)",
-                "rpm": r"(?:转速|转/分|每分钟转数|rpm)",
-                "hp": r"(?:马力|hp)",
-                "lb": r"(?:磅|lb)",
-                "lbs": r"(?:磅|lbs?)",
-                "ft": r"(?:英尺|ft)",
-            }
-            if not re.search(unit_patterns[unit], translated, flags=re.IGNORECASE):
-                return False
-            if unit == "km" and re.search(
-                rf"\b{re.escape(token)}\s+(?:an|per)\s+hour\b",
-                original,
-                flags=re.IGNORECASE,
-            ):
-                return bool(re.search(r"(?:时速|每小时|/小时)", translated))
-            return True
-
-        def _large_integer_preserved(token: str, translated: str) -> bool:
-            """Accept an exactly equivalent Chinese ten-thousand expression."""
-            if (
-                self.target_language.value not in {"简体中文", "繁体中文", "粤语"}
-                or not re.fullmatch(r"\d+", token)
-                or int(token) < 10000
-            ):
-                return False
-
-            value = Decimal(token)
-            ten_thousands = value / Decimal(10000)
-            rendered = format(ten_thousands, "f").rstrip("0").rstrip(".")
-            coefficient_forms = {rendered}
-            if ten_thousands == ten_thousands.to_integral_value():
-                integer = str(int(ten_thousands))
-                coefficient_forms.update(_integer_chinese_forms(integer))
-                if integer == "2":
-                    coefficient_forms.add("两")
-            return bool(
-                re.search(
-                    rf"(?<![\d.])(?:{'|'.join(map(re.escape, sorted(coefficient_forms, key=len, reverse=True)))})"
-                    r"\s*万(?![\d万])",
-                    translated,
-                )
-            )
-
-        def _spoken_magnitude_preserved(
-            original: str,
-            token: str,
-            translated_norm: str,
-        ) -> bool | None:
-            """Validate equivalents such as ``200 million`` -> ``两亿`` exactly."""
-            if not re.fullmatch(r"\d+(?:\.\d+)?", token):
-                return None
-            match = re.search(
-                rf"\b{re.escape(token)}\s+(hundred|thousand|million|billion|trillion)\b",
-                original,
-                flags=re.IGNORECASE,
-            )
-            if not match:
-                return None
-
-            multipliers = {
-                "hundred": Decimal(100),
-                "thousand": Decimal(1000),
-                "million": Decimal(1000000),
-                "billion": Decimal(1000000000),
-                "trillion": Decimal(1000000000000),
-            }
-            try:
-                absolute = Decimal(token) * multipliers[match.group(1).lower()]
-            except (InvalidOperation, KeyError):
-                return False
-
-            def decimal_text(value: Decimal) -> str:
-                rendered = format(value, "f")
-                return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
-
-            def coefficient_forms(value: Decimal) -> set[str]:
-                rendered = decimal_text(value)
-                forms = {rendered}
-                if value == value.to_integral_value() and 0 <= value < 10000:
-                    forms.update(_integer_chinese_forms(str(int(value))))
-                    if value == 2:
-                        forms.add("两")
-                return forms
-
-            candidates = {decimal_text(absolute)}
-            for divisor, unit in (
-                (Decimal(100000000), "亿"),
-                (Decimal(10000), "万"),
-                (Decimal(1000), "千"),
-                (Decimal(100), "百"),
-            ):
-                coefficient = absolute / divisor
-                exponent = coefficient.as_tuple().exponent
-                if coefficient == coefficient.to_integral_value() or (
-                    isinstance(exponent, int) and exponent >= -3
-                ):
-                    candidates.update(f"{form}{unit}" for form in coefficient_forms(coefficient))
-            return any(normalized_text(candidate) in translated_norm for candidate in candidates)
-
-        def _decade_preserved(token: str, translated: str, translated_norm: str) -> bool:
-            if not _is_decade_token(token):
-                return False
-            digits = token[:-1]
-            if normalized_text(token) in translated_norm:
-                return True
-            if len(digits) == 4:
-                century = digits[:2]
-                decade = digits[2:]
-                candidates = {
-                    f"{digits}年代",
-                    f"{century}世纪{decade}年代",
-                    f"{decade}年代",
-                    f"{int(decade)}年代",
-                }
-            else:
-                candidates = {
-                    f"{digits}年代",
-                    f"{int(digits)}年代",
-                }
-            chinese_decades = {
-                "00": "零零年代",
-                "10": "一十年代",
-                "20": "二十年代",
-                "30": "三十年代",
-                "40": "四十年代",
-                "50": "五十年代",
-                "60": "六十年代",
-                "70": "七十年代",
-                "80": "八十年代",
-                "90": "九十年代",
-            }
-            decade_key = digits[-2:]
-            if decade_key in chinese_decades:
-                candidates.add(chinese_decades[decade_key])
-            return any(normalized_text(candidate) in translated_norm for candidate in candidates)
-
-        def _age_decade_preserved(
-            original: str,
-            token: str,
-            translated_norm: str,
-        ) -> bool:
-            """Accept natural Chinese age expressions for possessive age decades."""
-            if self.target_language.value not in {"简体中文", "繁体中文", "粤语"}:
-                return False
-            match = re.fullmatch(r"(\d{2})s", token, flags=re.IGNORECASE)
-            if not match:
-                return False
-            if not re.search(
-                rf"\b(?:in|throughout)\s+(?:my|your|his|her|our|their|one's)\s+"
-                rf"(?:(?:early|mid(?:dle)?|late)[ -]?)?{re.escape(token)}\b",
-                original,
-                flags=re.IGNORECASE,
-            ):
-                return False
-
-            value = match.group(1)
-            age_forms = {f"{value}多岁"}
-            for number in _integer_chinese_forms(value):
-                age_forms.add(f"{number}多岁")
-            return any(normalized_text(candidate) in translated_norm for candidate in age_forms)
-
-        def _standalone_affirmative_percentage_preserved(
-            original: str,
-            token: str,
-            translated_norm: str,
-        ) -> bool:
-            """Allow ``100%`` as a standalone affirmation, not as a lost quantity."""
-            if (
-                self.target_language.value not in {"简体中文", "繁体中文", "粤语"}
-                or token != "100"
-                or not re.fullmatch(
-                    r"\s*100\s*(?:%|％|percent)\s*[.!?。！？]*\s*",
-                    original,
-                    flags=re.IGNORECASE,
-                )
-            ):
-                return False
-            equivalents = (
-                "完全如此",
-                "完全正确",
-                "完全正確",
-                "百分之百",
-                "当然",
-                "當然",
-                "没错",
-                "沒錯",
-                "确实",
-                "確實",
-                "正是",
-                "绝对",
-                "絕對",
-            )
-            return any(normalized_text(value) in translated_norm for value in equivalents)
-
-        def _is_price_band_token(original: str, token: str, translated: str = "") -> bool:
-            has_price_context = bool(
-                re.search(
-                    r"\b(?:cost|costs|expensive|pay|price|priced|range|sell|sold|worth)\b"
-                    r"|[$]",
-                    original,
-                    flags=re.IGNORECASE,
-                )
-                or re.search(
-                    r"(?:美元|美金|万元?|千元?|\d\s*[万千k])",
-                    translated,
-                    flags=re.IGNORECASE,
-                )
-            )
-            return bool(re.fullmatch(r"\d{2}s", token, flags=re.IGNORECASE) and has_price_context)
-
-        def _price_band_preserved(
-            original: str,
-            token: str,
-            translated: str,
-            translated_norm: str,
-        ) -> bool:
-            """Accept plural price bands translated as thousands or ten-thousands."""
-            if not _is_price_band_token(original, token, translated):
-                return False
-
-            match = re.fullmatch(r"(\d{2})s", token, flags=re.IGNORECASE)
-            assert match is not None
-            value = int(match.group(1))
-            candidates = {
-                f"{value}k",
-                f"{value}000",
-                f"{Decimal(value) / Decimal(10):g}万",
-            }
-            if value == 20:
-                candidates.update({"二万", "两万"})
-            return any(
-                normalized_text(candidate) in translated_norm for candidate in candidates
-            ) or bool(
-                re.search(
-                    rf"(?<!\d){value}(?!\d)\s*(?:千|k)",
-                    translated,
-                    flags=re.IGNORECASE,
-                )
-            )
-
-        def _inflected_alnum_preserved(token: str, translated_norm: str) -> bool:
-            if not re.search(r"\d", token):
-                return False
-            if not re.fullmatch(r"[A-Za-z0-9.-]+s", token):
-                return False
-            singular = token[:-1]
-            return len(singular) >= 2 and normalized_text(singular) in translated_norm
-
-        def _equivalent_token_preserved(token: str, translated_norm: str) -> bool:
-            normalized_token = token.strip(".,;:!?()[]{}").upper()
-            equivalents = _CHINESE_TOKEN_EQUIVALENTS.get(normalized_token)
-            if not equivalents:
-                normalized_token = token.strip(".,;:!?()[]{}").casefold()
-                equivalents = _CHINESE_ENTITY_ALIASES.get(normalized_token, ())
-            if not equivalents:
-                return False
-            return any(normalized_text(equivalent) in translated_norm for equivalent in equivalents)
-
-        def _compound_model_preserved(token: str, translated: str) -> bool:
-            if not (re.search(r"[A-Za-z]", token) and re.search(r"\d", token)):
-                return False
-            token_compact = re.sub(r"[^a-z0-9]", "", token.lower())
-            translated_compact = re.sub(r"[^a-z0-9]", "", translated.lower())
-            return bool(token_compact and token_compact in translated_compact)
-
-        def _magnitude_preserved(
-            original: str,
-            translated_norm: str,
-            token: str = "",
-        ) -> bool:
-            """Accept equivalent grand/K notation without allowing a lost magnitude."""
-
-            def decimal_text(value: Decimal) -> str:
-                rendered = format(value, "f")
-                return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
-
-            for match in re.finditer(
-                r"\b(\d+(?:\.\d+)?)\s*(grand|k)\b",
-                original,
-                flags=re.IGNORECASE,
-            ):
-                raw = match.group(0)
-                if token and normalized_text(token) not in {
-                    normalized_text(raw),
-                    normalized_text(match.group(1)),
-                }:
-                    continue
-                try:
-                    stated = Decimal(match.group(1))
-                except InvalidOperation:
-                    continue
-                absolute = stated * 1000
-                ten_thousands = absolute / 10000
-                candidates = {
-                    raw,
-                    decimal_text(absolute),
-                    f"{decimal_text(ten_thousands)}万",
-                }
-                if any(normalized_text(candidate) in translated_norm for candidate in candidates):
-                    return True
-            return False
-
-        def _thousand_magnitude_preserved(
-            original: str,
-            translated_norm: str,
-            token: str,
-        ) -> bool:
-            """Accept natural Chinese equivalents of explicit thousand amounts."""
-            if not re.fullmatch(r"\d+(?:\.\d+)?", token):
-                return False
-
-            normalized_source = re.sub(r"[-\s]+", " ", original).strip()
-            match = re.search(
-                rf"\b{re.escape(token)}\s+"
-                r"(?:(?:some\s+odd|some|odd)\s+)?thousand\b",
-                normalized_source,
-                flags=re.IGNORECASE,
-            )
-            if not match:
-                return False
-
-            try:
-                absolute = Decimal(token) * 1000
-            except InvalidOperation:
-                return False
-
-            def decimal_text(value: Decimal) -> str:
-                rendered = format(value, "f")
-                return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
-
-            candidates = {decimal_text(absolute)}
-            ten_thousands = absolute / 10000
-            if ten_thousands == ten_thousands.to_integral_value():
-                compact_value = str(int(ten_thousands))
-                candidates.add(f"{compact_value}万")
-                for chinese_value in _integer_chinese_forms(compact_value):
-                    candidates.add(f"{chinese_value}万")
-                if compact_value == "2":
-                    candidates.add("两万")
-            else:
-                candidates.add(f"{decimal_text(ten_thousands)}万")
-            return any(normalized_text(candidate) in translated_norm for candidate in candidates)
-
-        def _introductory_101_preserved(
-            original: str,
-            token: str,
-            translated_norm: str,
-        ) -> bool:
-            """Treat ``subject 101`` as an introductory-concept idiom in Chinese."""
-            if token != "101" or self.target_language.value not in {
-                "简体中文",
-                "繁体中文",
-                "粤语",
-            }:
-                return False
-            if re.search(
-                r"\b(?:route|highway|room|suite|flight|model|interstate)\s+101\b",
-                original,
-                flags=re.IGNORECASE,
-            ):
-                return False
-            if not re.search(
-                r"\b[A-Za-z][A-Za-z' -]{1,80}\s+101\b"
-                r"(?=\s*(?:[.!?,;:]|$|\bis\b|\bwas\b))",
-                original,
-                flags=re.IGNORECASE,
-            ):
-                return False
-            return any(
-                normalized_text(equivalent) in translated_norm
-                for equivalent in ("入门", "基础", "基本常识", "基础知识", "初级", "概论")
-            )
-
-        def _asr_formatted_number_preserved(
-            original: str,
-            token: str,
-            translated: str,
-            translated_norm: str,
-        ) -> bool:
-            """Allow only narrow, explicit repairs of ASR-formatted quantities."""
-            grouped = re.fullmatch(r"(\d{1,3})000", token)
-            if grouped:
-                base = grouped.group(1)
-                source_pattern = rf"[$]\s*{re.escape(base)},000\b"
-                unit_after_pattern = (
-                    rf"(?<!\d){re.escape(base)}\s*(?:mpg|mph|km/?h|kph|rpm|"
-                    r"英里每加仑|英里/加仑|英里每小时|公里每小时|马力|"
-                    r"磅英尺|磅-英尺)\b"
-                )
-                unit_before_pattern = (
-                    rf"(?:每加仑|时速|速度|mpg|mph)\D{{0,8}}(?<!\d)"
-                    rf"{re.escape(base)}(?!\d)"
-                )
-                has_unit = bool(
-                    re.search(
-                        unit_after_pattern,
-                        translated,
-                        flags=re.IGNORECASE,
-                    )
-                    or re.search(
-                        unit_before_pattern,
-                        translated,
-                        flags=re.IGNORECASE,
-                    )
-                )
-                if re.search(source_pattern, original) and has_unit:
-                    return True
-
-            if re.fullmatch(r"\d{2}", token):
-                year = f"20{token}"
-                shorthand_pattern = rf"\b(?:for|in|model\s+year)\s+{token}\b"
-                if re.search(shorthand_pattern, original, flags=re.IGNORECASE) and (
-                    year in translated_norm
-                ):
-                    return True
-            return False
-
-        def _abandoned_numeric_self_correction(
-            original: str,
-            token: str,
-            translated_norm: str,
-        ) -> bool:
-            """Allow an explicit false-start number to yield to its corrected value."""
-            match = re.search(
-                r"\b(\d+(?:\.\d+)?)\s*,\s+(?:a|uh|um|er)\s+(\d+\.\d+)\b",
-                original,
-                flags=re.IGNORECASE,
-            )
-            if not match or normalized_text(token) != normalized_text(match.group(1)):
-                return False
-            return normalized_text(match.group(2)) in translated_norm
-
-        def _discount_preserved(
-            original: str,
-            token: str,
-            translated: str,
-            translated_norm: str,
-        ) -> bool:
-            """Accept exact Chinese discount notation for an ``N% off`` source."""
-            if not re.fullmatch(r"\d{1,3}", token):
-                return False
-            if not re.search(
-                rf"\b{re.escape(token)}\s*%\s*off\b",
-                original,
-                flags=re.IGNORECASE,
-            ):
-                return False
-            discount = int(token)
-            if not 0 <= discount <= 100:
-                return False
-            if discount == 100:
-                return "免费" in translated
-            payable = Decimal(100 - discount) / Decimal(10)
-            payable_text = format(payable, "f").rstrip("0").rstrip(".")
-            chinese_digits = str.maketrans("0123456789", "零一二三四五六七八九")
-            candidates = {
-                f"{payable_text}折",
-                f"{payable_text.translate(chinese_digits)}折",
-            }
-            return any(normalized_text(value) in translated_norm for value in candidates)
-
-        def _casual_numeric_range_preserved(
-            original: str,
-            token: str,
-            translated_norm: str,
-        ) -> bool:
-            """Accept natural Chinese compression of a casual range such as 10 or 15."""
-            if not re.fullmatch(r"\d{1,3}", token):
-                return False
-            match = re.search(
-                r"\b(\d{1,3})\s+or\s+(\d{1,3})\s+"
-                r"(?:seconds?|minutes?|hours?|days?|years?)\b",
-                original,
-                flags=re.IGNORECASE,
-            )
-            if not match or token not in match.groups():
-                return False
-            lower, upper = map(int, match.groups())
-            if lower > upper:
-                lower, upper = upper, lower
-            if lower == 10 and 11 <= upper <= 19:
-                return any(
-                    normalized_text(candidate) in translated_norm for candidate in ("十几", "十来")
-                )
-            return False
-
-        for key, original in subtitle_dict.items():
-            translated = extract_text(response_dict.get(key, ""))
-            translated_norm = normalized_text(translated)
-            for token in important_tokens(original):
-                token_norm = normalized_text(token)
-                spoken_magnitude = _spoken_magnitude_preserved(
-                    original,
-                    token,
-                    translated_norm,
-                )
-                if spoken_magnitude is not None:
-                    if spoken_magnitude:
-                        continue
-                    missing.append(f"{key}:{token}")
-                    continue
-                if _abandoned_numeric_self_correction(
-                    original,
-                    token,
-                    translated_norm,
-                ):
-                    continue
-                if _discount_preserved(original, token, translated, translated_norm):
-                    continue
-                if _casual_numeric_range_preserved(original, token, translated_norm):
-                    continue
-                if _shared_magnitude_range_preserved(original, token, translated):
-                    continue
-                if _world_war_roman_preserved(original, token, translated_norm):
-                    continue
-                if _age_decade_preserved(original, token, translated_norm):
-                    continue
-                if _standalone_affirmative_percentage_preserved(
-                    original,
-                    token,
-                    translated_norm,
-                ):
-                    continue
-                if _is_price_band_token(original, token, translated):
-                    if _price_band_preserved(
-                        original,
-                        token,
-                        translated,
-                        translated_norm,
-                    ):
-                        continue
-                    missing.append(f"{key}:{token}")
-                    continue
-                if _decade_preserved(token, translated, translated_norm):
-                    continue
-                if _ordinal_preserved(token, translated_norm):
-                    continue
-                if _large_integer_preserved(token, translated):
-                    continue
-                if _integer_preserved(token, translated_norm):
-                    continue
-                if _inflected_alnum_preserved(token, translated_norm):
-                    continue
-                if _equivalent_token_preserved(token, translated_norm):
-                    continue
-                if _measurement_preserved(original, token, translated, translated_norm):
-                    continue
-                if _compound_model_preserved(token, translated):
-                    continue
-                if _magnitude_preserved(original, translated_norm, token):
-                    continue
-                if _thousand_magnitude_preserved(original, translated_norm, token):
-                    continue
-                if _introductory_101_preserved(original, token, translated_norm):
-                    continue
-                if _asr_formatted_number_preserved(
-                    original,
-                    token,
-                    translated,
-                    translated_norm,
-                ):
-                    continue
-                if token_norm and token_norm not in translated_norm:
-                    missing.append(f"{key}:{token}")
-
-            spoken_numbers = {
-                "two": 2,
-                "three": 3,
-                "four": 4,
-                "five": 5,
-                "six": 6,
-                "seven": 7,
-                "eight": 8,
-                "nine": 9,
-                "ten": 10,
-                "eleven": 11,
-                "twelve": 12,
-            }
-            for number_word, value in spoken_numbers.items():
-                if not re.search(
-                    rf"\b{number_word}\s+(?!(?:and|or)\b)[A-Za-z]",
-                    original,
-                    re.IGNORECASE,
-                ):
-                    continue
-                candidates = {str(value), *_integer_chinese_forms(str(value))}
-                if value == 2:
-                    candidates.add("两")
-                if not any(normalized_text(item) in translated_norm for item in candidates):
-                    missing.append(f"{key}:{number_word}")
-
-            if re.search(
-                r"\b\d+(?:\.\d+)?\s*(?:grand|k)\b",
-                original,
-                flags=re.IGNORECASE,
-            ) and not _magnitude_preserved(original, translated_norm):
-                missing.append(f"{key}:numeric magnitude")
-
-        if missing:
-            return (
-                False,
-                "Likely dropped important source tokens. Preserve model names, years, specs, "
-                f"and alphanumeric terms unless explicitly translated. Missing: {missing[:20]}",
-            )
+        """Retain the legacy validator contract during typed-rule migration."""
+        diagnostics = self._inspect_preserved_tokens(
+            response_dict,
+            subtitle_dict,
+            extract_text,
+        )
+        if diagnostics:
+            self._record_shadow_repair_plan(diagnostics)
+            return False, legacy_preserved_token_message(diagnostics)
         return True, ""
 
     def _translate_locked_batch(
@@ -4685,10 +5020,14 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             custom_prompt=self.custom_prompt,
         )
         system_prompt += self._dialogue_prompt_rules(subtitle_dict)
-        system_prompt += self._target_language_style_rules(subtitle_dict.values())
+        style_rules = self._target_language_style_rules(subtitle_dict.values())
+        if not is_glm_53_model(self.model):
+            system_prompt += style_rules
         context_text = self.translation_context.render()
         if context_text:
             system_prompt += f"\n\n<global_context>\n{context_text}\n</global_context>"
+        if is_glm_53_model(self.model):
+            system_prompt += style_rules
         system_prompt += (
             "\n\n<recovery_rules>\n"
             "This is a boundary-safe recovery pass. Every output key is locked to exactly "
@@ -4726,6 +5065,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 model=self.model,
                 temperature=0.2,
                 use_cache=self.use_cache,
+                cache_namespace=self.cache_namespace,
                 client=self.llm_client,
                 reasoning_mode="disabled",
                 max_output_tokens=4096,
@@ -4749,9 +5089,20 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                             value = value.get("native_translation", value.get("translation", ""))
                         recovered.append(replace(data, translated_text=str(value).strip()))
                     return recovered
+                self._record_shadow_legacy_action(
+                    strategy=(
+                        RepairStrategy.RETRY
+                        if _attempt + 1 < self.SINGLE_FALLBACK_MAX_ATTEMPTS
+                        else RepairStrategy.NONE
+                    ),
+                    reasoning_mode=PlannedReasoningMode.DISABLED,
+                )
                 last_error = error_message
                 messages.append(
-                    {"role": "assistant", "content": json.dumps(response_dict, ensure_ascii=False)}
+                    self._assistant_followup_message(
+                        response,
+                        json.dumps(response_dict, ensure_ascii=False),
+                    )
                 )
             messages.append(
                 {
@@ -4879,6 +5230,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                         model=self.model,
                         temperature=self.TRANSLATION_TEMPERATURE,
                         use_cache=self.use_cache,
+                        cache_namespace=self.cache_namespace,
                         client=self.llm_client,
                         reasoning_mode="disabled",
                         max_output_tokens=2048,
@@ -4931,6 +5283,15 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     )
                     if not natural_chinese_ok:
                         raise RuntimeError(natural_chinese_error)
+                    technical_terms_ok, technical_terms_error = (
+                        self._validate_no_weakened_technical_compounds(
+                            current_response,
+                            current_source,
+                            lambda value: str(value),
+                        )
+                    )
+                    if not technical_terms_ok:
+                        raise RuntimeError(technical_terms_error)
                     contextual_chinese_ok, contextual_chinese_error = (
                         self._validate_natural_chinese_contextual_constructions(
                             current_response,
@@ -4945,6 +5306,14 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     last_error = None
                     break
                 except Exception as error:
+                    self._record_shadow_legacy_action(
+                        strategy=(
+                            RepairStrategy.RETRY
+                            if attempt + 1 < self.SINGLE_FALLBACK_MAX_ATTEMPTS
+                            else RepairStrategy.NONE
+                        ),
+                        reasoning_mode=PlannedReasoningMode.DISABLED,
+                    )
                     if self._is_fatal_provider_error(error):
                         self._open_provider_circuit(error)
                         raise RuntimeError(self._fatal_provider_message) from error
@@ -4988,6 +5357,10 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             check_adjacent_repetition=False,
         )
         if not fallback_ok and len(subtitle_chunk) > 1:
+            self._record_shadow_legacy_action(
+                strategy=RepairStrategy.BATCH_REBUILD,
+                reasoning_mode=PlannedReasoningMode.DISABLED,
+            )
             try:
                 return self._translate_locked_batch(
                     subtitle_chunk,
@@ -4999,6 +5372,11 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     "validation; retaining the isolated results for final consistency review: %s",
                     error,
                 )
+        elif not fallback_ok:
+            self._record_shadow_legacy_action(
+                strategy=RepairStrategy.NONE,
+                reasoning_mode=PlannedReasoningMode.DISABLED,
+            )
         return translated_items
 
     def _widen_batch_tail_shift_repair(
@@ -5049,6 +5427,14 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         translated_list: List[SubtitleProcessData],
     ) -> List[SubtitleProcessData]:
         """Repair confirmed alignment errors and high-confidence adjacent repetition."""
+        if self.is_reflect and is_lmstudio_qwen_38_request(
+            self.model,
+            self.llm_client,
+        ):
+            return self._finalize_local_qwen_translated_list(
+                source_list,
+                translated_list,
+            )
         if not self._needs_alignment_audit(source_list):
             return translated_list
 
@@ -5078,6 +5464,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                             item,
                             translated_text=self._translate_alignment_item(
                                 item.original_text,
+                                source_key=str(item.index),
                                 previous_source=self._all_source_by_index.get(item.index - 1, ""),
                                 next_source=self._all_source_by_index.get(item.index + 1, ""),
                             ),
@@ -5192,13 +5579,23 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     "Repaired boundary still failed repetition validation: %s",
                     repaired_error,
                 )
-                repaired = self._translate_locked_batch(
-                    repair_sources,
-                    initial_feedback=(
-                        "The previous boundary repair still duplicated or anticipated "
-                        "neighboring meaning: " + repaired_error
-                    ),
-                )
+                try:
+                    repaired = self._translate_locked_batch(
+                        repair_sources,
+                        initial_feedback=(
+                            "The previous boundary repair still duplicated or anticipated "
+                            "neighboring meaning: " + repaired_error
+                        ),
+                    )
+                except Exception as repair_error:
+                    logger.warning(
+                        "Adjacent translation retry failed for subtitles %s and %s; "
+                        "retaining the previous translations: %s",
+                        pair_sources[0].index,
+                        pair_sources[1].index,
+                        repair_error,
+                    )
+                    continue
                 repaired_response = {str(item.index): item.translated_text for item in repaired}
                 repaired_valid, repaired_error = self._validate_cross_key_boundaries(
                     repaired_response,
@@ -5227,11 +5624,20 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         )
         for key in semantic_candidates:
             index = int(key)
+            previous_source = self._all_source_by_index.get(index - 1, "")
+            next_source = self._all_source_by_index.get(index + 1, "")
             try:
                 repaired_text = self._translate_alignment_item(
                     source_dict[key],
-                    previous_source=self._all_source_by_index.get(index - 1, ""),
-                    next_source=self._all_source_by_index.get(index + 1, ""),
+                    source_key=key,
+                    previous_source=previous_source,
+                    next_source=next_source,
+                    repair_hint=self._selective_semantic_repair_hint(
+                        source_dict[key],
+                        translated_dict.get(key, ""),
+                        previous_source=previous_source,
+                        next_source=next_source,
+                    ),
                 )
             except Exception as error:
                 logger.warning(
@@ -5250,17 +5656,75 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             source_list,
             translated_by_index,
         )
-        if self._is_multispeaker_document():
-            self._repair_multispeaker_dialogue_sequences(
-                source_list,
-                translated_by_index,
-            )
-
         self._remove_stranded_chinese_subject_tails(
             source_list,
             translated_by_index,
         )
         self._repair_chinese_boundary_fluency(
+            source_list,
+            translated_by_index,
+        )
+        self._repair_high_confidence_semantic_asr_fallbacks(
+            source_list,
+            translated_by_index,
+        )
+
+        # Recheck deterministic prose risks after broad boundary-fluency rewrites
+        # so a late polish pass cannot reintroduce a confirmed calque.
+        translated_dict = {
+            str(item.index): translated_by_index[item.index].translated_text
+            for item in source_list
+            if item.index in translated_by_index
+        }
+        prose_candidates = self._strong_chinese_prose_candidates(
+            source_dict,
+            translated_dict,
+        )
+        for key in prose_candidates:
+            index = int(key)
+            try:
+                repaired_text = self._translate_alignment_item(
+                    source_dict[key],
+                    source_key=key,
+                    previous_source=self._all_source_by_index.get(index - 1, ""),
+                    next_source=self._all_source_by_index.get(index + 1, ""),
+                    repair_hint=self._chinese_prose_repair_hint(
+                        source_dict[key],
+                        translated_dict.get(key, ""),
+                    ),
+                )
+            except Exception as error:
+                fallback_text = self._deterministic_chinese_prose_fallback(
+                    source_dict[key],
+                    translated_dict.get(key, ""),
+                )
+                if fallback_text != translated_dict.get(
+                    key, ""
+                ) and not self._chinese_prose_repair_hint(source_dict[key], fallback_text):
+                    translated_by_index[index] = replace(
+                        translated_by_index[index],
+                        translated_text=fallback_text,
+                    )
+                    logger.info(
+                        "Deterministic prose fallback corrected key after LLM failure: %s",
+                        key,
+                    )
+                    continue
+                logger.warning(
+                    "Final prose repair failed for subtitle %s: %s",
+                    key,
+                    error,
+                )
+                continue
+            translated_by_index[index] = replace(
+                translated_by_index[index],
+                translated_text=repaired_text,
+            )
+            logger.info("Final prose repair corrected key: %s", key)
+        # A final style rewrite may reintroduce a fragment that an earlier
+        # boundary pass had already completed. Reapply only deterministic,
+        # source-anchored repairs after all LLM output has settled.
+        self._repair_high_confidence_semantic_asr_fallbacks(
             source_list,
             translated_by_index,
         )
@@ -5270,220 +5734,109 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             if item.index in translated_by_index
         ]
 
-    @staticmethod
-    def _repair_multispeaker_dialogue_sequences(
+    def _finalize_local_qwen_translated_list(
+        self,
         source_list: List[SubtitleProcessData],
-        translated_by_index: Dict[int, SubtitleProcessData],
-    ) -> None:
-        """Repair confirmed dialogue sequences without another LLM call."""
+        translated_list: List[SubtitleProcessData],
+    ) -> List[SubtitleProcessData]:
+        """Run only evidence-backed repairs that justify local inference cost.
 
-        def apply_replacements(
-            items: tuple[SubtitleProcessData, ...],
-            replacements: tuple[str, ...],
-        ) -> None:
-            for item, text in zip(items, replacements):
-                current = translated_by_index.get(item.index)
-                if current is not None:
-                    translated_by_index[item.index] = replace(
-                        current,
-                        translated_text=text,
-                    )
-
-        for items in zip(
-            source_list,
-            source_list[1:],
-            source_list[2:],
-            source_list[3:],
-            source_list[4:],
-        ):
-            sources = [item.original_text.strip() for item in items]
-            if (
-                re.search(r"\bunique\s+about\s+post-literacy\b", sources[0], re.I)
-                and re.search(r"\bbroader\s+phenomenon\b", sources[1], re.I)
-                and re.search(r"\btext\s+is\s+no\s+longer\b.*\bmain\s+way\b", sources[2], re.I)
-                and re.search(
-                    r"\btransmit\s+information\b.*\bcultural\s+connection\b",
-                    sources[3],
-                    re.I,
-                )
-                and re.search(r"\bshifted\s+from\s+text\s+to\s+video\b", sources[4], re.I)
-            ):
-                apply_replacements(
-                    items,
-                    (
-                        "但我认为 后文字时代的独特之处在于这种转变",
-                        "它也反映了当下更广泛的趋势",
-                        "文字已不再是人们传递信息的主要方式",
-                        "新闻、娱乐和文化联系也不再以文字为主",
-                        "真正的变化 是重心从文字转向了视频",
-                    ),
-                )
-
-        for items in zip(
-            source_list,
-            source_list[1:],
-            source_list[2:],
-            source_list[3:],
-        ):
-            sources = [item.original_text.strip() for item in items]
-            if (
-                re.match(r"^so\s+i\s+think\s+that\b", sources[0], re.I)
-                and re.search(r"\basked\s+that\s+exact\s+question\b", sources[1], re.I)
-                and re.match(r"^but\s+i\s+think\s+that\b", sources[2], re.I)
-                and re.search(
-                    r"\bwasn['’]t\s+something\b.*\bspecific\s+to\s+text\b", sources[3], re.I
-                )
-            ):
-                apply_replacements(
-                    items,
-                    (
-                        "关于这个问题 我得先说明",
-                        "我在报道中没有直接追问这一点",
-                        "但我的判断是",
-                        "促成革命的并不是文字本身",
-                    ),
-                )
-
-        for first, second, third in zip(source_list, source_list[1:], source_list[2:]):
-            current = [
-                translated_by_index.get(first.index),
-                translated_by_index.get(second.index),
-                translated_by_index.get(third.index),
-            ]
-            if any(item is None for item in current):
+        A full reflective audit can issue nearly one request per subtitle on a
+        memory-bound local model. The Qwen path instead trusts the validated
+        batch result, applies deterministic corrections, and invokes native
+        reasoning only when an existing semantic detector proves a concrete
+        role or ASR mismatch.
+        """
+        translated_by_index = {item.index: item for item in translated_list}
+        source_dict = {str(item.index): item.original_text for item in source_list}
+        translated_dict = {
+            str(item.index): translated_by_index[item.index].translated_text
+            for item in source_list
+            if item.index in translated_by_index
+        }
+        semantic_candidates = self._strong_asr_semantic_candidates(
+            source_dict,
+            translated_dict,
+        )
+        for key in semantic_candidates:
+            if not key.isdigit() or int(key) not in translated_by_index:
                 continue
-
-            sources = [item.original_text.strip() for item in (first, second, third)]
-            replacements: tuple[str, str, str] | None = None
-            if (
-                re.fullmatch(r"are\s+we\s+just\s+talking\s+kids[?!.]?", sources[0], re.I)
-                and re.match(
-                    r"^are\s+we\s+just\s+talking\s+adults\?\s*"
-                    r"are\s+we\s+talking\s+everybody",
-                    sources[1],
-                    re.I,
-                )
-                and re.match(
-                    r"^so\s+i\s+think\s+we(?:['’]re|\s+are)\s+talking\s+everybody",
-                    sources[2],
-                    re.I,
-                )
-            ):
-                replacements = (
-                    "还是只是在说孩子？",
-                    "还是只是在说成年人？我们说的是所有人吗？",
-                    "我觉得我们说的是所有人",
-                )
-            elif (
-                re.search(
-                    r"\bat\s+the\s+same\s+time\b.*\bbooks?\s+leaving\s+the\s+classroom",
-                    sources[0],
-                    re.I,
-                )
-                and re.fullmatch(
-                    r"we(?:['’]ve|\s+have)\s+definitely\s+seen[,.!?]?",
-                    sources[1],
-                    re.I,
-                )
-                and re.search(
-                    r"\b(?:tablets?|chromebooks?|laptops?)\b.*"
-                    r"\bentering\s+the\s+classroom\b",
-                    sources[2],
-                    re.I,
-                )
-            ):
-                replacements = (
-                    "与此同时 书籍正逐渐退出课堂",
-                    "我们也明显看到了另一种变化",
-                    current[2].translated_text,
-                )
-            elif (
-                re.fullmatch(
-                    r"i\s+think\s+at\s+the\s+same\s+time[,.!?]?",
-                    sources[0],
-                    re.I,
-                )
-                and re.search(
-                    r"\ban\s+example\b.*\breally\s+illustrative\s+to\s+me\b",
-                    sources[1],
-                    re.I,
-                )
-                and re.search(
-                    r"\btalk\s+about\s+in\s+the\s+piece\b.*\bplato\b",
-                    sources[2],
-                    re.I,
-                )
-            ):
-                replacements = (
-                    "不过 我也想到了另一个角度",
-                    "有个例子尤其能说明问题",
-                    current[2].translated_text,
-                )
-            elif (
-                re.search(r"\bexperimental\s+standards\b.*\b1930s\b", sources[0], re.I)
-                and re.search(r"\bthis\s+research\s+was\s+being\s+done\b", sources[1], re.I)
-                and re.search(r"\bong['’]s\b.*\blarger\s+point\b", sources[2], re.I)
-            ):
-                replacements = (
-                    "当然 这项研究开展于20世纪30年代",
-                    "当时的实验标准与今天并不完全相同",
-                    current[2].translated_text,
-                )
-            elif (
-                re.search(r"\bong['’]s\b.*\blarger\s+point\b", sources[0], re.I)
-                and re.search(r"\bliterate\s+cultures\s+value\b", sources[1], re.I)
-                and re.search(r"\bcounterpoints\b.*\bdoes\s+stand\b", sources[2], re.I)
-            ):
-                replacements = (
-                    "但我认为 Ong 更宏观的观点仍然成立",
-                    "文字文化重视持续的线性论证和证据",
-                    "也重视对不同观点的反驳",
-                )
-            elif (
-                re.search(r"\bbrings?\s+in\s+new\s+voices\b", sources[0], re.I)
-                and re.search(r"\bdestabilizing\s+and\s+uncomfortable\b", sources[1], re.I)
-                and re.search(r"\bmonopoly\b.*\bshare\s+information\b", sources[2], re.I)
-            ):
-                replacements = (
-                    "这会让更多新的声音进入公共讨论",
-                    "这种变化总会让既得利益者感到不安",
-                    "尤其是那些原本垄断信息传播的人",
-                )
-
-            if replacements is None:
+            index = int(key)
+            previous_source = self._all_source_by_index.get(index - 1, "")
+            next_source = self._all_source_by_index.get(index + 1, "")
+            repair_hint = self._selective_semantic_repair_hint(
+                source_dict[key],
+                translated_dict.get(key, ""),
+                previous_source=previous_source,
+                next_source=next_source,
+            )
+            if not repair_hint:
                 continue
-            for source, item, text in zip((first, second, third), current, replacements):
-                translated_by_index[source.index] = replace(
-                    cast(SubtitleProcessData, item),
-                    translated_text=text,
+            try:
+                repaired_text = self._translate_alignment_item(
+                    source_dict[key],
+                    source_key=key,
+                    previous_source=previous_source,
+                    next_source=next_source,
+                    repair_hint=repair_hint,
                 )
-
-        for left, right in zip(source_list, source_list[1:]):
-            left_source = left.original_text.strip()
-            right_source = right.original_text.strip()
-            if re.search(
-                r"\bwould\s+need\s+to\s+be\s+a\s+really(?:,?\s+you\s+know)?[,.!?]?\s*$",
-                left_source,
-                re.I,
-            ) and re.match(
-                r"^large[ -]scale\s+shift\b.*\bfor\s+people\s+to\s+make\b",
-                right_source,
-                re.I,
-            ):
-                apply_replacements(
-                    (left, right),
-                    (
-                        "我认为 这会要求人们真正行动起来",
-                        "共同推动一次大规模转变",
-                    ),
+            except Exception as error:
+                logger.warning(
+                    "Local Qwen semantic repair failed for subtitle %s; retaining "
+                    "the validated translation: %s",
+                    key,
+                    error,
                 )
+                continue
+            translated_by_index[index] = replace(
+                translated_by_index[index],
+                translated_text=repaired_text,
+            )
+            logger.info("Local Qwen semantic repair corrected key: %s", key)
 
-    @staticmethod
+        self._repair_contextual_nuclear_plant_terms(
+            source_list,
+            translated_by_index,
+        )
+        self._remove_stranded_chinese_subject_tails(
+            source_list,
+            translated_by_index,
+        )
+        self._repair_high_confidence_semantic_asr_fallbacks(
+            source_list,
+            translated_by_index,
+        )
+        return [
+            translated_by_index[item.index]
+            for item in source_list
+            if item.index in translated_by_index
+        ]
+
+    def _allows_deterministic_boundary_edit(
+        self, left: SubtitleProcessData, right: SubtitleProcessData
+    ) -> bool:
+        """Local text moves cannot cross a known turn, language, or visible pause."""
+        left_speaker = self._all_speaker_by_index.get(left.index)
+        right_speaker = self._all_speaker_by_index.get(right.index)
+        return (
+            right.index == left.index + 1
+            and not (left_speaker and right_speaker and left_speaker != right_speaker)
+            and not (
+                left.source_language
+                and right.source_language
+                and left.source_language != right.source_language
+            )
+            and self._gap_after_index.get(left.index, 0) < self.SEPARATED_DISPLAY_GAP_MS
+        )
+
     def _remove_stranded_chinese_subject_tails(
+        self,
         source_list: List[SubtitleProcessData],
         translated_by_index: Dict[int, SubtitleProcessData],
     ) -> None:
         """Remove only a duplicated Chinese subject split from its following auxiliary."""
+        if self.target_language.value not in {"简体中文", "繁体中文", "粤语"}:
+            return
         auxiliary_heads = {
             "am",
             "are",
@@ -5505,42 +5858,92 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             "will",
             "would",
         }
-        english_subjects = {
-            "he",
-            "i",
-            "it",
-            "she",
-            "that",
-            "these",
-            "they",
-            "this",
-            "those",
-            "we",
-            "which",
-            "who",
-            "you",
+        pronoun_forms = {
+            "i": {"i", "me", "my", "mine", "myself"},
+            "you": {"you", "your", "yours", "yourself", "yourselves"},
+            "he": {"he", "him", "his", "himself"},
+            "she": {"she", "her", "hers", "herself"},
+            "it": {"it", "its", "itself"},
+            "we": {"we", "us", "our", "ours", "ourselves"},
+            "they": {"they", "them", "their", "theirs", "themselves"},
         }
-        pronouns = "我|你|他|她|它|我们|你们|他们|她们|它们"
+        pronouns = "我们|你们|他们|她们|它们|我們|你們|他們|她們|它們|我|你|他|她|它"
         for left, right in zip(source_list, source_list[1:]):
             left_item = translated_by_index.get(left.index)
             right_item = translated_by_index.get(right.index)
-            if left_item is None or right_item is None:
+            if (
+                left_item is None
+                or right_item is None
+                or not self._allows_deterministic_boundary_edit(left, right)
+                or re.search(r"[.!?][\"')\]]*\s*$", left.original_text)
+            ):
                 continue
             left_tokens = re.findall(r"[A-Za-z]+(?:['’][A-Za-z]+)?", left.original_text.lower())
             right_tokens = re.findall(r"[A-Za-z]+(?:['’][A-Za-z]+)?", right.original_text.lower())
+            subject = re.search(r"[.!?]\s+(i|you|he|she|it|we|they)\s*$", left.original_text, re.I)
             if (
                 len(left_tokens) < 2
-                or left_tokens[-1] not in english_subjects
                 or not right_tokens
                 or right_tokens[0] not in auxiliary_heads
+                or subject is None
             ):
                 continue
-            cleaned = re.sub(rf"(?:\s*)(?:{pronouns})\s*$", "", left_item.translated_text).strip()
+            # A separated tail plus the same following subject is evidence of
+            # duplication. A final pronoun alone can be the preceding verb's object.
+            tail = re.search(rf"[\s，,]+({pronouns})\s*$", left_item.translated_text)
+            head = re.match(rf"({pronouns})", right_item.translated_text.lstrip())
+            if tail is None or head is None or tail.group(1) != head.group(1):
+                continue
+            cleaned = left_item.translated_text[: tail.start()].strip()
+            # Whitespace alone does not prove the tail is dangling: it may be
+            # the preceding verb's object. Keep all earlier pronoun mentions.
+            forms = pronoun_forms[subject.group(1).lower()]
+            required_mentions = sum(
+                token.replace("’", "'").partition("'")[0] in forms for token in left_tokens[:-1]
+            )
+            remaining_mentions = re.findall(pronouns, cleaned).count(tail.group(1))
+            if remaining_mentions < required_mentions:
+                continue
             if cleaned and cleaned != left_item.translated_text.strip():
                 translated_by_index[left.index] = replace(
                     left_item,
                     translated_text=cleaned,
                 )
+
+    def _repair_high_confidence_semantic_asr_fallbacks(
+        self,
+        source_list: List[SubtitleProcessData],
+        translated_by_index: Dict[int, SubtitleProcessData],
+    ) -> None:
+        """Apply local text corrections without guessing missing source facts."""
+        if self.target_language != TargetLanguage.SIMPLIFIED_CHINESE:
+            return
+
+        for item in source_list:
+            current = translated_by_index.get(item.index)
+            if current is None:
+                continue
+            source = item.original_text.strip()
+            translated = current.translated_text.strip()
+            repaired = translated
+            if (
+                re.search(r"\bCobalt\b", source, re.I)
+                and not re.search(r"\bCruze\b", source, re.I)
+                and "科鲁兹" in translated
+                and not re.search(r"\bCobalt\b", translated, re.I)
+            ):
+                # Cobalt and Cruze are distinct Chevrolet models; a localized
+                # Cruze name is not a valid rendering of source-owned Cobalt.
+                repaired = translated.replace("科鲁兹", "Cobalt")
+            elif re.fullmatch(
+                r"(?:i|we|you|he|she|they)\s+(?:bought|drove|kept|sold|took)\s+this[.!?]?",
+                source,
+                re.I,
+            ):
+                if re.search(r"(?:这|那)辆$", translated):
+                    repaired = f"{translated}车"
+            if repaired != translated:
+                translated_by_index[item.index] = replace(current, translated_text=repaired)
 
     def _pending_alignment_repair_windows(
         self,
@@ -5699,25 +6102,22 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         source_list: List[SubtitleProcessData],
         translated_by_index: Dict[int, SubtitleProcessData],
     ) -> None:
-        """Resolve only an ambiguous plant shorthand from explicit nuclear context."""
-        if self.target_language.value not in {"简体中文", "繁体中文", "粤语"}:
+        """Correct a locally explicit power plant, not an ambiguous neighboring plant."""
+        if self.target_language != TargetLanguage.SIMPLIFIED_CHINESE:
             return
-        source_by_index = {
-            **{item.index: item.original_text for item in source_list},
-            **self._all_source_by_index,
-        }
         for item in source_list:
             source = item.original_text.lower()
-            if not re.search(r"\b(?:the|these|those)\s+plants\b", source):
+            if (
+                not re.search(r"\bnuclear(?:\s+power)?\s+plants?\b", source)
+                or len(re.findall(r"\bplants?\b", source)) != 1
+                or re.search(r"\b(?:factor(?:y|ies)|manufactur\w*|assembly)\b", source)
+            ):
                 continue
-            neighborhood = " ".join(
-                source_by_index.get(index, "") for index in range(item.index - 3, item.index + 4)
-            ).lower()
             translated_item = translated_by_index.get(item.index)
             if (
-                "nuclear" not in neighborhood
-                or translated_item is None
-                or "工厂" not in translated_item.translated_text
+                translated_item is None
+                or translated_item.translated_text.count("工厂") != 1
+                or "核电" in translated_item.translated_text
             ):
                 continue
             translated_by_index[item.index] = replace(
@@ -5804,22 +6204,45 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             }
         )
         windows = self._chinese_fluency_windows(source_list, confirmed_positions)
-        workers = min(self.thread_num, len(windows))
+        if not windows:
+            return
+        # Only disjoint groups can run concurrently. Shared cues are committed
+        # sequentially and rechecked against already accepted neighboring windows.
+        groups: list[list[List[SubtitleProcessData]]] = []
+        for window in windows:
+            if groups and window[0].index <= groups[-1][-1][-1].index:
+                groups[-1].append(window)
+            else:
+                groups.append([window])
+        workers = min(self.thread_num, len(groups))
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
+            futures = [
                 executor.submit(
-                    self._repair_chinese_fluency_window_with_retries,
-                    window,
-                    [translated_by_index[item.index] for item in window],
-                ): window
-                for window in windows
-            }
-            results = [future.result() for future in as_completed(futures)]
+                    self._repair_chinese_fluency_group,
+                    group,
+                    {
+                        item.index: translated_by_index[item.index]
+                        for window in group
+                        for item in window
+                    },
+                )
+                for group in groups
+            ]
+            for future in as_completed(futures):
+                translated_by_index.update(future.result())
 
-        for window, repaired, repair_error in sorted(
-            results,
-            key=lambda result: result[0][0].index,
-        ):
+    def _repair_chinese_fluency_group(
+        self,
+        windows: list[List[SubtitleProcessData]],
+        current: Dict[int, SubtitleProcessData],
+    ) -> Dict[int, SubtitleProcessData]:
+        accepted: list[List[SubtitleProcessData]] = []
+        for window in windows:
+            if not self.is_running:
+                break
+            _, repaired, repair_error = self._repair_chinese_fluency_window_with_retries(
+                window, [current[item.index] for item in window]
+            )
             if repaired is None:
                 logger.warning(
                     "Chinese boundary fluency repair failed for subtitles %s; retaining "
@@ -5828,12 +6251,40 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     repair_error,
                 )
                 continue
-            for item in repaired:
-                translated_by_index[item.index] = item
+            candidate = {item.index: item for item in repaired}
+            if set(candidate) != {item.index for item in window} or len(candidate) != len(repaired):
+                logger.warning("Discarding fluency repair with changed cue ownership")
+                continue
+            changed = {
+                index
+                for index, item in candidate.items()
+                if item.translated_text != current[index].translated_text
+            }
+            if not changed:
+                accepted.append(window)
+                continue
+            proposed = {**current, **candidate}
+            try:
+                for previous in accepted:
+                    if changed.intersection(item.index for item in previous):
+                        self._validate_chinese_fluency_repair(
+                            previous,
+                            [current[item.index] for item in previous],
+                            [proposed[item.index] for item in previous],
+                        )
+            except Exception as error:
+                logger.warning(
+                    "Discarding overlapping repair that invalidates an accepted window: %s",
+                    error,
+                )
+                continue
+            current.update(candidate)
+            accepted.append(window)
             logger.info(
                 "Chinese boundary fluency repair corrected subtitles: %s",
-                [item.index for item in window],
+                sorted(changed),
             )
+        return current
 
     def _repair_chinese_fluency_window_with_retries(
         self,
@@ -5849,6 +6300,11 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             window,
             current,
             multispeaker=self._is_multispeaker_document(),
+            protected_boundaries=frozenset(
+                left.index
+                for left, right in zip(window, window[1:])
+                if not self._allows_deterministic_boundary_edit(left, right)
+            ),
         )
         if deterministic is not None:
             return window, deterministic, None
@@ -5868,6 +6324,10 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 self._record_reasoning_metric("accepted_repairs")
                 return window, candidate, None
             except Exception as error:
+                self._record_shadow_legacy_action(
+                    strategy=RepairStrategy.LOCAL_REWRITE,
+                    reasoning_mode=PlannedReasoningMode.DISABLED,
+                )
                 repair_error = error
                 feedback = str(error)
                 self._record_reasoning_metric("rejected_repairs")
@@ -5897,6 +6357,10 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     self._record_reasoning_metric("accepted_repairs")
                 return window, candidate, None
             except Exception as error:
+                self._record_shadow_legacy_action(
+                    strategy=RepairStrategy.LOCAL_REWRITE,
+                    reasoning_mode=PlannedReasoningMode.DISABLED,
+                )
                 repair_error = error
                 feedback = str(error)
                 if use_reasoning:
@@ -5915,8 +6379,58 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 self._validate_chinese_fluency_repair(window, current, candidate)
                 return window, candidate, None
             except Exception as error:
+                self._record_shadow_legacy_action(
+                    strategy=RepairStrategy.NONE,
+                    reasoning_mode=PlannedReasoningMode.DISABLED,
+                )
                 repair_error = error
                 fresh_feedback = str(error)
+        # A failed rewrite does not prove that the validated text was defective:
+        # the candidate itself may have introduced the rejected structure. Before
+        # retaining the old text, independently verify its combined fidelity and
+        # per-cue readability. Only a confirmed residual defect receives one final,
+        # issue-guided rewrite, keeping the extra cost off normal windows.
+        try:
+            # The previous text must pass the same structural gate as a rewrite.
+            # A combined-fidelity verdict alone can overlook an individually
+            # unreadable cue such as ``真正的 / 全球场馆网络``.
+            self._validate_chinese_fluency_repair(window, current, current)
+            return window, current, None
+        except Exception as current_error:
+            repair_error = current_error
+
+        final_reasoning = self._should_reason_about_chinese_fluency_window(
+            window,
+            current,
+            feedback=str(repair_error or ""),
+        )
+        self._record_shadow_legacy_action(
+            strategy=RepairStrategy.LOCAL_REWRITE,
+            reasoning_mode=(
+                PlannedReasoningMode.ENABLED if final_reasoning else PlannedReasoningMode.DISABLED
+            ),
+        )
+        try:
+            candidate = self._rewrite_chinese_fluency_window_fresh(
+                window,
+                feedback=(
+                    "The existing translations also failed independent readability and "
+                    f"fidelity validation: {repair_error}"
+                ),
+                reasoning=final_reasoning,
+            )
+            self._validate_chinese_fluency_repair(window, current, candidate)
+            if final_reasoning:
+                self._record_reasoning_metric("accepted_repairs")
+            return window, candidate, None
+        except Exception as error:
+            self._record_shadow_legacy_action(
+                strategy=RepairStrategy.NONE,
+                reasoning_mode=PlannedReasoningMode.DISABLED,
+            )
+            repair_error = error
+            if final_reasoning:
+                self._record_reasoning_metric("rejected_repairs")
         return window, None, repair_error
 
     def _rewrite_chinese_fluency_window_fresh(
@@ -5927,7 +6441,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         reasoning: bool = False,
     ) -> List[SubtitleProcessData]:
         """Retranslate one confirmed broken window without defective target anchoring."""
-        payload: Dict[str, Dict[str, str]] = {}
+        payload: Dict[str, Dict[str, Any]] = {}
         for item in source_items:
             canonical = self._confirmed_context_canonical(item.original_text)
             value = {
@@ -5939,6 +6453,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             speaker = self._all_speaker_by_index.get(item.index, "")
             if speaker:
                 value["speaker"] = speaker
+            value.update(self._display_boundary_metadata(item.index))
             payload[str(item.index)] = value
         first_index = source_items[0].index
         last_index = source_items[-1].index
@@ -5976,7 +6491,9 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     f"{self.target_language.value} from scratch. Read all source items as one "
                     "continuous utterance, reconstruct its complete meaning, then distribute it "
                     "across the original keys so each cue is as readable as source ownership "
-                    "permits. Keep every "
+                    "permits. gap_after_ms describes the pause after an item: continuous items may "
+                    "form one display sequence, while separated items must not end with a naked "
+                    "number, unfinished predicate, modifier, or function word. Keep every "
                     "fact, name, number, negation, comparison, speaker turn, and conclusion exactly "
                     "once. Do not mirror an English boundary that strands a Chinese subject, "
                     "predicate, object, modifier, connective, or vague filler-only frame. Omit oral "
@@ -5988,9 +6505,14 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     "pronoun, classifier, or other non-material grammatical scaffolding between "
                     "adjacent keys. Never move a material action or event such as starting "
                     "operation, construction, lifting, growth, approval, or completion into a key "
-                    "whose source does not contain it. If the source splits a modifier from its "
-                    "head noun, keep a concise continuation instead of anticipating the next key's "
-                    "action. Preserve the combined meaning exactly once. For a three-key chain "
+                    "whose source does not contain it. Exception: when adjacent source keys split "
+                    "one inseparable semantic atom such as predicate-complement, modifier-head, or "
+                    "number-unit, you may realize that atom across those two keys with minimal "
+                    "shared grammatical or lexical scaffolding so separated displays are readable. "
+                    "Do not move it beyond that pair or duplicate the combined fact. If the source "
+                    "splits a modifier from its head noun, keep a concise continuation instead of "
+                    "anticipating the next key's action. Preserve the combined meaning exactly once. "
+                    "For a three-key chain "
                     "shaped as 将/把 + object, "
                     "locative phrase, then action, redistribute it into independently readable cues "
                     "such as 这里使用 + object, 它们会安装在 + location, then 并逐步 + action; "
@@ -6014,6 +6536,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             model=self.model,
             temperature=self.TRANSLATION_TEMPERATURE,
             use_cache=self.use_cache,
+            cache_namespace=self.cache_namespace,
             client=self.llm_client,
             reasoning_mode="enabled" if reasoning else "disabled",
             max_output_tokens=(self.REASONING_REWRITE_MAX_OUTPUT_TOKENS if reasoning else 4096),
@@ -6048,78 +6571,62 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         current: List[SubtitleProcessData],
         *,
         multispeaker: bool = False,
+        protected_boundaries: frozenset[int] = frozenset(),
     ) -> Optional[List[SubtitleProcessData]]:
-        """Repair narrowly defined audited constructions after model retries."""
+        """Move existing local wording; never synthesize a remembered translation."""
         current_by_index = {item.index: item for item in current}
         repaired_by_index = dict(current_by_index)
         changed = False
 
-        for first, second, third in zip(window, window[1:], window[2:]):
-            if (
-                multispeaker
-                and re.search(
-                    r"\b(?:about|or)\s+the\s+hyperlinks\s+as\s+much\b.*"
-                    r"\beasier\s+to\s+focus\s+on[.!?]?\s*$",
-                    first.original_text.strip(),
-                    re.IGNORECASE,
-                )
-                and re.fullmatch(
-                    r"and\s+so[,.!?]?",
-                    second.original_text.strip(),
-                    re.IGNORECASE,
-                )
-                and re.match(
-                    r"^it\s+does\s+seem\s+that\s+people\s+read\s+better\b",
-                    third.original_text.strip(),
-                    re.IGNORECASE,
-                )
-            ):
-                repaired_by_index[first.index] = replace(
-                    current_by_index[first.index],
-                    translated_text="超链接也没那么多 因此更容易集中注意力",
-                )
-                repaired_by_index[second.index] = replace(
-                    current_by_index[second.index],
-                    translated_text="这也会带来实际差异",
-                )
-                changed = True
-
-            if (
-                re.search(
-                    r"\bput\s+one\s+unless\s+you\s+just\s+sort\s+of\s+set$",
-                    first.original_text.strip(),
-                    re.IGNORECASE,
-                )
-                and re.match(
-                    r"^it\s+in\s+your\s+cargo\s+area\b",
-                    second.original_text.strip(),
-                    re.IGNORECASE,
-                )
-                and re.match(
-                    r"^and\s+accepted?\s+that\s+neither\b",
-                    third.original_text.strip(),
-                    re.IGNORECASE,
-                )
-            ):
-                repaired_by_index[first.index] = replace(
-                    current_by_index[first.index],
-                    translated_text="我觉得也放不下备胎 除非直接把备胎",
-                )
-                repaired_by_index[second.index] = replace(
-                    current_by_index[second.index],
-                    translated_text="放在后面的载物区里",
-                )
-                repaired_by_index[third.index] = replace(
-                    current_by_index[third.index],
-                    translated_text="那样一来 你和乘客就无法再往后备厢放其他东西",
-                )
-                changed = True
-
         for left, right in zip(window, window[1:]):
+            if left.index in protected_boundaries:
+                continue
             left_source = left.original_text.strip()
             right_source = right.original_text.strip()
             left_translation = repaired_by_index[left.index].translated_text.strip()
             right_translation = repaired_by_index[right.index].translated_text.strip()
+
+            # English focus markers can precede their complement at a cue edge.
+            # Relocate only existing Chinese wording with explicit source support;
+            # the caller's speaker, language, and pause protections still apply.
+            scope_tail = split_stranded_scope_adverb(left_translation)
+            if scope_tail and re.search(
+                r"(?:\b(?:and|or)\s+even|\b(?:especially|particularly))[,;:]?\s*$",
+                left_source,
+                re.IGNORECASE,
+            ):
+                prefix, marker = scope_tail
+                repaired_right = (
+                    right_translation
+                    if right_translation.startswith(marker)
+                    else f"{marker}{right_translation}"
+                )
+                if prefix and right_translation:
+                    repaired_by_index[left.index] = replace(
+                        repaired_by_index[left.index], translated_text=prefix
+                    )
+                    repaired_by_index[right.index] = replace(
+                        repaired_by_index[right.index], translated_text=repaired_right
+                    )
+                    left_translation = prefix
+                    right_translation = repaired_right
+                    changed = True
+
+            if LLMTranslator._source_ends_with_parallel_plural_attributes(
+                left_source
+            ) and re.search(r"的[\s，。！？；：、,.!?;:…]*$", left_translation):
+                cleaned_left = re.sub(
+                    r"的(?P<punct>[\s，。！？；：、,.!?;:…]*)$",
+                    r"\g<punct>",
+                    left_translation,
+                ).rstrip()
+                if cleaned_left:
+                    repaired_by_index[left.index] = replace(
+                        repaired_by_index[left.index],
+                        translated_text=cleaned_left,
+                    )
+                    left_translation = cleaned_left
+                    changed = True
 
             # English can place a copular emphasis immediately before a long
             # pause while natural Chinese carries the same emphasis with the
@@ -6149,11 +6656,13 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             # the previous cue end. This preserves the same relation and text
             # ownership while making both Chinese cues independently readable.
             connector_match = re.search(
-                r"[\s，,]*(但|但是|不过|而且|并且|所以|因此)$",
+                r"[\s，,]*(但|但是|不过|而且|并且|所以|因此|另一方面|与此同时|相比之下|相较之下)"
+                r"[\s，。！？；：、,.!?;:…]*$",
                 repaired_by_index[left.index].translated_text,
             )
             if connector_match and re.search(
-                r"\b(?:and(?:\s+then)?|but|so)[,.!?]?\s*$",
+                r"\b(?:and(?:\s+then)?|but|so|however|meanwhile|on\s+the\s+other\s+hand|"
+                r"by\s+contrast|in\s+contrast)[,.!?]?\s*$",
                 left_source,
                 re.IGNORECASE,
             ):
@@ -6173,7 +6682,11 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     r"^(?:好吧|行吧)", current_right
                 ):
                     repaired_right = re.sub(r"^(?:好吧|行吧)[\s，,]*", "不过 ", current_right)
-                elif re.match(r"^(?:但|但是|不过|而且|并且|所以|因此)", current_right):
+                elif re.match(
+                    r"^(?:但|但是|不过|然而|而且|并且|所以|因此|"
+                    r"另一方面|与此同时|相比之下|相较之下)",
+                    current_right,
+                ):
                     repaired_right = current_right
                 else:
                     repaired_right = f"{connector} {current_right}"
@@ -6188,161 +6701,31 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     )
                     changed = True
 
-            if (
-                multispeaker
-                and re.search(r"\bis\s+it\s+sort\s+of\s+like[,.!?]?\s*$", left_source, re.I)
-                and re.match(
-                    r"^we(?:['’]re|\s+are)\s+just\s+back\s+to\s+where\s+we\s+started",
-                    right_source,
-                    re.I,
-                )
-            ):
-                repaired_by_index[left.index] = replace(
-                    current_by_index[left.index],
-                    translated_text="这算不算某种倒退？",
-                )
-                repaired_by_index[right.index] = replace(
-                    current_by_index[right.index],
-                    translated_text="仿佛我们只是回到了起点？",
-                )
-                changed = True
-                continue
-            numeric_range = re.search(
-                r"\bfirst\s+(\d+)\s*$",
-                left_source,
-                re.IGNORECASE,
-            )
-            numeric_range_end = re.match(
-                r"^or\s+(\d+)\s+seconds?\b",
-                right_source,
-                re.IGNORECASE,
-            )
-            if multispeaker and numeric_range and numeric_range_end:
-                repaired_by_index[left.index] = replace(
-                    current_by_index[left.index],
-                    translated_text=(f"人们会更加注重在最初{numeric_range.group(1)}秒内抓住注意力"),
-                )
-                repaired_by_index[right.index] = replace(
-                    current_by_index[right.index],
-                    translated_text=(f"有时甚至会把这个窗口放宽到{numeric_range_end.group(1)}秒"),
-                )
-                changed = True
-                continue
-            if (
-                multispeaker
-                and re.search(
-                    r"\bwould\s+need\s+to\s+be\s+a\s+really[,.!?]?\s*$",
-                    left_source,
-                    re.IGNORECASE,
-                )
-                and re.match(
-                    r"^large[ -]scale\s+shift\s+for\s+people\s+to\s+make\b",
-                    right_source,
-                    re.IGNORECASE,
-                )
-            ):
-                repaired_by_index[left.index] = replace(
-                    current_by_index[left.index],
-                    translated_text="我认为 这会要求人们真正行动起来",
-                )
-                repaired_by_index[right.index] = replace(
-                    current_by_index[right.index],
-                    translated_text="共同推动一次大规模转变",
-                )
-                changed = True
-                continue
-            if re.search(
-                r"\b(?:better|higher)\s+quality\s+than\s+most\s+other$",
-                left_source,
-                re.IGNORECASE,
-            ) and re.match(r"^[a-z][a-z'’-]*\s+that\b", right_source, re.IGNORECASE):
-                right_translation = current_by_index[right.index].translated_text
-                noun_match = re.search(
-                    r"(?:我|我们)?(?:找到|试过|用过|买过)的([\u3400-\u9fff]{1,6}?)"
-                    r"(?=要|更|都|质量|$)",
-                    right_translation,
-                )
-                noun = noun_match.group(1) if noun_match else "产品"
-                left_translation = current_by_index[left.index].translated_text
-                repaired_left = re.sub(
-                    r"(?:比|胜过|优于)大多数其他$",
-                    f"远胜于大多数同类{noun}",
-                    left_translation,
-                )
-                if repaired_left != left_translation:
-                    repaired_by_index[left.index] = replace(
-                        current_by_index[left.index],
-                        translated_text=repaired_left,
-                    )
-                    repaired_by_index[right.index] = replace(
-                        current_by_index[right.index],
-                        translated_text=f"至少在我找到的{noun}中是这样",
-                    )
-                    changed = True
-                    continue
-            if re.search(
-                r"\bin\s+many\s+ways,?\s+it(?:['’]s|\s+is)\s+actually",
-                left_source,
-                re.IGNORECASE,
-            ) and re.match(r"^sometimes\b", right_source, re.IGNORECASE):
-                repaired_by_index[left.index] = replace(
-                    current_by_index[left.index],
-                    translated_text="其实换个角度看",
-                )
-                changed = True
-                continue
             if re.search(r"\bnewly\s+revised$", left_source, re.IGNORECASE) and re.match(
                 r"^(?:\w+\s+){0,3}(?:speaker|JBL|Bose|audio|sound)\b",
                 right_source,
                 re.IGNORECASE,
             ):
-                left_translation = current_by_index[left.index].translated_text.rstrip()
-                right_translation = current_by_index[right.index].translated_text.lstrip()
+                left_translation = repaired_by_index[left.index].translated_text.rstrip()
+                right_translation = repaired_by_index[right.index].translated_text.lstrip()
                 cleaned_left = re.sub(
                     r"\s*(?:这个|这款|这套)?(?:新|全新)?(?:改版|改款|修订)(?:的|版本)?$",
                     "",
                     left_translation,
                     count=1,
                 ).rstrip()
-                if cleaned_left and not re.match(r"^(?:这套)?(?:新|全新)?改版", right_translation):
+                if (
+                    cleaned_left
+                    and cleaned_left != left_translation
+                    and not re.match(r"^(?:这套)?(?:新|全新)?改版", right_translation)
+                ):
                     repaired_by_index[left.index] = replace(
-                        current_by_index[left.index],
+                        repaired_by_index[left.index],
                         translated_text=cleaned_left,
                     )
                     repaired_by_index[right.index] = replace(
-                        current_by_index[right.index],
+                        repaired_by_index[right.index],
                         translated_text=f"这套新改版的{right_translation}",
-                    )
-                    changed = True
-                    continue
-            if re.search(r"\brev$", left_source, re.IGNORECASE) and re.match(
-                r"^matching\b",
-                right_source,
-                re.IGNORECASE,
-            ):
-                left_translation = current_by_index[left.index].translated_text.rstrip()
-                right_translation = current_by_index[right.index].translated_text.lstrip()
-                cleaned_left = re.sub(
-                    r"\s*(?:(?:其实|也)?就是(?:他们)?(?:花哨的)?(?:说法|叫法)?\s*)?"
-                    r"(?:指的是|表示|也就是)?\s*(?:降挡)?$",
-                    "",
-                    left_translation,
-                    count=1,
-                ).rstrip()
-                cleaned_right = re.sub(
-                    r"^\s*(?:降挡)?\s*补油\s*[,，、]?\s*",
-                    "",
-                    right_translation,
-                    count=1,
-                ).lstrip()
-                if cleaned_left and cleaned_right:
-                    repaired_by_index[left.index] = replace(
-                        current_by_index[left.index],
-                        translated_text=cleaned_left,
-                    )
-                    repaired_by_index[right.index] = replace(
-                        current_by_index[right.index],
-                        translated_text=f"说白了就是降挡补油 {cleaned_right}",
                     )
                     changed = True
                     continue
@@ -6361,71 +6744,28 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     "sixth": "六挡",
                 }
                 gear_name = gear_names[ordinal_gear.group(1).lower()]
-                left_translation = current_by_index[left.index].translated_text
-                right_translation = current_by_index[right.index].translated_text
+                left_translation = repaired_by_index[left.index].translated_text
+                right_translation = repaired_by_index[right.index].translated_text
                 if gear_name not in left_translation:
-                    left_translation = f"{left_translation.rstrip()} {gear_name}"
+                    continue
                 cleaned_right = re.sub(
                     r"^\s*(?:(?:挂|切|换)(?:入|上|到)?\s*)?"
-                    r"(?:一|二|三|四|五|六)?挡(?:位)?(?:时)?\s*[,，、]?\s*",
+                    rf"(?:{gear_name[0]})?挡(?:位)?(?:时)?\s*[,，、]?\s*",
                     "",
                     right_translation,
                     count=1,
                 )
                 if cleaned_right and cleaned_right != right_translation:
                     repaired_by_index[left.index] = replace(
-                        current_by_index[left.index],
+                        repaired_by_index[left.index],
                         translated_text=left_translation,
                     )
                     repaired_by_index[right.index] = replace(
-                        current_by_index[right.index],
+                        repaired_by_index[right.index],
                         translated_text=cleaned_right,
                     )
                     changed = True
                     continue
-            percentage = re.search(
-                r"\b(\d+)%\s+of\s+what\s+you['’]re\s+going\s+to\s+use\s+"
-                r"this\s+(?:truck|car|vehicle)\s+for,?\s+like\s+the\s+steering\s+"
-                r"(?:rack|system),?$",
-                left_source,
-                flags=re.IGNORECASE,
-            )
-            if percentage and re.match(
-                r"^is\s+a\s+good\s+thing\s+because\b",
-                right_source,
-                flags=re.IGNORECASE,
-            ):
-                repaired_by_index[left.index] = replace(
-                    current_by_index[left.index],
-                    translated_text=f"我觉得在{percentage.group(1)}%的使用场景里",
-                )
-                repaired_by_index[right.index] = replace(
-                    current_by_index[right.index],
-                    translated_text="这套转向系统都更好用 因为响应更快了",
-                )
-                changed = True
-                continue
-
-            if re.fullmatch(
-                r"like\s+it\s+would\s+just\s+make\s+this\s+thing[.!?]?",
-                left_source,
-                flags=re.IGNORECASE,
-            ) and re.match(
-                r"^so\s+much\s+more\s+excellent\s+than\s+it\s+already\s+is"
-                r".*\bdon['’]t\s+get\s+me\s+wrong",
-                right_source,
-                flags=re.IGNORECASE,
-            ):
-                repaired_by_index[left.index] = replace(
-                    current_by_index[left.index],
-                    translated_text="它仿佛能让这台车更上一层楼",
-                )
-                repaired_by_index[right.index] = replace(
-                    current_by_index[right.index],
-                    translated_text="尽管它本来就已经很优秀了 但别误会",
-                )
-                changed = True
-
         if not changed:
             return None
         return [repaired_by_index[item.index] for item in window]
@@ -6460,7 +6800,8 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             edited_handoff = self._is_edited_speaker_handoff(left_source, right_source)
             if speaker_changed and not edited_handoff:
                 continue
-            target_signal = self._chinese_boundary_signal(
+            target_signal = self._target_boundary_signal(
+                left_source.index,
                 left_item.translated_text,
                 right_item.translated_text,
             )
@@ -6597,16 +6938,48 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             ):
                 continue
 
-            target_signal = self._chinese_boundary_signal(
+            long_gap_signal = self._long_gap_chinese_boundary_signal(
+                left.index,
+                left_item.translated_text,
+                right_item.translated_text,
+            )
+            target_signal = long_gap_signal or self._chinese_boundary_signal(
                 left_item.translated_text,
                 right_item.translated_text,
             )
             reasons = set(assess_english_boundary(left.original_text, right.original_text).reasons)
+            strong_dependency_reasons = {
+                "numeric value separated from its unit or noun",
+                "numeric value separated from its multiplier or unit",
+                "numeric compound modifier separated from its head noun",
+                "attributive or comparative modifier separated from its head",
+                "participle separated from its complement",
+                "source-backed syntactic dependency crosses the boundary",
+            }
+            strong_dependency = bool(reasons & strong_dependency_reasons)
+            separated_display = (
+                self._gap_after_index.get(left.index, 0) >= self.SEPARATED_DISPLAY_GAP_MS
+            )
+            repeated_dependency = strong_dependency and self._dependent_boundary_repeats_meaning(
+                left_item.translated_text,
+                right_item.translated_text,
+            )
             source_is_open = not re.search(
                 r"[.!?][\"')\]]*$",
                 left.original_text.strip(),
             )
-            if (
+            if target_signal == "scope adverb is separated from its complement":
+                mandatory.append(left.index)
+            elif strong_dependency and (target_signal or repeated_dependency):
+                mandatory.append(left.index)
+            elif separated_display and long_gap_signal:
+                mandatory.append(left.index)
+            elif (
+                separated_display
+                and target_signal == "connective stranded at previous subtitle end"
+            ):
+                mandatory.append(left.index)
+            elif (
                 source_is_open
                 and target_signal
                 and target_signal
@@ -6623,6 +6996,21 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 }
             ):
                 mandatory.append(left.index)
+            elif (
+                target_signal == "existential predicate is separated from its object"
+                and re.search(
+                    r"\b(?:didn't|doesn't|don't|isn't|aren't|wasn't|weren't|"
+                    r"hasn't|haven't|hadn't|won't|wouldn't|can't|couldn't|shouldn't)"
+                    r"[.!?]?\s*$",
+                    left.original_text,
+                    re.IGNORECASE,
+                )
+                and re.search(
+                    r"(?:没有|不是|不会|不能)[\s，。！？；：、,.!?;:…]*$",
+                    left_item.translated_text,
+                )
+            ):
+                mandatory.append(left.index)
             elif target_signal == "possible pronoun boundary" and any(
                 reason.startswith("dangling subject") for reason in reasons
             ):
@@ -6633,11 +7021,15 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     "numeric range split at conjunction",
                     "place name split between city and state",
                     "proper-name subject separated from its predicate",
+                    "clause-final subject separated from its finite predicate",
                     "split lexical unit 'experimental standards'",
                     "split lexical unit 'other socks'",
                     "split lexical unit 'rev matching'",
                     "split phrasal construction 'take ... away'",
                     "transitive predicate separated from its object",
+                    "transitive predicate separated from its pronoun object",
+                    "incomplete predicate 'have'",
+                    "new-clause connective stranded at previous cue end",
                 }
             ):
                 mandatory.append(left.index)
@@ -6723,512 +7115,16 @@ Return exactly one JSON object with all and only the current_subtitles keys:
     @staticmethod
     def _chinese_boundary_signal(left: str, right: str) -> str:
         """Describe a likely Chinese syntax break without deciding that it is wrong."""
-        trim_chars = " \t\r\n，。！？；：、,.!?;:…（）()【】[]‘’“”\"'"
-        left = str(left or "").strip(trim_chars)
-        right = str(right or "").strip(trim_chars)
-        left = re.sub(r"(?:[ \t]*你知道(?:的|吗)?)+$", "", left).strip(trim_chars)
-        right = re.sub(r"^(?:你知道(?:的|吗)?[ \t]*)+", "", right).strip(trim_chars)
+        features = ChineseBoundaryFeatures.from_text(left, right)
+        left = features.left
+        right = features.right
         if not left or not right:
             return ""
 
-        standalone = {
-            "但",
-            "但是",
-            "不过",
-            "而且",
-            "并且",
-            "所以",
-            "因为",
-            "如果",
-            "尽管",
-            "除非",
-            "以及",
-            "或者",
-            "总之",
-            "就是",
-            "但与此同时",
-            "与此同时",
-        }
-        if left in standalone or right in standalone:
-            return "standalone connective"
-
-        if re.fullmatch(r"(?:而|但|不过)?(?:这|那|它|此|这项|那项)(?:工程|工作|做法)?", left):
-            return "demonstrative subject is stranded"
-
-        if re.search(
-            r"(?:我|我们|你|你们|他|她|它|他们|她们|它们)"
-            r"(?:会|将|要|需要|可以|能够|打算|准备)?把"
-            r"[㐀-鿿A-Za-z0-9·一二两三四五六七八九十百千万]+$",
-            left,
-        ):
-            return "ba construction is separated from its predicate"
-
-        if re.search(
-            r"(?:^|[\s，,；;。.!?])(?:会|将|要|需要|可以|能够|打算|准备)?把"
-            r"[㐀-鿿A-Za-z0-9·一二两三四五六七八九十百千万]{2,24}$",
-            left,
-        ) and re.match(
-            r"^(?:在|向|往|从|沿|通过|用|给|让|使|被|由|再|并|不断|逐一|逐段)",
-            right,
-        ):
-            return "ba construction is separated from its predicate"
-
-        disposal_tail = re.search(
-            r"(?:^|[\s，,；;。.!?])(?:将|把)"
-            r"[㐀-鿿A-Za-z0-9·一二两三四五六七八九十百千万]{2,24}$",
-            left,
-        )
-        disposal_has_predicate = re.search(
-            r"(?:穿过|穿越|穿透|突破|切开|建成|完成|实施|安装|放置|移动|送到|"
-            r"带到|连接|贴到|推进|延伸|用于|承受)",
-            left,
-        )
-        disposal_continues = re.match(
-            r"^(?:在|向|往|从|沿|通过|用|给|让|使|被|由|再|并|不断|逐一|逐段|"
-            r"穿|切|建|完成|实施|安装|放|移|送|带|连接|贴|推进|延伸|承受|承担)",
-            right,
-        )
-        if disposal_tail and not disposal_has_predicate and disposal_continues:
-            return "disposal construction is separated from its predicate"
-
-        predicate_without_complement = re.search(
-            r"(?:安装到|安装在|放到|放在|装到|装在|移到|移至|送到|带到|"
-            r"连接到|贴到|推进到|延伸到|通向|进入|用于|承受)$",
-            left,
-        )
-        completed_passive_bearing = re.search(
-            r"^(?:将)?由.{1,12}(?:来)?(?:承受|承担)$",
-            left,
-        )
-        if predicate_without_complement and not completed_passive_bearing:
-            return "predicate is separated from its required complement"
-
-        if re.fullmatch(
-            r"(?:在|沿着|沿|向|往|从|通过|借助|利用).{1,24}"
-            r"(?:里|中|内|上|下|之间|之中|隧道|墙|墙体|土体|内部|表面)",
-            left,
-        ) and re.match(
-            r"^(?:会|将|就|再|又|还|不断|持续|开始|继续|逐渐|直接|可以|能够|"
-            r"逐一|逐段|被|把|贴|装|放|移|送|带|连接|推进|延伸|承受|承担)",
-            right,
-        ):
-            return "locative phrase is separated from its predicate"
-
-        if left.endswith("所受的") and re.match(
-            r"[㐀-鿿]{2,12}所受(?:到)?的",
-            right,
-        ):
-            return "possible duplicated boundary phrase"
-
-        if re.search(r"(?:在)?(?:世界|全球)(?:上)?首次$", left):
-            return "superlative modifier is separated from its predicate"
-
-        if any(
-            re.search(
-                r"(?:(?:很|非常|十分|极其)(?:困难|艰难)|难度(?:很|极|非常|极其)?高)"
-                r"的(?:工程|施工)(?:内容|中身)$",
-                text,
-            )
-            for text in (left, right)
-        ):
-            return "literal Japanese difficulty construction"
-
-        if any(
-            re.search(
-                r"(?:(?:工程|项目)(?:即为|就是|是)?(?:如此|这样).{0,6}(?:工程|施工)|"
-                r"(?:施工工程|工程施工|穿越施工工程))$",
-                text,
-            )
-            for text in (left, right)
-        ):
-            return "duplicated construction nominalization"
-
-        stacked_connective = re.compile(
-            r"^(?:所以|因此|不过|但是|但|而且|并且)[ \t]*"
-            r"(?:但|但是|不过|所以|因此|而且|并且|是的)"
-        )
-        if stacked_connective.search(left) or stacked_connective.search(right):
-            return "stacked discourse connectives"
-
-        canonical_left = re.sub(r"[\s，。！？；：、,.!?;:]+", "", left).replace("那种", "这种")
-        canonical_right = re.sub(r"[\s，。！？；：、,.!?;:]+", "", right).replace("那种", "这种")
-        shared_limit = min(len(canonical_left), len(canonical_right), 18)
-        if any(
-            canonical_left.endswith(canonical_right[:size]) for size in range(shared_limit, 2, -1)
-        ):
-            return "possible duplicated boundary phrase"
-        if min(len(canonical_left), len(canonical_right)) >= 10:
-            left_bigrams = {
-                canonical_left[index : index + 2] for index in range(len(canonical_left) - 1)
-            }
-            right_bigrams = {
-                canonical_right[index : index + 2] for index in range(len(canonical_right) - 1)
-            }
-            shorter_bigrams = min(len(left_bigrams), len(right_bigrams))
-            overlap = (
-                len(left_bigrams & right_bigrams) / shorter_bigrams if shorter_bigrams else 0.0
-            )
-            similarity = difflib.SequenceMatcher(
-                None,
-                canonical_left,
-                canonical_right,
-            ).ratio()
-            if overlap >= 0.72 and similarity >= 0.72:
-                return "possible duplicated boundary meaning"
-        repeated_short_units = {
-            "不到",
-            "做出",
-            "进行",
-            "采取",
-            "选择",
-            "获取",
-            "使用",
-            "开始",
-            "继续",
-            "变得",
-        }
-        if any(
-            canonical_left.endswith(unit) and canonical_right.startswith(unit)
-            for unit in repeated_short_units
-        ):
-            return "possible duplicated boundary phrase"
-        repeated_meaning_units = {"阅读", "写作", "书写", "文字", "书籍", "信息"}
-        if any(
-            canonical_left.endswith(unit) and canonical_right.startswith(unit)
-            for unit in repeated_meaning_units
-        ):
-            return "possible duplicated boundary phrase"
-        repeated_predicate = re.search(
-            r"((?:我|我们|你|你们|他|她|他们|她们|它们).{1,4})$",
-            canonical_left,
-        )
-        if repeated_predicate and canonical_right.startswith(repeated_predicate.group(1)):
-            return "possible duplicated boundary phrase"
-        repeated_locative = re.match(
-            r"在?([㐀-鿿A-Za-z]{2,8}(?:中|里|上|下|方面))",
-            canonical_right,
-        )
-        if repeated_locative and repeated_locative.group(1) in canonical_left[-24:]:
-            return "possible duplicated boundary meaning"
-
-        material_subject = re.search(
-            r"(?:[\u3400-\u9fffA-Za-z]{1,16})"
-            r"(?:人们|人士|选民|学生|读者|教师|家长|孩子|公司|学校|政府|机构|团队|群体|国家|社会)$",
-            left,
-        )
-        predicate_start = re.match(
-            r"^(?:也|还(?!是)|又|却|则|都|只|仍|已经|正在|通常|往往|几乎|开始|继续|"
-            r"可以|能够|应该|需要|认为|觉得|选择|拒绝|喜欢|愿意|拥有|缺少|没有|不)",
-            right,
-        )
-        material_is_object = re.search(
-            r"(?:教|让|给|问|帮助|要求|期待|提醒|告诉|采访|面向|针对)"
-            r"[\u3400-\u9fffA-Za-z]{0,4}$",
-            left,
-        )
-        if material_subject and predicate_start and not material_is_object:
-            return "material subject may be stranded"
-
-        if re.search(
-            r"(?:有|存在)(?:那么|这样|这些|那些|一些|几|很多|许多)?人$", left
-        ) and re.match(
-            r"^(?:也|还|又|却|则|都|只|仍|正在|开始|继续|选择|认为|觉得|希望|"
-            r"试图|愿意|会|能|可以|能够)",
-            right,
-        ):
-            return "material subject may be stranded"
-
-        if left.endswith("的") and re.match(
-            r"^[\u3400-\u9fffA-Za-z]{1,12}[、，,]"
-            r"[\u3400-\u9fffA-Za-z]{1,16}(?:[、，,]|的信息|的内容|的表达|的语言)",
-            right,
-        ):
-            return "coordinated modifier may be stranded"
-
-        connector_pattern = re.compile(
-            r"(?:但|但是|不过|而且|并且|所以|因为|如果|尽管|除非|以及|或者|总之)$"
-        )
-        if connector_pattern.search(left):
-            return "connective stranded at previous subtitle end"
-
-        if re.search(r"在于$", left):
-            return "possible copular bridge"
-
-        if re.search(r"(?:重点|关键|原因|问题|事实|观点|想法)$", left) and re.match(
-            r"^是(?:要|在|让|把|我们|你们|他们|她们|它们|这|那)",
-            right,
-        ):
-            return "possible copular bridge"
-
-        if re.search(
-            r"(?:尤其是对|尤其是关于|我更想表达的重点|我无法确定我是否认为|既)$",
-            left,
-        ):
-            return "unfinished Chinese grammatical structure"
-
-        if re.search(r"(?:我|我们)(?:仍|也|还)?(?:觉得|认为|相信|猜|希望)$", left):
-            return "unfinished Chinese grammatical structure"
-
-        if re.search(r"(?:觉得|认为|看到|发现|问)在.{1,24}(?:之间|之中)$", left):
-            return "unfinished Chinese locative frame"
-
-        if re.search(r"(?:我|你|他|她|它|我们|你们|他们|她们|它们)(?:还|又|也|就|刚)?把$", left):
-            return "unfinished Chinese grammatical structure"
-
-        if re.search(
-            r"(?:^|[\s，,；;。.!?])(?:这|那|它|车辆|这辆车|那辆车)"
-            r"(?:其实|基本|大概|完全|确实)?就是$",
-            left,
-        ):
-            return "copular frame is separated from its result"
-
-        if re.search(r"之所以.+(?:部分|主要|根本|唯一)?原因$", left):
-            return "unfinished Chinese reason construction"
-
-        if re.search(r"\d+%.+(?:转向机|转向齿条)$", left):
-            return "percentage use-case predicate is stranded"
-
-        if re.search(r"(?:让|使(?!用)).{0,8}(?:这|那)?(?:辆|台)?(?:车|车辆|东西)$", left):
-            return "resultative predicate is stranded"
-
-        if re.search(
-            r"(?:了|着|给|为|与|跟|和|有)(?:一|这|那)"
-            r"(?:个|位|名|只|件|辆|台|种|套|条|款|部)$",
-            left,
-        ):
-            return "classifier phrase is stranded"
-
-        if re.search(r"(?:出现|预测|提到|说到|例如|比如|包括|有).{0,8}像$", left):
-            return "comparison example is stranded"
-
-        if re.search(
-            r"(?:在|从|介于).{0,12}(?:零|一|二|三|四|五|六|七|八|九|十|\d+)"
-            r"(?:本|个|条|项|年|岁|人|次|种)?$",
-            left,
-        ) and re.match(
-            r"^(?:到|至|和|与)(?:零|一|二|三|四|五|六|七|八|九|十|\d+)",
-            right,
-        ):
-            return "numeric range is split"
-
-        if re.search(
-            r"(?:增长|扩大|增加|提升|上升|升高|减少|下降|降低|达到)(?:到|至)$",
-            left,
-        ) and re.search(
-            r"(?:\d+(?:\.\d+)?|零|一|二|两|三|四|五|六|七|八|九|十)",
-            right,
-        ):
-            return "numeric complement is stranded"
-
-        if re.search(
-            r"(?:以至于|从而|因此).{0,24}"
-            r"(?:\d+|[一二两三四五六七八九十几多]+)(?:项|个|座|次)?"
-            r"(?:诺贝尔奖|奖项|奖|荣誉|成果|结果)$",
-            left,
-        ) and not re.search(
-            r"(?:颁发|授予|获得|赢得|斩获|催生|产生|取得|带来)了?"
-            r".{0,12}(?:诺贝尔奖|奖项|奖|荣誉|成果|结果)$",
-            left,
-        ):
-            return "consequence predicate is missing"
-
-        if re.search(
-            r"(?:重点|关键|问题|原因|意义|独特之处).{0,8}(?:是|在于)$",
-            left,
-        ):
-            return "semantic frame is incomplete"
-
-        if re.search(
-            r"(?:我|我们|你|你们|他们|她们|它们|这|那).{0,6}"
-            r"(?:看到|发现|认为|觉得|表明|说明)$",
-            left,
-        ):
-            return "possible reporting frame"
-
-        if re.search(r"(?:真正|实际|核心|主要|完整|严重)的$", left):
-            return "nominal modifier is stranded"
-
-        if re.search(r"(?:大多数|许多|一些|所有)?其他$", left):
-            return "comparative noun modifier is stranded"
-
-        if re.search(r"(?:任何|某种|一种|某些)$", left):
-            return "unfinished Chinese grammatical structure"
-
-        if re.search(r"(?:并不是|不只是|有意思的是)$", left):
-            return "unfinished Chinese grammatical structure"
-
-        if re.search(
-            r"(?:进一步|从而|进而|任何价值|这种新的|这类新的|我写|我们写|正在写)$",
-            left,
-        ):
-            return "unfinished Chinese grammatical structure"
-
-        if re.search(r"(?:想指出的更多是|真正想说的|真正想表达的)$", left):
-            return "semantic frame is incomplete"
-
-        if re.fullmatch(
-            r"(?:但|不过|所以|而且)?(?:我|我们)(?:只是)?觉得(?:吧|呢)?",
-            left,
-        ):
-            return "vague filler-only frame"
-
-        if re.search(r"(?:真正想说的|真正想表达的)(?:重点)?并非如此$", left):
-            return "semantic frame is incomplete"
-
-        if re.search(r"(?:他|她|它|我|我们|他们|她们|它们).{0,6}(?:很|非常|确实)?适合$", left):
-            return "adjective complement is missing"
-
-        if re.search(r"(?:这|那)篇.{0,8}(?:千|万|\d)字$", left):
-            return "classifier phrase is stranded"
-
-        if re.match(r"^而(?:是|要)?在", left) and re.search(r"时代$", left):
-            return "unfinished Chinese locative frame"
-
-        if re.search(r"(?:看到|看见|发现)了$", left):
-            return "possible reporting frame"
-
-        if re.search(r"(?:阅读|写作|书写|书籍|文字|信息)$", left) and re.match(
-            r"^和(?:阅读|写作|书写|书籍|文字|信息)",
-            right,
-        ):
-            return "coordinated subject may be stranded"
-
-        if re.match(r"^(?:而|从而|进而)?(?:成为|变成|进入|转化为)", right) and not re.search(
-            r"(?:会|将|能够|可以|开始|逐渐|最终)(?:成为|变成|进入|转化为).*$",
-            left,
-        ):
-            return "predicate fragment starts at next subtitle"
-
-        completed_choice = re.search(r"(?:做出|作出|拥有|面临).{0,8}选择$", left)
-        completed_passive_use = re.search(
-            r"(?:被|仍在|正在|可供|用于).{0,6}使用$",
-            left,
-        )
-        if (
-            not completed_choice
-            and not completed_passive_use
-            and re.search(r"(?:获取|接触|保存|传播|选择|使用|评价)$", left)
-            and re.match(
-                r"^(?:这|那|这些|那些|我们|你们|他们|它们|任何|所有)",
-                right,
-            )
-        ):
-            return "transitive predicate is split from its object"
-
-        if re.search(r"(?:所以|不过|但是|但)?(?:我|我们)觉得(?:确实)?如此$", left) and re.match(
-            r"^(?:阅读|写作|书写|教育|政治|技术|社会|信息|这|那|它|他|她|他们|人们)",
-            right,
-        ):
-            return "unfinished Chinese grammatical structure"
-
-        if re.search(r"[\u3400-\u9fff]{2,10}们$", left) and re.match(
-            r"^(?:也|还|又|却|都|只|仍|曾|将|会|能|可以|能够|应该|需要|"
-            r"使用|利用|认为|觉得|选择|拒绝|拥有|发挥|开始|继续)",
-            right,
-        ):
-            return "material subject may be stranded"
-
-        classifier_tail = re.search(
-            r"(?:是|不是|有|没有|成了|成为|需要|构成|呈现为).{0,4}"
-            r"(?:一|这|那)(?:个|种|幅|段|场|项|件|条|位|名|辆|台|套)$",
-            left,
-        )
-        independently_nominalized_person = re.search(
-            r"(?:第一|最后|下一|前一|后一)(?:个|位|名)$",
-            left,
-        )
-        if classifier_tail and not independently_nominalized_person:
-            return "classifier phrase is stranded"
-
-        if canonical_left in {"而在过去", "在过去", "与此同时", "如今", "现在", "目前"} and (
-            canonical_right.startswith(canonical_left)
-        ):
-            return "possible duplicated boundary phrase"
-
-        if re.search(r"(?:并|还|也|却)?不(?:太|那么|算|够|怎么|完全)?$", left) and re.match(
-            r"^(?:像|如|及|比|和|与|跟|同).{0,16}(?:一样|相比|那么)",
-            right,
-        ):
-            return "negated comparison is split from its complement"
-
-        soft_tail = re.compile(
-            r"(?:的|是|把|被|让|给|和|与|对|向|从|比|像|后|前|大约|差不多|与其|为了|花)$"
-        )
-        if soft_tail.search(left):
-            return "possible function-word split"
-
-        structural_tail = re.compile(
-            r"(?:作为|没有|不会|不能|可以|应该|能够|正在|已经|只是|其实|确实|"
-            r"相当|非常|更|最|几乎|变得|如今|现在|目前|当时|后来|最终|实际上|像是|就像|就是|"
-            r"我是说|我的意思是|来说|例如|比如|唯一|投入|专注于|致力于|同时|"
-            r"成为|变成|属于|包括)$"
-        )
-        complete_perspective_frame = re.search(
-            r"(?:从|在)(?:很多|许多|某些|多个|一些)方面来说$",
-            left,
-        )
-        if structural_tail.search(left) and not complete_perspective_frame:
-            return "unfinished Chinese grammatical structure"
-        if re.search(r"(?:^|[\s，,])当$", left):
-            return "unfinished Chinese grammatical structure"
-
-        if re.search(
-            r"^(?:.{0,12})?来说(?:太|很|非常)?根本(?:了|的)?(?:\s|所以|因此|而|但|$)",
-            right,
-        ):
-            return "literal fundamental calque"
-
-        if re.search(
-            r"(?:买(?:到)?|选(?:择)?|找(?:到)?|换(?:成)?)"
-            r"(?:一|这|那)(?:个|辆|台|种|套|位|名|条|款|部|件)$",
-            left,
-        ):
-            return "unfinished Chinese grammatical structure"
-
-        if re.search(r"(?:身上|当中|之中|方面)$", left) and not re.search(
-            r"(?:(?:在|落在|发生在|位于|处于).{0,12}(?:身上|当中|之中|方面)|"
-            r"(?:体现|反映|呈现)(?:在)?.{0,32}(?:身上|当中|之中|方面)|"
-            r"(?:有|分为|包括|包含|涉及).{0,4}方面|"
-            r"(?:另一个|这一|某一|各个)方面)$",
-            left,
-        ):
-            return "unfinished Chinese locative subject"
-
-        if re.search(r"(?:已经|正在|仍然|仍|还|也|都|确实)在$", left):
-            return "unfinished Chinese grammatical structure"
-
-        if re.search(r"(?:仍然|依然|仍旧)$", left):
-            return "unfinished Chinese adverbial predicate"
-
-        if re.search(r"一路$", left) and re.match(r"^(?:升|涨|高|攀|上|到|达到)", right):
-            return "unfinished Chinese degree phrase"
-
-        if re.search(r"(?:像|如|不及|不如)[^。！？]*$", left) and re.match(
-            r"^(?:那样|一样)", right
-        ):
-            return "comparison phrase is stranded"
-
-        if (
-            re.search(r"(?:我|你|他|她|它|我们|你们|他们)$", left)
-            and len(re.sub(r"\s+", "", left)) >= 5
-        ):
-            # A final pronoun may be either a stranded subject ("问题是他们")
-            # or a perfectly natural object ("我会立刻选他"). Let the
-            # context-aware audit decide instead of rejecting it as a hard rule.
-            return "possible pronoun boundary"
-
-        if re.search(r"(?:这个|这些|那种)$", left) and len(re.sub(r"\s+", "", left)) <= 10:
-            return "possible demonstrative split"
-
-        if right in {"了", "的", "得"}:
-            return "particle stranded at next subtitle start"
-
-        if right.startswith("时"):
-            return "unfinished Chinese grammatical structure"
-
-        left_connector = re.search(r"(所以|因为|不过|但是|而且|并且)$", left)
-        if left_connector and right.startswith(left_connector.group(1)):
-            return "duplicated boundary connective"
+        for detector in ORDERED_CHINESE_BOUNDARY_DETECTORS:
+            match = detector(features)
+            if match is not None:
+                return match.message
         return ""
 
     def _request_chinese_fluency_flags(
@@ -7238,7 +7134,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
         translated_by_index: Dict[int, SubtitleProcessData],
     ) -> list[int]:
         source_by_index = {item.index: item for item in source_list}
-        items: Dict[str, Dict[str, str]] = {}
+        items: Dict[str, Dict[str, Any]] = {}
         allowed: set[str] = set()
         for index in candidate_indices:
             left = source_by_index.get(index)
@@ -7249,7 +7145,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 continue
             key = f"{index}-{index + 1}"
             allowed.add(key)
-            items[key] = {
+            item: Dict[str, Any] = {
                 "source_left": left.original_text,
                 "source_right": right.original_text,
                 "source_language_left": left.source_language,
@@ -7258,7 +7154,8 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 "translation_right": right_translation.translated_text,
                 "speaker_left": self._all_speaker_by_index.get(left.index, ""),
                 "speaker_right": self._all_speaker_by_index.get(right.index, ""),
-                "target_signal": self._chinese_boundary_signal(
+                "target_signal": self._target_boundary_signal(
+                    left.index,
                     left_translation.translated_text,
                     right_translation.translated_text,
                 ),
@@ -7269,6 +7166,8 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                     right_translation.translated_text,
                 ),
             }
+            item.update(self._display_boundary_metadata(left.index))
+            items[key] = item
         if not items:
             return []
 
@@ -7278,14 +7177,20 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 "content": (
                     "You are a conservative Chinese subtitle boundary auditor. Decide whether "
                     "each boundary creates an unsuitable Chinese subtitle break. Read both source "
-                    "keys as one continuous utterance and both translations as one display sequence. "
+                    "keys as one continuous utterance. Use gap_after_ms and display_continuity to "
+                    "judge how viewers actually encounter the two captions. A continuous boundary "
+                    "may read as one sequence. At a separated boundary, each displayed cue must "
+                    "avoid a naked number, unfinished predicate, modifier, function word, or other "
+                    "fragment that depends on text appearing only after the visible pause. "
                     "Flag city/state or model-name splits, a relative or adverbial clause separated "
                     "from what it modifies, a subject separated from its predicate, a modifier from "
                     "its noun, 是 from its complement, an auxiliary or adverb from its predicate, a "
                     "coordinate noun phrase split in half, or a temporal/locative phrase placed after "
                     "its Chinese predicate. Also flag a translation that is grammatically complete "
                     "only during continuous playback but awkward when either cue is displayed alone, "
-                    "or that follows English word order so literally that the pair is unnatural. "
+                    "or that follows source word order so literally that the pair is objectively "
+                    "unnatural or assigns the wrong semantic role. Do not flag merely because a "
+                    "different polished wording is possible. "
                     "For Japanese source fragments, follow Japanese particles and reconstruct a "
                     "complete Chinese topic-predicate or modifier-head relation instead of mapping "
                     "each short source fragment to an equally incomplete Chinese fragment. "
@@ -7316,6 +7221,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             model=self.model,
             temperature=0,
             use_cache=self.use_cache,
+            cache_namespace=self.cache_namespace,
             client=self.llm_client,
             reasoning_mode="disabled",
             max_output_tokens=4096,
@@ -7408,7 +7314,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
     ) -> List[SubtitleProcessData]:
         current_by_index = {item.index: item for item in current_items}
         multispeaker = self._is_multispeaker_document()
-        payload: Dict[str, Dict[str, str]] = {}
+        payload: Dict[str, Dict[str, Any]] = {}
         for item in source_items:
             canonical = self._confirmed_context_canonical(item.original_text)
             value = {
@@ -7420,6 +7326,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
                 value["confirmed_canonical_name"] = canonical
             if multispeaker:
                 value["speaker"] = self._all_speaker_by_index.get(item.index, "")
+            value.update(self._display_boundary_metadata(item.index))
             payload[str(item.index)] = value
         first_index = source_items[0].index
         last_index = source_items[-1].index
@@ -7463,6 +7370,9 @@ Return exactly one JSON object with all and only the current_subtitles keys:
 Rewrite only the provided translations. Keep every key, timestamp boundary, fact, name, number, negation, comparison, and conclusion. Preserve the combined meaning exactly once. Return only {{"translations": {{"key": "text"}}}} with every input key exactly once. readonly_context is read-only and must never be copied into the output. Before answering, map each source clause to its owning key, reconstruct the complete local idea, write concise idiomatic Chinese, and verify that every fact appears once. Fidelity outranks clarity, and clarity outranks elegance. Never output reasoning, labels, notes, placeholders, source text, or punctuation-only entries. """
                     "When an item has confirmed_canonical_name, reproduce that exact Latin string "
                     "in the same key; never translate, transliterate, abbreviate, or respell it. "
+                    "gap_after_ms describes the pause after each item. Treat continuous items as "
+                    "one display sequence. At a separated boundary, do not leave a naked number, "
+                    "unfinished predicate, modifier, or function word waiting across the pause. "
                     "When source_language is Japanese, use Japanese particles and the full local "
                     "clause to produce independently readable Chinese cues; do not preserve a "
                     "fragment boundary that leaves 把, a subject, predicate, object, or locative "
@@ -7470,8 +7380,12 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
                     "classifier, or other non-material grammatical scaffolding between adjacent "
                     "keys. Never move a material action or event such as starting operation, "
                     "construction, lifting, growth, approval, or completion into a key whose source "
-                    "does not contain it. If the source splits a modifier from its head noun, keep "
-                    "a concise continuation instead of anticipating the next key's action. For a "
+                    "does not contain it. Exception: if two adjacent source keys demonstrably split "
+                    "one predicate-complement, modifier-head, or number-unit atom, use only minimal "
+                    "shared scaffolding needed to make separated displays readable; keep its facts "
+                    "within that pair and state them once in the combined window. If the source "
+                    "splits a modifier from its head noun, keep a concise continuation instead of "
+                    "anticipating the next key's action. For a "
                     "chain shaped as 将/把 + object, locative phrase, then "
                     "action, redistribute it into independently readable cues such as 这里使用 + "
                     "object, 它们会安装在 + location, then 并逐步 + action; never preserve the stranded "
@@ -7502,6 +7416,7 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
             model=self.model,
             temperature=self.TRANSLATION_TEMPERATURE,
             use_cache=self.use_cache,
+            cache_namespace=self.cache_namespace,
             client=self.llm_client,
             # Spend native reasoning only on the first rewrite. Formatting retries
             # use the validator's concrete feedback and do not benefit from another
@@ -7542,7 +7457,7 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
         if (
             feedback
             or len(source_items) > self.CHINESE_FLUENCY_MAX_WINDOW
-            or not prefers_native_reasoning(self.model)
+            or not self._prefers_native_reasoning()
         ):
             return False
 
@@ -7571,7 +7486,8 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
             right_translation = current_by_index.get(right.index)
             if not left_translation or not right_translation:
                 continue
-            target_signal = self._chinese_boundary_signal(
+            target_signal = self._target_boundary_signal(
+                left.index,
                 left_translation.translated_text,
                 right_translation.translated_text,
             )
@@ -7668,7 +7584,8 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
             for item, following in zip(source_items, source_items[1:])
             if item.index in repaired_by_index
             and following.index in repaired_by_index
-            and self._chinese_boundary_signal(
+            and self._target_boundary_signal(
+                item.index,
                 repaired_by_index[item.index].translated_text,
                 repaired_by_index[following.index].translated_text,
             )
@@ -7677,7 +7594,8 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
             index: {
                 "left": repaired_by_index[index].translated_text,
                 "right": repaired_by_index[index + 1].translated_text,
-                "signal": self._chinese_boundary_signal(
+                "signal": self._target_boundary_signal(
+                    index,
                     repaired_by_index[index].translated_text,
                     repaired_by_index[index + 1].translated_text,
                 ),
@@ -7699,11 +7617,48 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
         }
         if hard_remaining:
             raise ValueError(f"fluency repair left structural boundary signals: {hard_remaining}")
+        for left, right in zip(source_items, source_items[1:]):
+            repaired_left = repaired_by_index.get(left.index)
+            repaired_right = repaired_by_index.get(right.index)
+            if repaired_left is None or repaired_right is None:
+                continue
+            cross_language_error = self._cross_language_chinese_boundary_error(
+                left.original_text,
+                right.original_text,
+                repaired_left.translated_text,
+                repaired_right.translated_text,
+            )
+            if cross_language_error:
+                raise ValueError(cross_language_error)
         # Soft signals only shortlist the original defect. Re-running the same
         # classifier after a rewrite creates a circular veto and rejects valid
         # Chinese redistribution. Hard structural signals above remain binding;
         # one independent whole-window fidelity verdict is the final arbiter.
         self._validate_chinese_window_fidelity(source_items, repaired_items)
+
+    @staticmethod
+    def _cross_language_chinese_boundary_error(
+        left_source: str,
+        right_source: str,
+        left_translation: str,
+        right_translation: str,
+    ) -> str:
+        """Reject target text that preserves a known English-only fragment boundary."""
+        reasons = set(assess_english_boundary(left_source, right_source).reasons)
+        if (
+            "new-clause connective stranded at previous cue end" in reasons
+            and re.match(
+                r"^(?:different|similar|distinct)\b",
+                right_source.strip(),
+                re.IGNORECASE,
+            )
+            and re.match(r"^(?:和|与|跟|比)", right_translation.strip())
+        ):
+            return (
+                "comparison repair still lacks an explicit Chinese subject after a "
+                "stranded English discourse connective"
+            )
+        return ""
 
     def _validate_chinese_window_fidelity(
         self,
@@ -7717,6 +7672,8 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
         independent check verifies that the small same-speaker window still contains
         every source fact exactly once without introducing new meaning.
         """
+        if not self.is_running:
+            raise LLMRequestCancelled("Translation cancelled before fidelity validation")
         repaired_by_index = {item.index: item for item in repaired_items}
         combined_source = " ".join(
             self._source_for_translation(item.original_text) for item in source_items
@@ -7735,14 +7692,15 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
             self._is_edited_speaker_handoff(left, right)
             for left, right in zip(source_items, source_items[1:])
         )
-        payload = {
-            str(item.index): {
+        payload: Dict[str, Dict[str, Any]] = {}
+        for item in source_items:
+            value: Dict[str, Any] = {
                 "source": self._source_for_translation(item.original_text),
                 "translation": repaired_by_index[item.index].translated_text,
                 "speaker": self._all_speaker_by_index.get(item.index, ""),
             }
-            for item in source_items
-        }
+            value.update(self._display_boundary_metadata(item.index))
+            payload[str(item.index)] = value
         handoff_rule = (
             " One boundary is a tightly edited speaker handoff inside a dependent source "
             "phrase. Minimal repetition or restatement of a shared noun, function words, or "
@@ -7768,7 +7726,10 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
                     "outside this window. A minimal pronoun, demonstrative, classifier, or already "
                     "established head noun may be restated solely as Chinese grammatical scaffolding; "
                     "do not count it as duplicated meaning unless it repeats or changes a material "
-                    "fact. Judge combined "
+                    "fact. gap_after_ms describes the visible pause after each key. At a separated "
+                    "boundary, an adjacent predicate-complement, modifier-head, or number-unit atom "
+                    "may use minimal shared scaffolding across that exact pair so both cues are "
+                    "readable, provided its combined facts remain complete and occur once. Judge combined "
                     "fidelity and per-cue readability, not English word-order similarity. "
                     "If a left source key owns a material coordinated noun subject and the next "
                     "source key begins that subject's predicate, keep the subject identities visible "
@@ -7780,11 +7741,32 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
             },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ]
+        key = generate_cache_key(
+            {
+                "messages": messages,
+                "model": self.model,
+                "client_identity": id(self.llm_client),
+                "target_language": self.target_language.value,
+                "context": self.translation_context.fingerprint(),
+                "custom_prompt": self.custom_prompt,
+                "sources": self._all_source_by_index,
+                "speakers": self._all_speaker_by_index,
+                "languages": self._all_language_by_index,
+                "gaps": self._gap_after_index,
+            }
+        )
+        self._positive_fidelity_verdicts.validate(
+            key, lambda: self._request_chinese_window_fidelity(messages)
+        )
+
+    def _request_chinese_window_fidelity(self, messages: List[Dict[str, str]]) -> None:
+        """Make the unchanged fidelity request; only a valid verdict is reusable."""
         response = call_llm(
             messages=messages,
             model=self.model,
             temperature=0,
             use_cache=self.use_cache,
+            cache_namespace=self.cache_namespace,
             client=self.llm_client,
             # The expensive reasoning budget was already spent on candidate
             # confirmation and rewriting. Keep this independent gate compact.
@@ -7825,9 +7807,9 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
                     data.index: self._all_speaker_by_index.get(data.index, "") for data in chunk
                 },
                 "prompt_version": (
-                    "context-v37-open-clause-dialogue-review"
+                    "context-v42-terminology-boundary-review"
                     if self._is_multispeaker_document()
-                    else "context-v31-open-clause-window-review"
+                    else "context-v36-terminology-boundary-review"
                 ),
             }
         )

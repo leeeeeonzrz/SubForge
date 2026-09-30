@@ -1,20 +1,37 @@
 "use client";
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import { importSubtitleDocument } from "@/lib/documentOperations";
+import { hasUnsavedSubtitles } from "@/lib/subtitleEdits";
+
+import { useState, useCallback, useEffect, useRef, useMemo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { useUiStore } from "@/store/uiStore";
+import { Icon } from "@/components/Icon";
 import { useAppStore } from "@/store/appStore";
-import { subtitleApi, subtitlesApi, filesApi, configApi } from "@/lib/api";
+import { subtitlesApi, filesApi, configApi } from "@/lib/api";
+import type { TaskStarter } from "@/lib/useTaskMonitor";
 
 export function SubtitlePanel({
+  startTask,
   focusRequest = null,
+  checkFilter = null,
   showPrompt = true,
   showTranslateActions = true,
 }: {
+  startTask: TaskStarter;
   focusRequest?: { id: number; token: number } | null;
+  checkFilter?: { label: string; ids: number[]; reasons: Record<number, string>; onPrevious: () => void; onNext: () => void; onClear: () => void } | null;
   showPrompt?: boolean;
   showTranslateActions?: boolean;
-} = {}) {
-  const { subtitles, setSubtitles, updateSubtitle, selectedIds, toggleSelect, selectAll, deselectAll, subtitleFile, config, setError } = useAppStore();
+}) {
+  const { subtitles, commitSubtitles, subtitleHistory, undoSubtitleEdit, updateSubtitle, selectedIds, toggleSelect, selectAll, deselectAll, subtitleFile, videoFile, config, setError, isProcessing } = useAppStore();
+  const filterIds = checkFilter?.ids;
+  const visibleSubtitles = useMemo(() => { const ids = filterIds ? new Set(filterIds) : null; return ids ? subtitles.filter((sub) => ids.has(sub.id)) : subtitles; }, [subtitles, filterIds]);
+  const { nativeToolbar, exportRequested, consumeExport } = useUiStore();
+  const unsaved = useAppStore(hasUnsavedSubtitles);
+  const saving = useAppStore((state) => state.subtitleSaving);
+  const loading = useAppStore((state) => state.documentLoading);
+  const exportMenuRef = useRef<HTMLDivElement>(null);
   const [editingCell, setEditingCell] = useState<{ id: number; field: "text" | "translated" } | null>(null);
   const [editValue, setEditValue] = useState("");
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; id: number | null } | null>(null);
@@ -22,15 +39,16 @@ export function SubtitlePanel({
   const [promptExpanded, setPromptExpanded] = useState(false);
   const [focusedRowId, setFocusedRowId] = useState<number | null>(null);
   const promptDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
   const tableScrollRef = useRef<HTMLDivElement>(null);
   const rowRefs = useRef(new Map<number, HTMLTableRowElement>());
   // TanStack Virtual intentionally exposes mutable measurement helpers.
   // eslint-disable-next-line react-hooks/incompatible-library
   const rowVirtualizer = useVirtualizer({
-    count: subtitles.length,
+    count: visibleSubtitles.length,
     getScrollElement: () => tableScrollRef.current,
     estimateSize: () => 64,
-    getItemKey: (index) => subtitles[index]?.id ?? index,
+    getItemKey: (index) => visibleSubtitles[index]?.id ?? index,
     measureElement: (element) => element.getBoundingClientRect().height,
     overscan: 8,
   });
@@ -38,7 +56,7 @@ export function SubtitlePanel({
 
   useEffect(() => {
     if (!focusRequest) return;
-    const rowIndex = subtitles.findIndex((subtitle) => subtitle.id === focusRequest.id);
+    const rowIndex = visibleSubtitles.findIndex((subtitle) => subtitle.id === focusRequest.id);
     if (rowIndex < 0) return;
     rowVirtualizer.scrollToIndex(rowIndex, { align: "center" });
     setFocusedRowId(focusRequest.id);
@@ -59,9 +77,9 @@ export function SubtitlePanel({
       window.cancelAnimationFrame(focusFrame);
       window.clearTimeout(timer);
     };
-  }, [focusRequest, rowVirtualizer, subtitles]);
+  }, [focusRequest, rowVirtualizer, visibleSubtitles]);
 
-  const startEdit = useCallback((id: number, field: "text" | "translated", value: string) => { setEditingCell({ id, field }); setEditValue(value); }, []);
+  const startEdit = useCallback((id: number, field: "text" | "translated", value: string) => { if (useAppStore.getState().isProcessing || useAppStore.getState().documentLoading) return; setEditingCell({ id, field }); setEditValue(value); }, []);
   const commitEdit = useCallback(() => { if (!editingCell) return; updateSubtitle(editingCell.id, editingCell.field, editValue); setEditingCell(null); }, [editingCell, editValue, updateSubtitle]);
 
   const deleteSelected = useCallback(() => {
@@ -70,9 +88,9 @@ export function SubtitlePanel({
     const updated = subtitles
       .filter((s) => !ids.has(s.id))
       .map((s, i) => ({ ...s, id: i + 1 }));
-    setSubtitles(updated);
+    commitSubtitles(updated);
     deselectAll();
-  }, [subtitles, setSubtitles, deselectAll]);
+  }, [subtitles, commitSubtitles, deselectAll]);
 
   const mergeSelected = useCallback(() => {
     const ids = useAppStore.getState().selectedIds;
@@ -94,71 +112,48 @@ export function SubtitlePanel({
       speaker: selected[0].speaker || "",
     };
     const result = [...others, merged].sort((a, b) => a.id - b.id).map((s, i) => ({ ...s, id: i + 1 }));
-    setSubtitles(result);
+    commitSubtitles(result);
     deselectAll();
-  }, [subtitles, setSubtitles, deselectAll, setError]);
+  }, [subtitles, commitSubtitles, deselectAll, setError]);
 
-  const translateAll = useCallback(async () => {
-    if (!subtitleFile) return;
+  const runTranslation = useCallback(async (needOptimize: boolean) => {
+    if (!subtitleFile || useAppStore.getState().isProcessing) return;
     setIsTranslating(true);
-    const store = useAppStore.getState();
-    store.setError(null);
-    store.setIsProcessing(true);
-    store.setTaskState(0, "Starting translation...", "running");
     try {
-      const result = await subtitleApi.start({
+      await startTask("subtitle", {
         subtitle_file: subtitleFile,
+        media_file: videoFile || undefined,
         target_language: config.targetLanguage,
         translator: config.translator,
         llm_provider: config.llmProvider,
         llm_model: config.llmModel,
-        need_optimize: false,
+        need_optimize: needOptimize,
         need_translate: true,
         need_reflect: config.needReflect,
         custom_prompt: config.customPrompt,
       });
-      store.setCurrentTaskId(result.task_id);
-    } catch (err) {
-      store.setError(err instanceof Error ? err.message : "Translation failed");
-      store.setTaskState(0, "", "idle");
-      store.setIsProcessing(false);
     } finally { setIsTranslating(false); }
-  }, [subtitleFile, config]);
+  }, [subtitleFile, videoFile, config, startTask]);
 
-  const retranslateAll = useCallback(async () => {
-    if (!subtitleFile) return;
-    setIsTranslating(true);
-    const store = useAppStore.getState();
-    store.setError(null);
-    store.setIsProcessing(true);
-    store.setTaskState(0, "Starting translation...", "running");
-    try {
-      const result = await subtitleApi.start({
-        subtitle_file: subtitleFile,
-        target_language: config.targetLanguage,
-        translator: config.translator,
-        llm_provider: config.llmProvider,
-        llm_model: config.llmModel,
-        need_optimize: config.needOptimize,
-        need_translate: true,
-        need_reflect: config.needReflect,
-        custom_prompt: config.customPrompt,
-      });
-      store.setCurrentTaskId(result.task_id);
-    } catch (err) {
-      store.setError(err instanceof Error ? err.message : "Translation failed");
-      store.setTaskState(0, "", "idle");
-      store.setIsProcessing(false);
-    } finally { setIsTranslating(false); }
-  }, [subtitleFile, config]);
+  const translateAll = useCallback(() => runTranslation(false), [runTranslation]);
+  const retranslateAll = useCallback(() => runTranslation(config.needOptimize), [runTranslation, config.needOptimize]);
 
   const [exportFormat, setExportFormat] = useState<"srt" | "vtt" | "ass" | "txt" | "json">("srt");
   const [exportMode, setExportMode] = useState<"original" | "translated" | "bilingual">("bilingual");
   const [showExportMenu, setShowExportMenu] = useState(false);
+  useEffect(() => {
+    if (!exportRequested) return;
+    consumeExport();
+    // A native toolbar command opens this editor's existing export controls.
+    setShowExportMenu(true);
+  }, [exportRequested, consumeExport]);
+  useEffect(() => {
+    if (showExportMenu) exportMenuRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
+  }, [showExportMenu]);
   const getExportFilename = useCallback((format: string, mode: string) => {
     const source = subtitleFile?.split(/[\\/]/).pop() || "subtitles.srt";
     const suffix = mode === "original" ? "_original" : mode === "translated" ? "_translated" : "_bilingual";
-    return source.replace(/\.[^.]+$/, `${suffix}.${format}`);
+    return source.replace(/\.[^.]+$/, "").replace(/_(original|translated|bilingual)$/i, "") + `${suffix}.${format}`;
   }, [subtitleFile]);
   const handleExport = useCallback(async (format?: string, mode?: string) => {
     if (!subtitleFile) return;
@@ -211,17 +206,20 @@ export function SubtitlePanel({
     }
   }, [subtitleFile, subtitles, exportFormat, exportMode, getExportFilename]);
   const handleSave = useCallback(async () => {
-    if (!subtitleFile || subtitles.length === 0) return;
-    try {
-      const result = await subtitlesApi.save(subtitleFile, subtitles);
-      useAppStore.getState().addToast(
-        `原文、译文和双语字幕已保存到 ${result.directory}`,
-        "success",
-      );
-    } catch (err) {
-      useAppStore.getState().setError(err instanceof Error ? err.message : "Save failed");
+    if (!subtitleFile || useAppStore.getState().subtitleSaving || useAppStore.getState().documentLoading || isProcessing) return;
+    if (editingCell) {
+      updateSubtitle(editingCell.id, editingCell.field, editValue);
+      setEditingCell(null);
     }
-  }, [subtitleFile, subtitles]);
+    const snapshot = useAppStore.getState();
+    useAppStore.setState({ subtitleSaving: true });
+    try {
+      const result = await subtitlesApi.save(subtitleFile, snapshot.subtitles);
+      useAppStore.getState().markSubtitlesSaved(snapshot.subtitles, snapshot.subtitleDocumentRevision, result.file_path);
+      useAppStore.getState().addToast(`原文、译文和双语字幕已保存到 ${result.directory}`, "success");
+    } catch (err) { setError(err instanceof Error ? err.message : "字幕保存失败"); }
+    finally { useAppStore.setState({ subtitleSaving: false }); }
+  }, [subtitleFile, isProcessing, editingCell, editValue, updateSubtitle, setError]);
 
   const handleContextMenu = useCallback((e: React.MouseEvent, id: number) => { e.preventDefault(); e.stopPropagation(); if (!selectedIds.has(id)) toggleSelect(id); setContextMenu({ x: e.clientX, y: e.clientY, id }); }, [selectedIds, toggleSelect]);
 
@@ -229,7 +227,10 @@ export function SubtitlePanel({
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (editingCell) return;
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") { e.preventDefault(); void handleSave(); return; }
+      if (editingCell || (e.target instanceof HTMLElement && (e.target.closest("input, textarea, select, [contenteditable=true]")))) return;
+      if (useAppStore.getState().isProcessing || useAppStore.getState().documentLoading) return;
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && e.key.toLowerCase() === "z") { e.preventDefault(); undoSubtitleEdit(); }
       if (e.key === "Delete") { e.preventDefault(); deleteSelected(); }
       if ((e.metaKey || e.ctrlKey) && e.key === "m") { e.preventDefault(); mergeSelected(); }
       if ((e.metaKey || e.ctrlKey) && e.key === "t") { e.preventDefault(); translateAll(); }
@@ -237,44 +238,46 @@ export function SubtitlePanel({
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [editingCell, deleteSelected, mergeSelected, translateAll, selectAll]);
+  }, [editingCell, deleteSelected, mergeSelected, translateAll, selectAll, handleSave, undoSubtitleEdit]);
 
   const allSelected = subtitles.length > 0 && selectedIds.size === subtitles.length;
 
   return (
-    <div className="flex flex-col h-full bg-surface relative">
+    <div className="subtitle-editor flex flex-col h-full bg-surface relative">
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+      <div className="editor-toolbar flex items-center justify-between px-4 py-3 border-b border-border">
         <div className="flex items-center gap-3">
           <h2 className="text-[13px] font-medium text-text-primary">字幕编辑</h2>
           {subtitles.length > 0 && <span className="text-[11px] text-text-muted bg-[rgba(0,0,0,0.04)] px-2 py-0.5 rounded-full">{subtitles.length} 条</span>}
           {selectedIds.size > 0 && <span className="text-[11px] text-accent bg-accent-dim px-2 py-0.5 rounded-full font-medium">已选 {selectedIds.size}</span>}
         </div>
         <div className="flex items-center gap-1.5">
-          <label className="px-2.5 py-1.5 text-[12px] rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-all border border-border cursor-pointer btn-press">
-            导入
-            <input type="file" accept=".srt,.vtt,.ass" className="hidden" onChange={(e) => {
+          <button type="button" onClick={() => importInputRef.current?.click()} className="px-2.5 py-1.5 text-[12px] rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-all border border-border cursor-pointer btn-press">导入</button>
+            <input ref={importInputRef} type="file" accept=".srt,.vtt,.ass" className="hidden" onChange={(e) => {
               const file = e.target.files?.[0];
-              if (file) { filesApi.upload(file).then(({ file_path }) => { useAppStore.getState().setSubtitleFile(file_path); subtitlesApi.load(file_path).then((subFile) => { useAppStore.getState().setSubtitles(subFile.segments); }).catch((err) => { useAppStore.getState().setError(err instanceof Error ? err.message : "Failed to load subtitle file"); useAppStore.getState().setSubtitleFile(null); }); }).catch((err) => { useAppStore.getState().setError(err instanceof Error ? err.message : "Upload failed"); }); }
+              e.target.value = "";
+              if (file) void importSubtitleDocument(async () => {
+                const uploaded = await filesApi.upload(file);
+                return subtitlesApi.load(uploaded.file_path);
+              }).catch((err) => setError(err instanceof Error ? err.message : "字幕导入失败"));
             }} />
-          </label>
-          <button disabled={!subtitleFile || subtitles.length === 0} onClick={handleSave}
-            title="保存原文、译文和双语三份字幕"
+          <button disabled={!subtitleFile || saving || loading || isProcessing} onClick={handleSave}
             className="px-2.5 py-1.5 text-[12px] rounded-md text-text-secondary hover:text-text-primary hover:bg-surface-hover transition-all border border-border disabled:opacity-30 disabled:cursor-not-allowed btn-press">
-            保存全部
+            {saving ? "保存中…" : "保存全部"}
           </button>
           <div className="relative flex items-stretch">
-            <button disabled={!subtitleFile || subtitles.length === 0} onClick={() => handleExport()}
+            <button hidden={nativeToolbar} disabled={!subtitleFile || subtitles.length === 0 || loading || isProcessing} onClick={() => handleExport()}
               className="px-2.5 py-1.5 text-[12px] rounded-l-md bg-accent-dim text-accent hover:bg-accent/15 transition-all font-medium disabled:opacity-30 disabled:cursor-not-allowed btn-press">
               导出
             </button>
-            <button disabled={!subtitleFile || subtitles.length === 0} onClick={(e) => { e.stopPropagation(); setShowExportMenu(!showExportMenu); }}
+            <button hidden={nativeToolbar} aria-expanded={showExportMenu} disabled={!subtitleFile || subtitles.length === 0} onClick={(e) => { e.stopPropagation(); setShowExportMenu(!showExportMenu); }}
               className="px-1.5 py-1.5 text-[11px] rounded-r-md border-l border-accent/15 bg-accent-dim text-accent hover:bg-accent/15 transition-all disabled:opacity-30 disabled:cursor-not-allowed btn-press"
               title="选择导出格式">
               ▾
             </button>
             {showExportMenu && (
-              <div onClick={(e) => e.stopPropagation()} className="absolute right-0 top-full mt-1 bg-surface border border-border rounded-xl z-50 p-3 w-56 space-y-3 shadow-md">
+              <div ref={exportMenuRef} role="dialog" aria-label="导出字幕" onKeyDown={(event) => { if (event.key === "Escape") { setShowExportMenu(false); event.stopPropagation(); } }} onClick={(e) => e.stopPropagation()} className={`export-popover glass-surface ${nativeToolbar ? "native-export" : ""}`}>
+                <div className="flex items-center justify-between"><strong className="text-[13px] font-medium">导出字幕</strong><button aria-label="关闭导出选项" className="popover-close" onClick={() => setShowExportMenu(false)}><Icon icon="solar:close-circle-linear" width={18} /></button></div>
                 {/* Format */}
                 <div>
                   <label className="text-[11px] text-text-muted uppercase tracking-wider font-medium block mb-1.5">格式</label>
@@ -294,7 +297,7 @@ export function SubtitlePanel({
                   <label className="text-[11px] text-text-muted uppercase tracking-wider font-medium block mb-1.5">语言</label>
                   <div className="space-y-0.5">
                     {([
-                      { id: "bilingual" as const, label: "中英双语", desc: "原文 + 译文" },
+                      { id: "bilingual" as const, label: "双语字幕", desc: "原文 + 译文" },
                       { id: "original" as const, label: "仅原文", desc: "原始语言字幕" },
                       { id: "translated" as const, label: "仅译文", desc: "翻译后的字幕" },
                     ]).map((m) => (
@@ -319,26 +322,32 @@ export function SubtitlePanel({
         </div>
       </div>
 
+      {subtitleFile && <div className="editor-document-status">
+        <span className="editor-document-name" title={subtitleFile}>{subtitleFile.split(/[\\/]/).pop()}</span>
+        <span role="status" className={unsaved ? "document-unsaved" : ""}>{loading ? "正在读取字幕…" : isProcessing ? "任务处理中" : saving ? "正在保存…" : unsaved ? "有未保存的修改" : "与文件一致"}</span>
+      </div>}
+
       {/* Toolbar */}
       {subtitles.length > 0 && (
         <div className="flex items-center gap-0.5 px-3 py-1.5 border-b border-border bg-[rgba(0,0,0,0.01)]">
-          <button onClick={allSelected ? deselectAll : selectAll} className="p-1.5 rounded text-text-muted hover:text-text-secondary hover:bg-surface-hover transition-all btn-press" title="全选 (Ctrl+A)">
+          <button onClick={undoSubtitleEdit} disabled={isProcessing || !subtitleHistory.length} className="px-2 py-1 text-[12px] rounded text-text-secondary hover:bg-surface-hover disabled:opacity-30" title="撤销编辑 (⌘Z)">撤销</button>
+          <button onClick={allSelected ? deselectAll : selectAll} className="p-1.5 rounded text-text-muted hover:text-text-secondary hover:bg-surface-hover transition-all btn-press" aria-label="全选字幕" title="全选 (⌘A)">
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" /></svg>
           </button>
           <div className="w-px h-3.5 bg-border mx-1" />
-          <button onClick={deleteSelected} disabled={selectedIds.size === 0} className="p-1.5 rounded text-text-muted hover:text-red-500 hover:bg-red-50 transition-all disabled:opacity-30 btn-press" title="删除选中 (Delete)">
+          <button onClick={deleteSelected} disabled={isProcessing || selectedIds.size === 0} className="p-1.5 rounded text-text-muted hover:text-red-500 hover:bg-red-50 transition-all disabled:opacity-30 btn-press" aria-label="删除选中" title="删除选中 (Delete)">
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
           </button>
-          <button onClick={mergeSelected} disabled={selectedIds.size < 2} className="p-1.5 rounded text-text-muted hover:text-text-secondary hover:bg-surface-hover transition-all disabled:opacity-30 btn-press" title="合并选中 (Ctrl+M)">
+          <button onClick={mergeSelected} disabled={isProcessing || selectedIds.size < 2} className="p-1.5 rounded text-text-muted hover:text-text-secondary hover:bg-surface-hover transition-all disabled:opacity-30 btn-press" aria-label="合并选中" title="合并选中 (⌘M)">
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" /></svg>
           </button>
           <div className="w-px h-3.5 bg-border mx-1" />
           {showTranslateActions && (
             <>
-              <button onClick={translateAll} disabled={!subtitleFile || isTranslating} className="px-2 py-1 text-[12px] rounded text-text-muted hover:text-accent hover:bg-accent-dim transition-all disabled:opacity-30 btn-press" title="翻译全部 (Ctrl+T)">
+              <button onClick={translateAll} disabled={!subtitleFile || isTranslating || isProcessing} className="px-2 py-1 text-[12px] rounded text-text-muted hover:text-accent hover:bg-accent-dim transition-all disabled:opacity-30 btn-press" title="翻译全部 (⌘T)">
                 {isTranslating ? "翻译中..." : "翻译全部"}
               </button>
-              <button onClick={retranslateAll} disabled={isTranslating} className="px-2 py-1 text-[12px] rounded text-text-muted hover:text-accent hover:bg-accent-dim transition-all disabled:opacity-30 btn-press">
+              <button onClick={retranslateAll} disabled={isTranslating || isProcessing} className="px-2 py-1 text-[12px] rounded text-text-muted hover:text-accent hover:bg-accent-dim transition-all disabled:opacity-30 btn-press">
                 重新翻译全部
               </button>
             </>
@@ -379,12 +388,12 @@ export function SubtitlePanel({
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
             删除
           </button>
-          <button onClick={() => { mergeSelected(); setContextMenu(null); }} disabled={selectedIds.size < 2} className="w-full px-3 py-1.5 text-left text-[12px] text-text-secondary hover:text-text-primary hover:bg-[rgba(0,0,0,0.03)] flex items-center gap-2 disabled:opacity-30">
+          <button onClick={() => { mergeSelected(); setContextMenu(null); }} disabled={isProcessing || selectedIds.size < 2} className="w-full px-3 py-1.5 text-left text-[12px] text-text-secondary hover:text-text-primary hover:bg-[rgba(0,0,0,0.03)] flex items-center gap-2 disabled:opacity-30">
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" /></svg>
             合并
           </button>
           <div className="h-px bg-border my-1" />
-          <button onClick={() => { translateAll(); setContextMenu(null); }} disabled={!subtitleFile} className="w-full px-3 py-1.5 text-left text-[12px] text-accent hover:bg-accent-dim flex items-center gap-2 disabled:opacity-30">
+          <button onClick={() => { translateAll(); setContextMenu(null); }} disabled={!subtitleFile || isTranslating || isProcessing} className="w-full px-3 py-1.5 text-left text-[12px] text-accent hover:bg-accent-dim flex items-center gap-2 disabled:opacity-30">
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 5h12M9 3v2m1.048 9.5A18.022 18.022 0 016.412 9m6.088 9h7M11 21l5-10 5 10M12.751 5C11.783 10.77 8.07 15.61 3 18.129" /></svg>
             翻译全部
           </button>
@@ -396,6 +405,11 @@ export function SubtitlePanel({
         </div>
       )}
 
+      {checkFilter && <div className="check-filter" aria-label="检查结果筛选">
+        <div><strong>{checkFilter.label} · {checkFilter.ids.length.toLocaleString()} 条</strong><p>{focusedRowId ? checkFilter.reasons[focusedRowId] || "此条已不在当前检查结果中" : "选择字幕查看原因"}</p></div>
+        <div className="check-filter-actions"><button disabled={!checkFilter.ids.length} onClick={checkFilter.onPrevious}>上一条</button><button disabled={!checkFilter.ids.length} onClick={checkFilter.onNext}>下一条</button><button onClick={checkFilter.onClear}>清除筛选</button></div>
+      </div>}
+      {checkFilter && !visibleSubtitles.length && <p className="check-note p-4">当前没有匹配项，可以清除筛选查看全部字幕。</p>}
       {/* Table */}
       <div ref={tableScrollRef} className="flex-1 overflow-auto">
         {subtitles.length === 0 ? (
@@ -404,13 +418,13 @@ export function SubtitlePanel({
               <svg className="w-7 h-7 text-accent/50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
             </div>
             <p className="text-[13px] text-text-secondary mb-1 font-medium">暂无字幕数据</p>
-            <p className="text-[12px] text-text-muted">转录完成后字幕将在此显示</p>
+            <p className="text-[13px] text-text-muted">导入字幕即可编辑，或先从视频中转录。</p><button className="toolbar-button mt-5" onClick={() => useAppStore.getState().setStep("import")}>导入素材</button>
           </div>
         ) : (
-          <table className="grid w-full text-[13px]">
+          <table className="subtitle-table grid w-full text-[15px] leading-6">
             <thead className="sticky top-0 z-10 grid">
-              <tr className="grid grid-cols-[40px_40px_148px_minmax(0,1fr)_minmax(0,1fr)] bg-surface border-b border-border">
-                <th className="text-left px-3 py-2 text-[11px] text-text-muted font-medium w-10"><input type="checkbox" checked={allSelected} onChange={allSelected ? deselectAll : selectAll} className="accent-accent w-3 h-3" /></th>
+              <tr className="grid grid-cols-[32px_36px_132px_minmax(0,1fr)_minmax(0,1fr)] bg-surface border-b border-border">
+                <th className="text-left px-3 py-2 text-[11px] text-text-muted font-medium w-10"><input type="checkbox" checked={checkFilter ? visibleSubtitles.length > 0 && visibleSubtitles.every((sub) => selectedIds.has(sub.id)) : allSelected} onChange={() => { if (checkFilter) { const ids = visibleSubtitles.map((sub) => sub.id); const clear = ids.every((id) => selectedIds.has(id)); ids.forEach((id) => { if (selectedIds.has(id) === clear) toggleSelect(id); }); } else { (allSelected ? deselectAll : selectAll)(); } }} aria-label="选择字幕" className="accent-accent w-3.5 h-3.5" /></th>
                 <th className="text-left px-3 py-2 text-[11px] text-text-muted font-medium w-10">#</th>
                 <th className="text-left px-3 py-2 text-[11px] text-text-muted font-medium w-36">时间</th>
                 <th className="text-left px-3 py-2 text-[11px] text-text-muted font-medium">原文</th>
@@ -422,7 +436,7 @@ export function SubtitlePanel({
               style={{ height: `${rowVirtualizer.getTotalSize()}px` }}
             >
               {rowVirtualizer.getVirtualItems().map((virtualRow) => {
-                const sub = subtitles[virtualRow.index];
+                const sub = visibleSubtitles[virtualRow.index];
                 const idx = virtualRow.index;
                 return (
                 <tr
@@ -437,7 +451,7 @@ export function SubtitlePanel({
                     }
                   }}
                   tabIndex={-1}
-                  className={`subtitle-row group absolute left-0 top-0 grid w-full grid-cols-[40px_40px_148px_minmax(0,1fr)_minmax(0,1fr)] cursor-pointer transition-[background-color,box-shadow] duration-300 focus:outline-none ${selectedIds.has(sub.id) ? "selected" : ""} ${
+                  className={`subtitle-row group absolute left-0 top-0 grid w-full grid-cols-[32px_36px_132px_minmax(0,1fr)_minmax(0,1fr)] cursor-pointer transition-[background-color,box-shadow] duration-300 focus:outline-none ${selectedIds.has(sub.id) ? "selected" : ""} ${
                     focusedRowId === sub.id
                       ? "bg-amber-50 shadow-[inset_3px_0_0_#d97706]"
                       : idx % 2 === 0
@@ -447,7 +461,7 @@ export function SubtitlePanel({
                   style={{ transform: `translateY(${virtualRow.start}px)` }}
                   onClick={() => toggleSelect(sub.id)} onContextMenu={(e) => handleContextMenu(e, sub.id)}>
                   <td className="px-3 py-2 border-b border-[rgba(0,0,0,0.04)]">
-                    <input type="checkbox" checked={selectedIds.has(sub.id)} onChange={() => toggleSelect(sub.id)} onClick={(e) => e.stopPropagation()} className="accent-accent w-3 h-3" />
+                    <input type="checkbox" checked={selectedIds.has(sub.id)} onChange={() => toggleSelect(sub.id)} onClick={(e) => e.stopPropagation()} aria-label="选择字幕" className="accent-accent w-3.5 h-3.5" />
                   </td>
                   <td className="px-3 py-2 text-[12px] text-text-muted font-mono border-b border-[rgba(0,0,0,0.04)]">{sub.id}</td>
                   <td className="min-w-0 overflow-hidden px-3 py-2 border-b border-[rgba(0,0,0,0.04)]">
@@ -456,9 +470,9 @@ export function SubtitlePanel({
                       <span className="text-[12px] text-text-muted font-mono">&rarr; {sub.end}</span>
                     </div>
                   </td>
-                  <td className="min-w-0 overflow-hidden px-3 py-2 border-b border-[rgba(0,0,0,0.04)]" onDoubleClick={(e) => { e.stopPropagation(); startEdit(sub.id, "text", sub.text); }}>
+                  <td className="min-w-0 overflow-hidden px-3 py-2 border-b border-[rgba(0,0,0,0.04)]" tabIndex={isProcessing ? -1 : 0} aria-label={`字幕 ${sub.id} 原文，按回车编辑`} onKeyDown={(event) => { if (event.key === "Enter" && event.target === event.currentTarget) { event.preventDefault(); startEdit(sub.id, "text", sub.text); } }} onDoubleClick={(e) => { e.stopPropagation(); startEdit(sub.id, "text", sub.text); }}>
                     {editingCell?.id === sub.id && editingCell?.field === "text" ? (
-                      <input autoFocus className="inline-edit text-text-primary" value={editValue} onChange={(e) => setEditValue(e.target.value)} onBlur={commitEdit} onKeyDown={(e) => { if (e.key === "Enter") commitEdit(); if (e.key === "Escape") setEditingCell(null); }} onClick={(e) => e.stopPropagation()} />
+                      <input autoFocus aria-label={`编辑字幕 ${sub.id} 原文`} className="inline-edit text-text-primary" value={editValue} onChange={(e) => setEditValue(e.target.value)} onBlur={commitEdit} onKeyDown={(e) => { if (e.key === "Enter") commitEdit(); if (e.key === "Escape") setEditingCell(null); }} onClick={(e) => e.stopPropagation()} />
                     ) : (
                       <span className="flex items-start gap-2 text-text-primary group-hover:text-text-primary transition-colors">
                         {sub.speaker && (
@@ -470,12 +484,12 @@ export function SubtitlePanel({
                       </span>
                     )}
                   </td>
-                  <td className="min-w-0 overflow-hidden px-3 py-2 border-b border-[rgba(0,0,0,0.04)]" onDoubleClick={(e) => { e.stopPropagation(); startEdit(sub.id, "translated", sub.translated); }}>
+                  <td className="min-w-0 overflow-hidden px-3 py-2 border-b border-[rgba(0,0,0,0.04)]" tabIndex={isProcessing ? -1 : 0} aria-label={`字幕 ${sub.id} 译文，按回车编辑`} onKeyDown={(event) => { if (event.key === "Enter" && event.target === event.currentTarget) { event.preventDefault(); startEdit(sub.id, "translated", sub.translated); } }} onDoubleClick={(e) => { e.stopPropagation(); startEdit(sub.id, "translated", sub.translated); }}>
                     {editingCell?.id === sub.id && editingCell?.field === "translated" ? (
-                      <input autoFocus className="inline-edit text-accent" value={editValue} onChange={(e) => setEditValue(e.target.value)} onBlur={commitEdit} onKeyDown={(e) => { if (e.key === "Enter") commitEdit(); if (e.key === "Escape") setEditingCell(null); }} onClick={(e) => e.stopPropagation()} />
+                      <input autoFocus aria-label={`编辑字幕 ${sub.id} 译文`} className="inline-edit text-accent" value={editValue} onChange={(e) => setEditValue(e.target.value)} onBlur={commitEdit} onKeyDown={(e) => { if (e.key === "Enter") commitEdit(); if (e.key === "Escape") setEditingCell(null); }} onClick={(e) => e.stopPropagation()} />
                     ) : (
-                      <span className="block min-w-0 break-words text-text-muted group-hover:text-accent transition-colors">
-                        {sub.translated.trim() || <span className="text-amber-700 italic">待翻译</span>}
+                      <span className="block min-w-0 break-words text-text-primary transition-colors">
+                        {sub.translated.trim() || <span className="text-text-muted text-[13px]">待翻译</span>}
                       </span>
                     )}
                   </td>
@@ -487,18 +501,23 @@ export function SubtitlePanel({
         )}
       </div>
 
+      {selectedIds.size > 0 && <div className="selection-dock glass-surface" role="region" aria-label="选中字幕操作">
+        <span>已选 <strong>{selectedIds.size}</strong> 条</span>
+        <div className="flex items-center gap-2"><button onClick={mergeSelected} disabled={isProcessing || selectedIds.size < 2}>合并</button><button onClick={deleteSelected}>删除</button><button onClick={deselectAll} aria-label="取消选择"><Icon icon="solar:close-circle-linear" width={16} />取消选择</button></div>
+      </div>}
+
       {/* Status bar */}
       {subtitles.length > 0 && (
-        <div className="flex items-center justify-between px-4 py-1.5 border-t border-border bg-[rgba(0,0,0,0.015)]">
+        <div className="flex items-center justify-between subtitle-status px-4 py-2 border-t border-border bg-[rgba(0,0,0,0.015)]">
           <div className="flex items-center gap-3">
             <span className="text-[11px] text-text-muted">{subtitles.length} 条字幕</span>
             <span className="text-[11px] text-text-muted">{subtitles.filter((s) => s.translated.trim()).length} 已翻译</span>
           </div>
           <div className="flex items-center gap-4">
-            <span className="text-[11px] text-text-muted">Delete 删除 · Ctrl+M 合并 · Ctrl+T 翻译 · 双击时间跳转</span>
+            <span className="text-[11px] text-text-muted">Delete 删除 · ⌘M 合并 · ⌘T 翻译 · 双击文字编辑</span>
             <div className="flex items-center gap-2">
               {subtitles.every((s) => s.translated.trim()) ? (
-                <><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /><span className="text-[11px] text-emerald-600">翻译完成</span></>
+                <><span className="w-1.5 h-1.5 rounded-full bg-emerald-500" /><span className="text-[11px] text-emerald-600">译文已填满</span></>
               ) : (
                 <><span className="w-1.5 h-1.5 rounded-full bg-amber-400" /><span className="text-[11px] text-text-muted">待翻译</span></>
               )}

@@ -14,6 +14,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.request
@@ -151,7 +152,9 @@ def restore_version_file(original: bytes | None) -> None:
 
 
 def clean() -> None:
-    for path in [BUILD_DIR, DIST_DIR, ARTIFACT_DIR, FRONTEND_DIR / ".next"]:
+    # Evaluation manifests and reports also live under artifacts/. They are
+    # durable evidence, not disposable desktop build output.
+    for path in [BUILD_DIR, DIST_DIR, FRONTEND_DIR / ".next"]:
         if path.exists():
             print(f"Removing {path.relative_to(ROOT)}")
             shutil.rmtree(path)
@@ -403,11 +406,52 @@ def prepare_whisper_cpp() -> None:
     print(f"Bundled whisper.cpp runtime: {cli.name} and required DLLs")
 
 
+def prepare_native_bootloader() -> Path | None:
+    """Build the AppKit host against the selected SDK, not a wheel's old SDK."""
+    if platform.system() != "Darwin":
+        return None
+    sdk = _run(["xcrun", "--show-sdk-version"], capture_output=True, text=True).stdout.strip()
+    if int(sdk.split(".")[0]) < 26:
+        return None
+    import PyInstaller
+
+    if PyInstaller.__version__ != "6.20.0":
+        raise RuntimeError(
+            "Update the pinned native bootloader source for this PyInstaller version"
+        )
+    cache = BUILD_DIR / "native-bootloader"
+    source = cache / "pyinstaller-6.20.0"
+    binary = source / "PyInstaller" / "bootloader" / "Darwin-64bit" / "runw"
+    stamp = cache / "sdk-build.txt"
+    sdk_path = _run(["xcrun", "--show-sdk-path"], capture_output=True, text=True).stdout.strip()
+    identity = f"{sdk}\n{sdk_path}\n{platform.machine()}\n{PyInstaller.__version__}\n"
+    if binary.exists() and stamp.exists() and stamp.read_text() == identity:
+        return binary
+    archive = _download_verified_archive(
+        "https://files.pythonhosted.org/packages/46/60/d03d52e6690d4e9caf333dcd14550cde634ce6c118b3bc8fa3112c3186fd/pyinstaller-6.20.0.tar.gz",
+        cache / "pyinstaller-6.20.0.tar.gz",
+        "95c5c7e03d5d61e9dfb8ef259c699cf492bb1041beb6dbe83696608cec07347a",
+    )
+    if not (source / "bootloader" / "waf").exists():
+        with tarfile.open(archive) as tar:
+            tar.extractall(cache, filter="data")
+    env = os.environ.copy()
+    env.update(SDKROOT=sdk_path, MACOSX_DEPLOYMENT_TARGET="11.0")
+    _run([sys.executable, "waf", "all", "--no-universal2"], cwd=str(source / "bootloader"), env=env)
+    if not binary.exists():
+        raise RuntimeError("Native AppKit bootloader build did not produce runw")
+    stamp.write_text(identity)
+    return binary
+
+
 def build_pyinstaller(version: str) -> None:
+    bootloader = prepare_native_bootloader()
     clean_managed_dist_outputs()
     env = os.environ.copy()
     env["VIDEOCAPTIONER_DESKTOP_RUNTIME_DIR"] = str(RUNTIME_DIR)
     env["SUBFORGE_BUILD_VERSION"] = version
+    if bootloader:
+        env["SUBFORGE_NATIVE_BOOTLOADER"] = str(bootloader)
     if platform.system() == "Darwin":
         env.setdefault("TORCH_USE_RTLD_GLOBAL", "1")
     _run(
@@ -638,7 +682,13 @@ def patch_packaged_mlx_metallib() -> None:
 
 
 def resign_macos_app() -> None:
-    """Refresh the ad-hoc signature after post-build bundle modifications."""
+    """Refresh the signature after post-build bundle modifications.
+
+    CI and unsigned developer machines keep using an ad-hoc signature. Local
+    release builds may set ``SUBFORGE_CODESIGN_IDENTITY`` to a stable Apple
+    signing identity so macOS Keychain can remember access decisions across
+    rebuilds.
+    """
     if platform.system() != "Darwin":
         return
     app = DIST_DIR / "SubForge.app"
@@ -654,7 +704,17 @@ def resign_macos_app() -> None:
         shutil.move(app, staged_app)
         try:
             _run(["xattr", "-cr", str(staged_app)])
-            _run(["codesign", "--force", "--deep", "--sign", "-", str(staged_app)])
+            identity = os.environ.get("SUBFORGE_CODESIGN_IDENTITY", "-").strip() or "-"
+            _run(
+                [
+                    "codesign",
+                    "--force",
+                    "--deep",
+                    "--sign",
+                    identity,
+                    str(staged_app),
+                ]
+            )
             _run(["codesign", "--verify", "--deep", "--strict", str(staged_app)])
         finally:
             if staged_app.exists():
@@ -694,6 +754,14 @@ def _verify_data_root(data_root: Path, label: str) -> None:
         / "bin"
         / ("ffprobe.exe" if platform.system() == "Windows" else "ffprobe"),
     ]
+    # Windows and Apple Silicon builds include this engine. Intel's base build
+    # can omit it, but any build that installs it must retain its VAD data.
+    if (
+        platform.system() == "Windows"
+        or _requires_mlx_metallib()
+        or importlib.util.find_spec("faster_whisper") is not None
+    ):
+        required.append(data_root / "faster_whisper" / "assets" / "silero_vad_v6.onnx")
     if platform.system() == "Windows":
         required.extend(
             [
@@ -778,13 +846,14 @@ def verify_windows_torch_cuda_build() -> None:
     if platform.system() != "Windows":
         return
     import torch
+    from torch import version as torch_version
 
-    if torch.version.cuda is None:
+    if torch_version.cuda is None:
         raise RuntimeError(
             "Windows desktop packaging requires a CUDA-enabled PyTorch wheel. "
             "Sync the project from the configured pytorch-cu128 index first."
         )
-    print(f"Verified CUDA-enabled PyTorch build: {torch.__version__} (CUDA {torch.version.cuda})")
+    print(f"Verified CUDA-enabled PyTorch build: {torch.__version__} (CUDA {torch_version.cuda})")
 
 
 def archive(version: str) -> None:
@@ -800,7 +869,11 @@ def archive(version: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--clean", action="store_true", help="Remove build/dist/artifacts first")
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="Remove build, dist, and frontend build cache first",
+    )
     parser.add_argument(
         "--no-archive", action="store_true", help="Build and verify without creating zip archives"
     )
