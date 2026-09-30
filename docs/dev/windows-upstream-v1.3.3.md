@@ -43,4 +43,21 @@
 - 启动文件：`dist/SubForge/SubForge.exe`，须保留同目录的 `_internal` 运行库。
 - 最终前端重新构建后逐文件 SHA-256 比对，27 个文件与桌面包内一致。
 - `scripts/smoke_desktop.py dist/SubForge` 返回 0：FFmpeg/FFprobe、FastAPI 路由及 HTTP、whisper.cpp、DeepFilterNet3 实际推理、FasterWhisper/Silero VAD、WhisperX 设备选择与 PyTorch CUDA 探针、forced alignment、pyannote 导入全部通过。
-- 本次提供本地桌面目录，没有生成新的 setup 安装程序，也没有修改已安装的应用。
+- 提供本地桌面目录，并已补齐与旧版相同形式的中文单文件 setup 安装程序；没有修改已安装的应用。
+
+## Windows 安装包
+
+复用既有 Inno Setup 6.7.3 和 `scripts/windows_installer.iss`，保留中文/英文界面、炉子图标、相同 AppId 和升级时清理旧 `_internal` 运行库的逻辑。
+
+- 安装包：`artifacts/SubForge-1.3.3-windows.1-windows-x64-setup.exe`。
+- SHA-256：同目录同名 `.exe.sha256` 文件。
+- 大小：2,076,585,760 字节（2.08 GB）。
+- 构建日志：`artifacts/integration-installer-build.txt`；编译成功，ProductVersion 已核对为 `1.3.3-windows.1`。
+- 安装包内程序沿用上述完整桌面烟雾测试通过的目录；未执行覆盖安装测试。
+- 本次只生成本地安装包，未推送或发布。
+
+复现命令（仓库根目录）：
+
+```powershell
+& work-dir/InnoSetup6/ISCC.exe /DMyAppVersion=1.3.3-windows.1 scripts/windows_installer.iss
+```
