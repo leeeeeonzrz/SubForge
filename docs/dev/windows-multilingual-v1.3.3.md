@@ -46,3 +46,14 @@ $env:SUBFORGE_BUILD_VERSION='1.3.3-windows.2'
 ```
 
 安装程序沿用原 AppId、中文界面和炉子图标，本地包使用 normal 压缩档。最终安装包大小及 SHA-256 以同目录验证文件为准。
+
+## 最终安装包
+
+交付完成：2026-10-02。源码提交：ce5debc。
+
+- 路径：artifacts/SubForge-1.3.3-windows.2-windows-x64-setup.exe。
+- 体积：2294343762 字节（2.29 GB）。
+- ProductVersion：1.3.3-windows.2；Inno Setup 日志确认 Successful compile。
+- SHA-256：7f394af3612cdf5b209617790eb2637ccb26a1564d701045886e66d79e8bc80e。
+- 同目录提供 .exe.sha256；结构化验证记录：artifacts/multilingual-installer-verification.json。
+- 未进行覆盖安装；旧版安装包及旧桌面目录均保留。
