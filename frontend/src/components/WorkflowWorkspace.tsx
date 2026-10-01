@@ -608,27 +608,11 @@ function TranscribeWorkspace({ startTask, cancelTask }: WorkflowWorkspaceProps) 
 
                 <ToggleLine
                   label="自动补录其他语言"
-                  description={
-                    config.sourceLanguage === "auto"
-                      ? "自动语言模式已经包含多语言检测与按需对齐"
-                      : hardware === null
-                        ? "正在确认设备是否支持 MLX 多语言补录"
-                      : hardware.platform !== "Darwin" || hardware.arch !== "arm64"
-                        ? "当前仅支持 Apple Silicon 的 MLX Whisper"
-                        : "保留所选主语言，并对稳定检测到的其他语言局部重识别"
-                  }
-                  checked={
-                    config.sourceLanguage !== "auto" &&
-                    hardware?.platform === "Darwin" &&
-                    hardware.arch === "arm64" &&
-                    config.detectAdditionalLanguages
-                  }
-                  disabled={
-                    config.sourceLanguage === "auto" ||
-                    hardware === null ||
-                    hardware.platform !== "Darwin" ||
-                    hardware.arch !== "arm64"
-                  }
+                  description={config.sourceLanguage === "auto"
+                    ? "自动语言模式已经包含多语言检测与按需对齐"
+                    : "保留所选主语言，对可信的外语片段局部补录；支持 Windows CUDA / CPU，需使用多语言模型"}
+                  checked={config.sourceLanguage !== "auto" && config.detectAdditionalLanguages}
+                  disabled={config.sourceLanguage === "auto"}
                   onChange={(value) => void saveConfig("detect_additional_languages", value)}
                 />
 

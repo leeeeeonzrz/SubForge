@@ -3336,7 +3336,10 @@ class WhisperXASR(BaseASR):
     def _resolve_align_model_name(self, language_code: str) -> str | None:
         normalized_language = _normalize_language(language_code)
         if self.align_model and self.align_model != DEFAULT_EN_ALIGN_MODEL:
-            return self.align_model
+            primary_language = getattr(self, "language", None)
+            mixed_mode = primary_language is None or getattr(self, "detect_additional_languages", False)
+            if not mixed_mode or normalized_language == primary_language:
+                return self.align_model
         if self.align_model == DEFAULT_EN_ALIGN_MODEL:
             if normalized_language == "en":
                 return DEFAULT_EN_ALIGN_MODEL
@@ -3418,11 +3421,18 @@ class WhisperXASR(BaseASR):
 
             language_code = str(result.get("language") or self.language or "en").lower()
             skip_alignment_languages: set[str] = set()
-            if self.language is None:
-                _, skip_alignment_languages = self._resolve_missing_alignment_models(
-                    language_code,
-                    [],
+            if self.language is None or getattr(self, "detect_additional_languages", False):
+                from .faster_whisper_language import FasterWhisperLanguageDecoder
+
+                decoder = FasterWhisperLanguageDecoder(model.model, audio, self._raise_if_cancelled)
+                callback(48, "Checking for language switches...")
+                language_ranges = self._detect_language_ranges(
+                    audio, result, language_code, decoder.probabilities, decoder.decode, callback,
+                ) if decoder.is_multilingual else []
+                language_ranges, skip_alignment_languages = self._resolve_missing_alignment_models(
+                    language_code, language_ranges,
                 )
+                result = decoder.replace_ranges(result, language_ranges, language_code)
             aligned = self._align_multilingual_result(
                 result,
                 audio,
@@ -3559,7 +3569,6 @@ class WhisperXASR(BaseASR):
             import mlx_whisper
             from mlx_whisper.audio import (
                 N_FRAMES,
-                SAMPLE_RATE,
                 log_mel_spectrogram,
                 pad_or_trim,
             )
@@ -3571,20 +3580,45 @@ class WhisperXASR(BaseASR):
             logger.info("Mixed-language probing is unavailable: %s", exc)
             return []
 
+        audio = load_mlx_audio(audio_path)
+        model = ModelHolder.get_model(mlx_model_path, mx.float16)
+        full_mel = log_mel_spectrogram(cast(Any, audio), n_mels=model.dims.n_mels)
+
+        def probabilities(start: float, end: float) -> dict[str, float]:
+            frame_start = max(0, int(start * 100))
+            frame_end = min(int(full_mel.shape[-2]), int(end * 100))
+            mel = pad_or_trim(full_mel[frame_start:frame_end], N_FRAMES, axis=-2).astype(mx.float16)
+            _, raw = model.detect_language(mel)
+            return cast(dict[str, float], raw)
+
+        def decode(clip: Any) -> dict:
+            return mlx_whisper.transcribe(
+                clip, path_or_hf_repo=mlx_model_path, task="transcribe",
+                word_timestamps=False, condition_on_previous_text=False, verbose=None,
+            )
+
+        return self._detect_language_ranges(audio, result, primary_language, probabilities, decode)
+
+    def _detect_language_ranges(
+        self,
+        audio: Any,
+        result: dict,
+        primary_language: str,
+        detect_probabilities: Callable[[float, float], dict[str, float]],
+        decode: Callable[[Any], dict],
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+    ) -> list[_LanguageRange]:
+        """Share VAD, sustained evidence and script confirmation across ASR engines."""
         source_segments = _segments_for_alignment(result)
         if not source_segments:
             return []
 
-        audio = load_mlx_audio(audio_path)
-        model = ModelHolder.get_model(mlx_model_path, mx.float16)
-        audio_duration = float(audio.shape[0]) / SAMPLE_RATE
-        full_mel = log_mel_spectrogram(cast(Any, audio), n_mels=model.dims.n_mels)
-        frames_per_second = 100
+        audio_duration = float(audio.shape[0]) / MLX_AUDIO_SAMPLE_RATE
         probes: list[_LanguageProbe] = []
         try:
             speech_segments_ms = _detect_speech_in_mlx_gaps(
                 audio,
-                SAMPLE_RATE,
+                MLX_AUDIO_SAMPLE_RATE,
                 [(0.0, audio_duration)],
             )
         except Exception as exc:
@@ -3614,13 +3648,8 @@ class WhisperXASR(BaseASR):
             )
             if speech_seconds < minimum_speech or speech_ratio < MIXED_LANGUAGE_MIN_VOICED_RATIO:
                 return
-            frame_start = max(0, int(start * frames_per_second))
-            frame_end = min(int(full_mel.shape[-2]), int(end * frames_per_second))
-            mel_segment = pad_or_trim(full_mel[frame_start:frame_end], N_FRAMES, axis=-2).astype(
-                mx.float16
-            )
-            _, raw_probabilities = model.detect_language(mel_segment)
-            probabilities = cast(dict[str, float], raw_probabilities)
+            self._raise_if_cancelled("language probing")
+            probabilities = detect_probabilities(start, end)
             if not probabilities:
                 return
             ranked = sorted(probabilities.items(), key=lambda item: item[1], reverse=True)
@@ -3650,6 +3679,12 @@ class WhisperXASR(BaseASR):
 
         window_start = 0.0
         while window_start < audio_duration:
+            self._raise_if_cancelled("language probing")
+            if progress_callback:
+                progress_callback(
+                    48 + int(10 * window_start / max(audio_duration, 1)),
+                    f"Checking language switches ({window_start:.0f}/{audio_duration:.0f}s)...",
+                )
             window_end = min(audio_duration, window_start + MIXED_LANGUAGE_WINDOW_SECONDS)
             # Probe the complete recording. Forced-primary ASR can omit foreign speech,
             # so its segment boundaries are not a reliable VAD gate here. Use only the
@@ -3696,17 +3731,12 @@ class WhisperXASR(BaseASR):
                 candidate.end,
                 speech_segments_ms,
             )
-            clip = audio[int(context_start * SAMPLE_RATE) : int(context_end * SAMPLE_RATE)]
+            clip = audio[int(context_start * MLX_AUDIO_SAMPLE_RATE) : int(context_end * MLX_AUDIO_SAMPLE_RATE)]
             try:
-                decoded = mlx_whisper.transcribe(
-                    clip,
-                    path_or_hf_repo=mlx_model_path,
-                    task="transcribe",
-                    word_timestamps=False,
-                    condition_on_previous_text=False,
-                    verbose=None,
-                )
+                self._raise_if_cancelled("language confirmation")
+                decoded = decode(clip)
             except Exception as exc:
+                self._raise_if_cancelled("language confirmation")
                 logger.warning(
                     "Mixed-language confirmation failed for %.2f-%.2f: %s",
                     candidate.start,
@@ -3769,17 +3799,12 @@ class WhisperXASR(BaseASR):
             confirmed_ranges,
             speech_segments_ms,
         ):
-            clip = audio[int(left.end * SAMPLE_RATE) : int(right.start * SAMPLE_RATE)]
+            clip = audio[int(left.end * MLX_AUDIO_SAMPLE_RATE) : int(right.start * MLX_AUDIO_SAMPLE_RATE)]
             try:
-                decoded = mlx_whisper.transcribe(
-                    clip,
-                    path_or_hf_repo=mlx_model_path,
-                    task="transcribe",
-                    word_timestamps=False,
-                    condition_on_previous_text=False,
-                    verbose=None,
-                )
+                self._raise_if_cancelled("language confirmation")
+                decoded = decode(clip)
             except Exception as exc:
+                self._raise_if_cancelled("language confirmation")
                 logger.warning(
                     "Mixed-language bridge confirmation failed for %.2f-%.2f: %s",
                     left.end,
@@ -4075,7 +4100,7 @@ class WhisperXASR(BaseASR):
             grouped.setdefault(language, []).append(segment)
 
         skip_alignment_languages = skip_alignment_languages or set()
-        if len(grouped) <= 1 and not (set(grouped) & skip_alignment_languages):
+        if set(grouped) <= {primary_language} and not (set(grouped) & skip_alignment_languages):
             return self._align_result(
                 result,
                 audio,
@@ -4514,9 +4539,13 @@ class WhisperXASR(BaseASR):
     def _get_key(self) -> str:
         key = {
             "crc32": self.crc32_hex,
-            "model": self.mlx_model,
+            "model": self.mlx_model if self.uses_mlx else self.whisper_model,
+            "backend": "mlx" if self.uses_mlx else "faster-whisper",
+            "detect_additional_languages": getattr(self, "detect_additional_languages", False),
             "language": self.language or "auto",
-            "mixed_language_revision": 5 if self.uses_mlx and self.language is None else 0,
+            "mixed_language_revision": 6 if (
+                self.language is None or getattr(self, "detect_additional_languages", False)
+            ) else 0,
             "speech_coverage_revision": 5 if self.uses_mlx else 0,
             "align_device": self.align_device,
             "compute_type": self.compute_type,

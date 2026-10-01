@@ -22,6 +22,45 @@ from desktop_dialogs import choose_input_file, configure_native_language
 _NULL_STREAMS = []
 
 
+def _check_multilingual_sample(request_path: str) -> None:
+    """Optional local audio probe inside the exact packaged WhisperX runtime."""
+    import json
+
+    from faster_whisper.audio import decode_audio
+    from whisperx.asr import WhisperModel
+
+    from subforge.core.asr.faster_whisper_language import FasterWhisperLanguageDecoder
+    from subforge.core.asr.whisperx_asr import WhisperXASR
+
+    request = json.loads(Path(request_path).read_text(encoding="utf-8-sig"))
+    device = request.get("device", "cpu")
+    model = WhisperModel(
+        request["model"], device=device,
+        compute_type="float16" if device == "cuda" else "int8", local_files_only=True,
+    )
+    audio = decode_audio(request["audio"], sampling_rate=16000)
+    asr = WhisperXASR.__new__(WhisperXASR)
+    asr.cancel_event = None
+    decoder = FasterWhisperLanguageDecoder(model, audio, asr._raise_if_cancelled)
+    primary = request["primary_language"]
+    original = decoder.decode(audio, primary)
+    ranges = asr._detect_language_ranges(
+        audio, original, primary, decoder.probabilities, decoder.decode,
+        lambda progress, message: print(f"{progress}% {message}", flush=True),
+    )
+    result = decoder.replace_ranges(original, ranges, primary)
+    report = {"device": device, "ranges": [vars(item) for item in ranges],
+              "original": original, "result": result}
+    Path(request["output"]).write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8",
+    )
+    expected = set(request["expected_languages"])
+    actual = set(result["languages"])
+    if not expected <= actual:
+        raise RuntimeError(f"Multilingual sample expected {expected}, got {actual}")
+    print(f"WhisperX multilingual sample: ok ({device}; {sorted(actual)})", flush=True)
+
+
 def _configure_frozen_standard_streams() -> None:
     """Provide writable streams for libraries inside a windowed executable."""
     if not getattr(sys, "frozen", False):
@@ -554,6 +593,9 @@ if __name__ == "__main__":
                     f"alignment={align_device}, torch={torch.__version__})"
                 )
                 print("WhisperX ASR and forced alignment imports: ok")
+                sample_request = os.environ.get("SUBFORGE_CHECK_MULTILINGUAL_SAMPLE", "")
+                if sample_request:
+                    _check_multilingual_sample(sample_request)
             print("WhisperX forced alignment import: ok")
             finish_packaged_check(0)
         except Exception:

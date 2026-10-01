@@ -1106,49 +1106,16 @@ export function SettingsPanel() {
             String(settings.source_language || "auto") !== "auto" && (
               <SettingsField
                 label="自动补录其他语言"
-                description={
-                  hwInfo === null
-                    ? "正在确认设备是否支持 MLX 多语言补录"
-                    : hwInfo.platform === "Darwin" && hwInfo.arch === "arm64"
-                      ? "以所选语言为主，稳定检测到其他语言时按需下载对齐模型并局部补录"
-                      : "当前仅支持 Apple Silicon 的 MLX Whisper 路径"
-                }
+                description="以所选语言为主，可信的外语片段按需补录并提示缺失对齐模型；支持 Windows CUDA / CPU，需使用多语言模型"
               >
                 <button
                   type="button"
-                  disabled={
-                    hwInfo === null ||
-                    hwInfo.platform !== "Darwin" ||
-                    hwInfo.arch !== "arm64"
-                  }
-                  onClick={() =>
-                    handleSave(
-                      "detect_additional_languages",
-                      !settings.detect_additional_languages
-                    )
-                  }
-                  className={`relative h-[22px] w-10 rounded-full transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-                    settings.detect_additional_languages &&
-                    hwInfo?.platform === "Darwin" &&
-                    hwInfo.arch === "arm64"
-                      ? "bg-accent"
-                      : "bg-black/10"
-                  }`}
-                  aria-pressed={Boolean(
-                    settings.detect_additional_languages &&
-                    hwInfo?.platform === "Darwin" &&
-                    hwInfo.arch === "arm64"
-                  )}
+                  onClick={() => handleSave("detect_additional_languages", !settings.detect_additional_languages)}
+                  className={`relative h-[22px] w-10 rounded-full transition-colors ${settings.detect_additional_languages ? "bg-accent" : "bg-black/10"}`}
+                  aria-label="自动补录其他语言"
+                  aria-pressed={Boolean(settings.detect_additional_languages)}
                 >
-                  <span
-                    className={`absolute top-[3px] h-4 w-4 rounded-full bg-white shadow-sm transition-[left] ${
-                      settings.detect_additional_languages &&
-                      hwInfo?.platform === "Darwin" &&
-                      hwInfo.arch === "arm64"
-                        ? "left-[21px]"
-                        : "left-[3px]"
-                    }`}
-                  />
+                  <span className={`absolute top-[3px] h-4 w-4 rounded-full bg-white shadow-sm transition-[left] ${settings.detect_additional_languages ? "left-[21px]" : "left-[3px]"}`} />
                 </button>
               </SettingsField>
             )}

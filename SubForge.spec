@@ -252,6 +252,7 @@ a = Analysis(
         'subforge.core.asr.speaker_embedding_models',
         'subforge.core.asr.speaker_verification',
         'subforge.core.asr.faster_whisper',
+        'subforge.core.asr.faster_whisper_language',
         'subforge.core.asr.chunked_asr',
         'subforge.core.asr.transcribe',
         'subforge.core.asr.base',

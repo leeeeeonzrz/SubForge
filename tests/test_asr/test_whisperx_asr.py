@@ -2019,6 +2019,7 @@ def test_whisperx_maps_local_torchaudio_weight_to_pipeline_identifier(tmp_path):
 def test_whisperx_keeps_explicit_non_english_alignment_model():
     asr = WhisperXASR.__new__(WhisperXASR)
     asr.align_model = "example/korean-alignment-model"
+    asr.language = "ko"
 
     assert asr._resolve_align_model_name("ko") == "example/korean-alignment-model"
 
