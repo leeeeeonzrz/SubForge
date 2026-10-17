@@ -157,8 +157,24 @@ def test_transcription_output_can_be_loaded_from_external_drive(external_input, 
     ))
     translated = task_manager.get_task(translation.id)
     assert translated.status == "completed", translated.error
-    loaded_translation = asyncio.run(subtitles.load_subtitle(translated.result["subtitle_file"]))
-    assert loaded_translation["segments"][0]["text"] == "New transcription."
-    assert loaded_translation["segments"][0]["translated"] == "新的转录"
+    output_files = translated.result["subtitle_files"]
+    assert set(output_files) == {"original", "translated", "bilingual"}
+    assert len(set(output_files.values())) == 3
+    # The source sidecar remains the authoritative input for a later translation.
+    assert translated.result["subtitle_file"] == output_files["original"]
+    expected_columns = {
+        "original": ("New transcription.", ""),
+        "translated": ("新的转录", ""),
+        "bilingual": ("New transcription.", "新的转录"),
+    }
+    for mode, path in output_files.items():
+        # Every generated variant needs its own grant outside the allowed roots.
+        assert security.validate_path(path).is_file()
+        loaded = asyncio.run(subtitles.load_subtitle(path))
+        assert loaded["count"] == 1
+        assert [
+            (segment["text"], segment["translated"])
+            for segment in loaded["segments"]
+        ] == [expected_columns[mode]]
     with pytest.raises(ValueError):
         security.validate_path(str(video.with_name("private.txt")))
