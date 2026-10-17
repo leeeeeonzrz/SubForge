@@ -22,6 +22,80 @@ from desktop_dialogs import choose_input_file, configure_native_language
 _NULL_STREAMS = []
 
 
+def _check_denoise_sample(audio_path: str) -> None:
+    """Exercise enhancement and its real WAV-to-MP3 transcription handoff."""
+    import math
+    from io import BytesIO
+
+    import soundfile as sf
+    from pydub import AudioSegment
+
+    from subforge.core.asr.audio_enhancer import enhance_audio, is_available
+    from subforge.core.asr.base import BaseASR
+    from subforge.core.asr.chunked_asr import ChunkedASR
+
+    available = is_available()
+    print(f"DeepFilterNet3 available: {available}")
+    if not available:
+        # Report the original dependency error when availability probing failed.
+        import soundfile  # noqa: F401
+        import torch  # noqa: F401
+        from df.enhance import enhance as _enhance  # noqa: F401
+        from df.enhance import init_df as _init_df  # noqa: F401
+
+        raise RuntimeError("DeepFilterNet3 is unavailable")
+    if not audio_path:
+        return
+
+    enhanced_path = None
+    try:
+        enhanced_path = enhance_audio(audio_path, atten_lim_db=18.0)
+        enhanced_file = Path(enhanced_path)
+        if not enhanced_file.is_file() or enhanced_file.stat().st_size == 0:
+            raise RuntimeError("DeepFilterNet3 produced no smoke-test output")
+        print(f"DeepFilterNet3 inference: ok ({enhanced_file.stat().st_size} bytes)")
+
+        # Exercise multiple chunks without spawning thousands of processes if
+        # this diagnostic is given a full recording instead of the smoke clip.
+        chunk_seconds = max(1, math.ceil(sf.info(enhanced_file).duration / 3))
+        chunks = ChunkedASR(
+            asr_class=BaseASR,
+            audio_path=str(enhanced_file),
+            chunk_length=chunk_seconds,
+            chunk_overlap=0,
+        )._split_audio()
+        if len(chunks) < 2:
+            raise RuntimeError("Denoise handoff check requires at least two audio chunks")
+        for index, (chunk_bytes, _offset_ms) in enumerate(chunks):
+            if not chunk_bytes:
+                raise RuntimeError(f"Denoise handoff produced empty MP3 chunk {index}")
+            with BytesIO(chunk_bytes) as source:
+                decoded = AudioSegment.from_file(source, format="mp3")
+            if len(decoded) == 0:
+                raise RuntimeError(f"Denoise handoff decoded empty MP3 chunk {index}")
+        print(f"DeepFilterNet3 transcription handoff: ok ({len(chunks)} MP3 chunks)")
+    finally:
+        if enhanced_path:
+            Path(enhanced_path).unlink(missing_ok=True)
+
+
+def _run_denoise_runtime_check() -> int:
+    """Persist failures from windowed packaged checks before their hard exit."""
+    try:
+        _check_denoise_sample(os.environ.get("SUBFORGE_DENOISE_AUDIO_PATH", ""))
+    except BaseException:
+        detail = traceback.format_exc()
+        print(detail)
+        error_log = os.environ.get("SUBFORGE_CHECK_ERROR_LOG", "").strip()
+        if error_log:
+            try:
+                Path(error_log).write_text(detail, encoding="utf-8")
+            except OSError:
+                pass
+        return 1
+    return 0
+
+
 def _check_multilingual_sample(request_path: str) -> None:
     """Optional local audio probe inside the exact packaged WhisperX runtime."""
     import json
@@ -494,36 +568,7 @@ if __name__ == "__main__":
         os._exit(exit_code)
 
     if os.environ.get("SUBFORGE_CHECK_DENOISE") == "1":
-        import traceback
-
-        from subforge.core.asr.audio_enhancer import enhance_audio, is_available
-
-        available = is_available()
-        print(f"DeepFilterNet3 available: {available}")
-        if not available:
-            try:
-                import soundfile  # noqa: F401
-                import torch  # noqa: F401
-                from df.enhance import enhance as _enhance  # noqa: F401
-                from df.enhance import init_df as _init_df  # noqa: F401
-            except Exception:
-                traceback.print_exc()
-        audio_path = os.environ.get("SUBFORGE_DENOISE_AUDIO_PATH", "")
-        if available and audio_path:
-            enhanced_path = None
-            try:
-                enhanced_path = enhance_audio(audio_path, atten_lim_db=18.0)
-                enhanced_file = Path(enhanced_path)
-                if not enhanced_file.is_file() or enhanced_file.stat().st_size == 0:
-                    raise RuntimeError("DeepFilterNet3 produced no smoke-test output")
-                print(f"DeepFilterNet3 inference: ok ({enhanced_file.stat().st_size} bytes)")
-            except BaseException:
-                traceback.print_exc()
-                finish_packaged_check(1)
-            finally:
-                if enhanced_path:
-                    Path(enhanced_path).unlink(missing_ok=True)
-        finish_packaged_check(0 if available else 1)
+        finish_packaged_check(_run_denoise_runtime_check())
     if os.environ.get("SUBFORGE_CHECK_FASTER_WHISPER") == "1":
         import traceback
 

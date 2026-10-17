@@ -222,8 +222,15 @@ def main() -> int:
             env = os.environ.copy()
             env["SUBFORGE_CHECK_DENOISE"] = "1"
             env["SUBFORGE_DENOISE_AUDIO_PATH"] = str(video)
-            _run([str(exe)], env=env)
-            print("Verified packaged DeepFilterNet3 inference")
+            denoise_error_log = tmp_path / "denoise-check-error.log"
+            env["SUBFORGE_CHECK_ERROR_LOG"] = str(denoise_error_log)
+            try:
+                _run([str(exe)], env=env)
+            except subprocess.CalledProcessError:
+                if denoise_error_log.exists():
+                    print(denoise_error_log.read_text(encoding="utf-8"))
+                raise
+            print("Verified packaged DeepFilterNet3 inference and MP3 chunk handoff")
 
             env = os.environ.copy()
             env["SUBFORGE_CHECK_FASTER_WHISPER"] = "1"

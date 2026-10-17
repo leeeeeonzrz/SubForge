@@ -1,9 +1,82 @@
 import base64
+import shutil
 import sys
 import threading
 import types
+import wave
+
+import pytest
 
 import launcher
+
+
+def _mock_enhanced_audio(monkeypatch, tmp_path):
+    from subforge.core.asr import audio_enhancer
+
+    enhanced = tmp_path / "enhanced.wav"
+    with wave.open(str(enhanced), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(b"\0\0" * 48_000)
+    monkeypatch.setattr(audio_enhancer, "is_available", lambda: True)
+    monkeypatch.setattr(audio_enhancer, "enhance_audio", lambda *_a, **_kw: str(enhanced))
+    monkeypatch.setenv("SUBFORGE_DENOISE_AUDIO_PATH", "sample.mp4")
+    return enhanced
+
+
+def test_denoise_runtime_checks_actual_mp3_chunk_handoff(monkeypatch, tmp_path, capsys):
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("FFmpeg and ffprobe are required for the packaged handoff check")
+    from pydub import AudioSegment
+
+    enhanced = _mock_enhanced_audio(monkeypatch, tmp_path)
+    original_from_file = AudioSegment.from_file
+    decoded_formats = []
+
+    def track_decode(source, *args, **kwargs):
+        decoded_formats.append(kwargs.get("format"))
+        return original_from_file(source, *args, **kwargs)
+
+    monkeypatch.setattr(AudioSegment, "from_file", track_decode)
+
+    assert launcher._run_denoise_runtime_check() == 0
+
+    assert decoded_formats.count("mp3") == 3
+    assert "transcription handoff: ok (3 MP3 chunks)" in capsys.readouterr().out
+    assert not enhanced.exists()
+
+
+def test_denoise_runtime_persists_handoff_error_and_cleans_output(monkeypatch, tmp_path):
+    from subforge.core.asr.chunked_asr import ChunkedASR
+
+    enhanced = _mock_enhanced_audio(monkeypatch, tmp_path)
+    error_log = tmp_path / "denoise-error.log"
+    monkeypatch.setenv("SUBFORGE_CHECK_ERROR_LOG", str(error_log))
+
+    def fail_split(_self):
+        raise RuntimeError("ffmpeg handoff failed")
+
+    monkeypatch.setattr(ChunkedASR, "_split_audio", fail_split)
+
+    assert launcher._run_denoise_runtime_check() == 1
+
+    assert "RuntimeError: ffmpeg handoff failed" in error_log.read_text(encoding="utf-8")
+    assert not enhanced.exists()
+
+
+def test_denoise_runtime_rejects_empty_exported_chunk(monkeypatch, tmp_path):
+    from subforge.core.asr.chunked_asr import ChunkedASR
+
+    enhanced = _mock_enhanced_audio(monkeypatch, tmp_path)
+    error_log = tmp_path / "denoise-error.log"
+    monkeypatch.setenv("SUBFORGE_CHECK_ERROR_LOG", str(error_log))
+    monkeypatch.setattr(ChunkedASR, "_split_audio", lambda _self: [(b"", 0), (b"", 1000)])
+
+    assert launcher._run_denoise_runtime_check() == 1
+
+    assert "empty MP3 chunk 0" in error_log.read_text(encoding="utf-8")
+    assert not enhanced.exists()
 
 
 def test_configure_frozen_standard_streams_replaces_missing_streams(monkeypatch, tmp_path):
