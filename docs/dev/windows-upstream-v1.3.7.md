@@ -27,3 +27,20 @@
 - 前端生产构建使用 `NEXT_PUBLIC_APP_VERSION=1.3.7-windows.1 npm run build -- --webpack`，TypeScript 和静态导出通过。默认 Turbopack 在本机发生 PostCSS 子进程握手失败；仅使用构建参数切换，未更改源码或默认配置。
 - Ruff 通过。Pyright：0 errors、48 warnings（包含可选平台依赖等告警）。
 - 测试、构建和运行证据保存于本地 `artifacts/rebase-v1.3.7-*`，不提交模型、音频和二进制产物。
+
+## 新桌面包验证
+
+- 使用 `.venv/Scripts/python.exe scripts/build_desktop.py --no-archive --skip-frontend-build`，构建版本环境变量为 `SUBFORGE_BUILD_VERSION=1.3.7-windows.1`。前端复用上文已完成的 webpack 生产构建。
+- 构建返回 0；新包冻结后端版本正确，36 个前端文件逐一 SHA-256 匹配。CTranslate2 下的重复 `cudnn64_9.dll` 和 `libiomp5md.dll` 已移除，使用 Torch 配套共享运行时。
+- 新包 `scripts/smoke_desktop.py dist/SubForge` 返回 0：FastAPI/HTTP、FFmpeg/FFprobe、whisper.cpp、DeepFilterNet3 实际推理、FasterWhisper/CTranslate2/PyAV、WhisperX CUDA/forced alignment 运行时、pyannote 导入均通过。
+- 使用此前保留的 47.944 秒韩语→英语→韩语合成音频，对新 `SubForge.exe` 实测。CUDA（large-v3-turbo）保留 7 条韩语原句，CPU（tiny）保留 8 条韩语原句；两者均补出完整英语内容，最终时间段无重叠。对应结果和断言汇总保存在 `artifacts/rebase-v1.3.7-multilingual-verification.json`。
+- 以上为合成音频及运行时验证，不代表真实长视频识别准确率、完整在线翻译、可见 UI 操作或覆盖安装均已实测；没有调用付费 API。
+- 旧桌面目录已备份到 `artifacts/SubForge-1.3.3-windows.2-backup-20261017`，旧安装程序保留。未覆盖安装、推送或发布 Release。
+
+## 安装程序
+
+- 文件：`artifacts/SubForge-1.3.7-windows.1-windows-x64-setup.exe`。
+- 体积：2,294,427,339 bytes；产品版本：`1.3.7-windows.1`。
+- SHA-256：`e30221525e65dd7c429e0a6d59e8df73cd714ff796abc344b52acdf8777fdaf2`；同目录提供 `.exe.sha256`。
+- Inno Setup 使用 `lzma2/normal` 编译成功，20,673 个源文件与已验证的新桌面包逐一匹配。
+- 验证记录：`artifacts/rebase-v1.3.7-installer-verification.json`；产品源码基于 `11d545f`，测试适配及同步记录提交为 `3035bb1`。
