@@ -23,6 +23,8 @@ on:
       - main
     tags:
       - "v*"
+      # Windows CUDA releases use locally verified artifacts, not the CI CPU build.
+      - "!v*windows.*"
   workflow_dispatch:
     inputs:
       release_version:

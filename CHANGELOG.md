@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.3.7-windows.2 - 2026-10-18
+
+### Windows audio decoding and upstream integration
+
+- Rebase the Windows fork onto upstream v1.3.7 while retaining CUDA support, Korean transcription/alignment behavior, subtitle output options, and preview protection.
+- Read confirmed PCM WAV files directly after denoising, fixing the reproduced FFmpeg exit code `3221225794` during transcription chunking. Preserve automatic decoding for non-PCM and floating-point WAV files.
+- Extend packaged runtime checks to cover denoising, actual ASR chunking, and decoding of the resulting MP3 chunks.
+
+### Windows distribution and validation
+
+- Publish the verified Windows x64/CUDA application as a split Inno Setup installer. Download the setup EXE and both BIN files into one folder, then run the EXE. ASR and alignment model weights remain separate.
+- Verified full-length denoising/chunking of the reported input, real 24-second WhisperX CUDA transcription with Korean alignment, and overwrite installation preserving settings and model files. This does not claim full-video transcription or paid translation validation.
+- Python regression coverage totals 3116 passing cases across the main run and six environment-corrected reruns; 17 skipped and 35 external integration tests deselected. Ruff passed and targeted Pyright reported no errors.
+- Windows Start search may still omit the application on the tested machine; use the desktop shortcut or installed executable. This release does not claim to repair Windows search indexing.
+
 ## v1.3.7 - 2026-10-17
 
 ### Native import panel and localization

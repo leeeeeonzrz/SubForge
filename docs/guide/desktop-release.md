@@ -69,7 +69,12 @@ is not part of the current application or its release checks.
 ## GitHub Actions
 
 `.github/workflows/build-desktop.yml` runs on pull requests affecting the desktop
-app, pushes to `master`/`main`, version tags, and manual dispatch. The matrix is:
+app, pushes to `master`/`main`, standard version tags, and manual dispatch.
+Windows fork tags matching `v*windows.*` are excluded: those releases publish
+the locally verified CUDA payload, and the standard CI build must not replace it.
+Use PEP 440-compatible source tags such as `v1.3.7+windows.2`; the desktop
+display version and installer filenames may use `1.3.7-windows.2`.
+The matrix is:
 
 | Build | Runner | Output |
 | --- | --- | --- |

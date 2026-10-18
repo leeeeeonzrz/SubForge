@@ -63,7 +63,7 @@ WAV 扩展名，因此本来可直接读取的 PCM WAV 又经过 FFprobe/FFmpeg�
 
 ## 覆盖安装与安装后验收
 
-- 安装到既有当前用户目录 `C:\Users\xuleh\AppData\Local\Programs\SubForge`，
+- 安装到既有当前用户目录 `%LOCALAPPDATA%\Programs\SubForge`，
   静默覆盖安装返回 0，安装日志确认成功且无需重启 Windows。
 - 注册表及已安装后端均报告 `1.3.7-windows.2`；安装后的 EXE 和音频读取
   模块与已验证构建的 SHA-256 一致。
@@ -76,4 +76,4 @@ WAV 扩展名，因此本来可直接读取的 PCM WAV 又经过 FFprobe/FFmpeg�
   样本略有不同。
 - 验证证据：`artifacts/fix-ffmpeg-installed-verification.json`、
   `artifacts/fix-ffmpeg-installed-transcription.json` 和安装日志。
-- 未调用付费翻译 API，未推送或发布；新程序已启动供用户继续使用。
+- 本轮修复验收未调用付费翻译 API，当时尚未推送或发布；新程序已启动供用户继续使用。
