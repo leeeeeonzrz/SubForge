@@ -126,6 +126,25 @@ def test_comparison_rejects_changed_source_or_gold_identity():
     assert payload["gates"]["corpus_identity"] is False
 
 
+@pytest.mark.parametrize("old_revision", [None, "legacy-v1"])
+def test_comparison_requires_same_detector_revision(old_revision):
+    legacy = _report()
+    candidate = _report()
+    if old_revision is not None:
+        legacy["metrics_revision"] = old_revision
+    candidate["metrics_revision"] = "multilingual-text-v2"
+    payload = compare_evaluation_reports(legacy, candidate)
+    assert payload["gates"]["metrics_revision"] is False
+    assert payload["accepted"] is False
+
+
+def test_comparison_accepts_recomputed_reports_with_same_detector_revision():
+    legacy = _report()
+    candidate = _report()
+    legacy["metrics_revision"] = candidate["metrics_revision"] = "multilingual-text-v2"
+    assert compare_evaluation_reports(legacy, candidate)["accepted"] is True
+
+
 def test_comparison_accepts_efficiency_at_five_percent_budget():
     payload = compare_evaluation_reports(
         _report(),

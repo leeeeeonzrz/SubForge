@@ -71,6 +71,17 @@ def test_optimizer_protects_japanese_characters_from_silent_deletion():
     assert _lexical_edit_violations("これは伝統的な工法です", "これは工法です")
 
 
+def test_optimizer_keeps_korean_short_replies_and_repeated_emphasis():
+    for source, edited in [
+        ("네 네", "네"), ("너무너무 좋아요", "너무 좋아요"),
+        ("아니 아니 그게 아니라", "아니 그게 아니라"), ("응", ""),
+        ("삐용삐용 띠요", "삐용 띠요"),
+    ]:
+        assert _lexical_edit_violations(source, edited)
+    assert not _lexical_edit_violations("네 네", "네, 네!")
+    assert not _lexical_edit_violations("um I like it", "I like it")
+
+
 def test_validation_rejects_copying_next_subtitle_into_current_key():
     optimizer = SubtitleOptimizer.__new__(SubtitleOptimizer)
     original = {

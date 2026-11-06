@@ -166,7 +166,11 @@ def run(args: Namespace, config: dict) -> int:
         asr_data = transcribe(audio_path, transcribe_config, callback=callback)
 
         # Save output
-        if asr_data.coverage_issues:
+        blocking_issues = [
+            issue for issue in asr_data.coverage_issues
+            if issue.get("reason") not in {"suspected_non_speech_text", "suspected_repetition"}
+        ]
+        if blocking_issues:
             from subforge.core.asr.speech_gap_repair import coverage_issue_message
 
             recovery_path = Path(output_path).with_stem(Path(output_path).stem + "_recovery")
@@ -182,6 +186,14 @@ def run(args: Namespace, config: dict) -> int:
         if progress:
             n = len(asr_data.segments)
             progress.finish(f"Transcription complete -> {output_path} ({n} segment{'' if n == 1 else 's'})")
+        if asr_data.coverage_issues:
+            from subforge.core.asr.speech_gap_repair import coverage_review_ranges
+
+            output.warn(
+                "Some subtitles need review against the audio "
+                f"({coverage_review_ranges(asr_data.coverage_issues)}). "
+                "All subtitle text was preserved; translation may continue."
+            )
         if quiet:
             print(output_path)
         return EXIT.SUCCESS

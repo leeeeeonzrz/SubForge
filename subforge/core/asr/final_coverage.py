@@ -12,6 +12,12 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .asr_data import ASRData, reasonable_word_duration_ms
+from .repetition_review import (
+    RepetitionRange,
+    mark_repetitions_for_review,
+    repetition_ranges,
+    validate_repetition_replacement,
+)
 from .speech_gap_repair import corroborates, word_key
 
 logger = logging.getLogger(__name__)
@@ -312,7 +318,7 @@ def _save_evidence(records):
 def repair_final_coverage(data, audio_path, config, callback, factory, analysis_context=None):
     """Bounded local recovery, with unresolved regions propagated to existing UI."""
     if not data.is_word_timestamp():
-        return data
+        return mark_repetitions_for_review(data)
     from .audio_analysis import AudioAnalysisContext
 
     _checkpoint(config)
@@ -331,17 +337,25 @@ def repair_final_coverage(data, audio_path, config, callback, factory, analysis_
         data.coverage_issues.append(
             {"start": 0, "end": duration, "reason": "final_audit_unavailable"}
         )
-        return data
-    if not gaps:
+        return mark_repetitions_for_review(data)
+    # Decoder loops can occupy every timestamp and hide a missing utterance.
+    # Share the existing decode budget; text repetition alone never deletes text.
+    repetitions = repetition_ranges(data)
+    # Preserve the established missing-speech budget priority. A long recording
+    # may contain many review-only chants before a genuinely missing sentence.
+    targets = [*gaps, *repetitions]
+    if not targets:
         return data
     duration_ms = round(len(samples) / 16)
     decoded_seconds = 0
     attempts = 0
     current = gaps
-    for gap in gaps:
+    for gap in targets:
         _checkpoint(config)
+        is_repetition = isinstance(gap, RepetitionRange)
         # Previous accepted repair may have covered more than one original gap.
-        if not any(g.start < gap.end and g.end > gap.start for g in current):
+        pending = repetition_ranges(data) if is_repetition else current
+        if not any(g.start < gap.end and g.end > gap.start for g in pending):
             continue
         left = max(0, round(gap.start * 1000) - CONTEXT_MS)
         right = min(duration_ms, round(gap.end * 1000) + CONTEXT_MS)
@@ -363,7 +377,8 @@ def repair_final_coverage(data, audio_path, config, callback, factory, analysis_
             continue
         attempts += 1
         decoded_seconds += cost
-        callback(95, "Recovering missing speech with surrounding context...")
+        callback(95, "Checking repeated subtitles against original speech..." if is_repetition
+                 else "Recovering missing speech with surrounding context...")
         original = ASRData(
             copy.deepcopy(
                 [s for s in data.segments if s.start_time >= left and s.end_time <= right]
@@ -380,7 +395,7 @@ def repair_final_coverage(data, audio_path, config, callback, factory, analysis_
             second = _decode(context, confirm_left, confirm_right, config, factory, callback)
             record["confirmation"] = _words(second)
             agreed = _consensus_proposal(original, first, second, gap.start, gap.end)
-            if agreed is None:
+            if agreed is None and not is_repetition:
                 # A 22s clip read "80-ish thousand dollar" as "$80,000".
                 # One wider independent decode can corroborate either reading;
                 # never normalize away the approximation or a changed number.
@@ -404,6 +419,10 @@ def repair_final_coverage(data, audio_path, config, callback, factory, analysis_
             (lo, hi, replacement), localized = agreed
             if localized:
                 record["localized_consensus"] = True
+            if is_repetition:
+                record["repetition_evidence"] = validate_repetition_replacement(
+                    original.segments[lo:hi], replacement, gap, context
+                )
             if any(
                 seg.start_time / 1000 < span["end"] and seg.end_time / 1000 > span["start"]
                 for seg in replacement
@@ -457,6 +476,7 @@ def repair_final_coverage(data, audio_path, config, callback, factory, analysis_
     for gap in remaining:
         if not any(i["start"] <= gap.start and i["end"] >= gap.end for i in data.coverage_issues):
             data.coverage_issues.append({**asdict(gap), "reason": "final_export_gap"})
+    mark_repetitions_for_review(data)
     try:
         _save_evidence(records)
     except Exception:

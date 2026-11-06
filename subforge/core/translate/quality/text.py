@@ -8,6 +8,10 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
 from subforge.core.entities import SubtitleProcessData
+from subforge.core.translate.language_text import (
+    compact_similarity_text,
+    has_korean_clause_residue,
+)
 from subforge.core.translate.types import TargetLanguage
 
 _REASONING_LEAK_RE = re.compile(
@@ -20,7 +24,7 @@ _REASONING_LEAK_RE = re.compile(
 
 
 def _compact_similarity_text(text: str) -> str:
-    return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", str(text or "").casefold())
+    return compact_similarity_text(text)
 
 
 def contains_reasoning_leak(text: str) -> bool:
@@ -89,7 +93,17 @@ def is_untranslated_output(
         return False
     normalized_source = re.sub(r"\s+", "", source).casefold()
     normalized_output = re.sub(r"\s+", "", output).casefold()
-    if source_language and source_language != "zh" and normalized_output == normalized_source:
+    if (
+        source_language
+        and source_language != "zh"
+        and normalized_output == normalized_source
+        and re.search(
+            r"[\u3040-\u30ff\u31f0-\u31ff\u1100-\u11ff\u3130-\u318f"
+            r"\ua960-\ua97f\uac00-\ud7af\ud7b0-\ud7ff\u3400-\u4dbf"
+            r"\u4e00-\u9fff\uf900-\ufaff]",
+            source,
+        )
+    ):
         return True
     if (
         target_language
@@ -105,6 +119,16 @@ def is_untranslated_output(
         output_kana = re.findall(r"[\u3040-\u30ff\u31f0-\u31ff]", output)
         if source_kana and len(output_kana) >= max(2, len(source_kana) // 2):
             return True
+    if (
+        target_language
+        in {
+            TargetLanguage.SIMPLIFIED_CHINESE,
+            TargetLanguage.TRADITIONAL_CHINESE,
+            TargetLanguage.CANTONESE,
+        }
+        and has_korean_clause_residue(output, source)
+    ):
+        return True
     if re.search(target_pattern, output):
         return False
     if re.search(

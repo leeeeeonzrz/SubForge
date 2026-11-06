@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
+from subforge.core.translate.language_text import HANGUL_RE
+
 _CHINESE_TARGETS = {"简体中文", "繁体中文", "粤语"}
 
 
@@ -77,6 +79,31 @@ def target_language_style_rules(
         "subject when its reference is unmistakable, but retain or minimally recover any subject "
         "needed to prevent ambiguity across subtitle boundaries.",
     ]
+
+    if HANGUL_RE.search(source):
+        rules.extend(
+            [
+                "For informal Korean conversation, use the existing previous/next turns to "
+                "resolve ellipsis, replies, self-correction, and register. Recover an omitted "
+                "subject only when the local turn makes it unambiguous; do not default every "
+                "subjectless statement to I or invent a fan's unseen question.",
+                "Preserve short Korean replies and reactions: 네/응 can affirm or acknowledge, "
+                "아니 can deny or introduce a correction, and 어/아 can signal a response or "
+                "surprise. Decide their function from the local exchange, not a filler blacklist. "
+                "Preserve negation, questions, and intentional repetition for emphasis or "
+                "turn-taking. Do not delete a cue because it is short or resembles its neighbor.",
+                "Compress only clearly non-semantic hesitation within a cue. If a cue consists "
+                "only of hesitation or a reaction, give a brief faithful target-language "
+                "equivalent rather than an empty value, a long chain of filler words, or an "
+                "invented sentence. Text alone cannot prove that a repeated source is an ASR "
+                "hallucination; never fabricate missing speech.",
+                "Keep Korean names, nicknames, group names, and Korean-English language switches "
+                "consistent with established context. Translate the surrounding Korean clause "
+                "fully; preserving a name does not justify copying untranslated Korean sentences. "
+                "Do not expand a nickname into an unsupported identity or normalize informal "
+                "speech into more formal facts.",
+            ]
+        )
 
     conditional_rules = (
         (

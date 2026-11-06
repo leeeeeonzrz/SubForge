@@ -1,9 +1,24 @@
 import json
+import unicodedata
 from pathlib import Path
 
+import pytest
+
 from scripts.translation_quality.manifest import CorpusManifest, CorpusSample, sha256_file
-from scripts.translation_quality.metrics import _is_placeholder, evaluate_manifest
+from scripts.translation_quality.metrics import (
+    METRICS_REVISION,
+    _adjacent_duplicate_risks,
+    _compact,
+    _document_quality,
+    _is_placeholder,
+    _is_untranslated,
+    _similarity,
+    _target_language,
+    evaluate_manifest,
+)
 from scripts.translation_quality.report import write_report
+from scripts.translation_quality.srt import SrtCue, SrtDocument
+from subforge.core.translate.types import TargetLanguage
 
 
 def _write(path: Path, target_one: str, target_two: str) -> Path:
@@ -249,3 +264,107 @@ def test_reasoning_metric_does_not_treat_normal_result_narration_as_private_reas
     )
 
     assert report.aggregate["reasoning_leaks"] == 0
+
+
+def _cue(index: int, source: str, target: str) -> SrtCue:
+    return SrtCue(index, "", index * 1000, (index + 1) * 1000, source, target, (target, source))
+
+
+@pytest.mark.parametrize(
+    "left,right",
+    [
+        ("오늘 저녁은 먹었어요", "새 앨범 준비하고 있어요"),
+        ("今日はご飯を食べました", "新しい曲を練習しています"),
+        ("I already had dinner.", "We are rehearsing a new song."),
+    ],
+)
+def test_multilingual_metric_detects_copied_translation_for_different_sources(left, right):
+    target = "今天晚上已经吃过晚饭了"
+    risks = _adjacent_duplicate_risks((_cue(1, left, target), _cue(2, right, target)))
+    assert len(risks) == 1
+    assert risks[0]["source_similarity"] < 0.82
+
+
+@pytest.mark.parametrize(
+    "source,target",
+    [
+        ("정말 정말 고마워요", "真的真的非常感谢大家"),
+        ("本当に本当にありがとう", "真的真的非常感谢大家"),
+        ("Thank you so, so much.", "真的真的非常感谢大家"),
+        ("네 네", "对对"),
+        ("아니요", "不是"),
+        ("응", "嗯"),
+        ("はい", "是的"),
+        ("Yes.", "对"),
+    ],
+)
+def test_multilingual_metric_preserves_real_repetition_and_short_answers(source, target):
+    assert not _adjacent_duplicate_risks((_cue(1, source, target), _cue(2, source, target)))
+    assert not _is_untranslated(_cue(1, source, target))
+
+
+@pytest.mark.parametrize("source", ["오늘은 집에 있어요", "今日は家にいます", "I am at home."])
+def test_multilingual_metric_finds_untranslated_source(source):
+    assert _is_untranslated(_cue(1, source, source))
+
+
+@pytest.mark.parametrize("source", ["BMW M3", "https://example.com", "123"])
+def test_untranslated_metric_preserves_neutral_identifiers(source):
+    assert not _is_untranslated(_cue(1, source, source))
+
+
+def test_metric_normalizes_decomposed_hangul_without_erasing_korean():
+    source = "오늘 같이 이야기해요"
+    assert _compact(source)
+    assert _similarity(source, unicodedata.normalize("NFD", source)) == 1.0
+    assert _similarity(source, "내일 새로운 노래를 들어요") < 0.82
+
+
+def test_duplicate_metric_needs_source_evidence():
+    target = "今天晚上已经吃过晚饭了"
+    assert not _adjacent_duplicate_risks((_cue(1, "...", target), _cue(2, "안녕하세요", target)))
+
+
+@pytest.mark.parametrize(
+    "code,expected",
+    [
+        ("zh-CN", TargetLanguage.SIMPLIFIED_CHINESE),
+        ("zh-Hans", TargetLanguage.SIMPLIFIED_CHINESE),
+        ("zh_TW", TargetLanguage.TRADITIONAL_CHINESE),
+        ("zh-Hant", TargetLanguage.TRADITIONAL_CHINESE),
+        ("ja", TargetLanguage.JAPANESE),
+        ("ko", TargetLanguage.KOREAN),
+        ("en", TargetLanguage.ENGLISH),
+        ("unknown", None),
+    ],
+)
+def test_metric_respects_declared_target_language(code, expected):
+    assert _target_language(code) == expected
+
+
+def test_japanese_target_is_not_misreported_as_missing_chinese():
+    document = SrtDocument(
+        Path("synthetic.srt"),
+        (_cue(1, "오늘은 집에 있어요", "今日は家にいます"),),
+        "utf-8", "lf", False,
+    )
+    assert not _document_quality(document, TargetLanguage.JAPANESE, "ko")["untranslated_targets"]
+
+
+@pytest.mark.parametrize("language", ["en", "mixed"])
+def test_document_metric_with_declared_language_preserves_neutral_identifiers(language):
+    document = SrtDocument(
+        Path("synthetic.srt"),
+        tuple(_cue(index, source, source) for index, source in enumerate(
+            ["BMW M3", "https://example.com", "123"], 1,
+        )),
+        "utf-8", "lf", False,
+    )
+    assert not _document_quality(
+        document, TargetLanguage.SIMPLIFIED_CHINESE, language,
+    )["untranslated_targets"]
+
+
+def test_evaluation_reports_record_detector_revision():
+    report = evaluate_manifest(CorpusManifest(1, "empty", "now", "ROOT", ()), Path("."), manifest_hash="x")
+    assert report.to_dict()["metrics_revision"] == METRICS_REVISION

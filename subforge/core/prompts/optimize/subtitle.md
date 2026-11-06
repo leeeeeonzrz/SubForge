@@ -23,6 +23,7 @@ You will receive a JSON object with numbered subtitle entries.
 11. **Output only** the corrected JSON, no explanations
 12. **Reference consistency**: Reference content may confirm an obvious one-character ASR near-miss in a repeated chassis/model code (for example, a title and several captions agree on G70 while one caption says G77). Correct only high-confidence near-misses; preserve genuinely different generations such as G11, G12, E38, and E65
 13. **Korean source safety**: Preserve Korean word spacing, particles, endings, honorific level, and mixed-language names. Fix an obvious spacing, particle, or phonetic ASR error only when the local grammar and repeated surrounding context make one correction unambiguous; otherwise keep the recognized wording unchanged
+14. **Conversational Korean**: Keep short answers and reactions such as 네, 응, 아니, 어, and 아. Their meaning depends on the dialogue; never delete them using a filler-word list. Preserve repeated agreement, emphasis, laughter, and self-corrections when they may be intentional. Keep a filler-only entry non-empty and leave uncertain repetition unchanged for translation; text alone cannot establish an ASR hallucination
 </instructions>
 
 <output_format>

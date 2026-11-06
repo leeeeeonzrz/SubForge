@@ -343,6 +343,10 @@ def transcribe(
                 _create_single_asr,
                 analysis_context=analysis_context,
             )
+        else:
+            from subforge.core.asr.repetition_review import mark_repetitions_for_review
+
+            asr_data = mark_repetitions_for_review(asr_data)
 
         if diarization_turns:
             from subforge.core.asr.speaker_diarization import (

@@ -104,6 +104,9 @@ def compare_evaluation_reports(
     )
     gates["sample_identity"] = True
     gates["corpus_identity"] = identity_match
+    # Re-evaluate both outputs when the detectors change. Old Korean reports
+    # dropped Hangul during comparison and cannot be compared with fixed metrics.
+    gates["metrics_revision"] = legacy.get("metrics_revision") == candidate.get("metrics_revision")
 
     efficiency = None
     if (legacy_efficiency is None) != (candidate_efficiency is None):

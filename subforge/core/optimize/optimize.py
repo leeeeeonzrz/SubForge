@@ -15,6 +15,7 @@ from ..llm import call_llm, get_response_text, parse_json_object
 from ..llm.client import LLMRequestCancelled
 from ..prompts import get_prompt
 from ..split.alignment import SubtitleAligner
+from ..translate.language_text import HANGUL_RE
 from ..utils.logger import setup_logger
 from ..utils.text_utils import count_words
 
@@ -129,6 +130,11 @@ def _allowed_deleted_tokens(tokens: List[str], start: int, end: int) -> bool:
         return True
     if deleted == ["you", "know"] or all(token in {"um", "uh", "ah", "er"} for token in deleted):
         return True
+    if any(HANGUL_RE.search(token) for token in deleted):
+        # Korean tokens here are syllables, not words. Repeated syllables may be
+        # an acknowledgment, emphasis, laughter, or part of a name. Audio-free
+        # source cleanup must not silently remove them as duplicate words.
+        return False
     previous = tokens[start - 1] if start > 0 else ""
     following = tokens[end] if end < len(tokens) else ""
     return all(

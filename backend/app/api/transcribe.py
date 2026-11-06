@@ -564,12 +564,12 @@ async def _run_transcription(task_id: str, req: TranscribeRequest):
                     work_dir = source.parent
             work_dir.mkdir(parents=True, exist_ok=True)
             coverage_issues = getattr(result, "coverage_issues", [])
-            # Uncertain isolated words are retained in a complete transcript.
+            # Uncertain words and suspected repetitions are retained in full.
             # They need review, but do not represent missing speech or an ASR
             # failure. Actual coverage gaps still use the recovery/error path.
             blocking_issues = [
                 issue for issue in coverage_issues
-                if issue.get("reason") != "suspected_non_speech_text"
+                if issue.get("reason") not in {"suspected_non_speech_text", "suspected_repetition"}
             ]
             suffix = "_recovery" if blocking_issues else ""
             subtitle_path = work_dir / f"{video_stem}{suffix}.srt"
@@ -607,7 +607,7 @@ async def _run_transcription(task_id: str, req: TranscribeRequest):
 
                 completion_result["coverage_issues"] = coverage_issues
                 completion_result["warning"] = (
-                    f"转录已完成；{len(coverage_issues)} 处短字幕的音频证据不确定，"
+                    f"转录已完成；{len(coverage_issues)} 处字幕需要结合音频复核，"
                     f"请复核：{coverage_review_ranges(coverage_issues)}。"
                     "字幕已保留并保存，可继续翻译。"
                 )

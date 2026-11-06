@@ -2,6 +2,9 @@ import asyncio
 import importlib
 import sys
 from pathlib import Path
+from unittest.mock import Mock
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "backend"))
 
@@ -20,6 +23,61 @@ def _config_values(tmp_path: Path) -> dict:
         "whisperx_align_model": "WAV2VEC2_ASR_LARGE_LV60K_960H",
         "whisper_model_dir": str(tmp_path / "models"),
     }
+
+
+@pytest.mark.parametrize("reason", ["suspected_non_speech_text", "suspected_repetition"])
+@pytest.mark.parametrize("blocking_reason", [None, "final_export_gap", "final_audit_unavailable"])
+def test_audio_review_warnings_complete_but_missing_speech_still_blocks(
+    tmp_path, monkeypatch, reason, blocking_reason,
+):
+    from subforge.core.asr.asr_data import ASRData, ASRDataSeg
+    from subforge.core.entities import TranscribeConfig
+
+    source = tmp_path / "source.wav"
+    source.touch()
+    original = "사랑해 " * 20
+    data = ASRData([ASRDataSeg(original, 0, 15000)])
+    data.coverage_issues = [{"start": 0, "end": 15, "reason": reason}]
+    destination = tmp_path / "source.srt"
+    if blocking_reason:
+        data.coverage_issues.append({"start": 20, "end": 23, "reason": blocking_reason})
+        destination.write_text("existing subtitle", encoding="utf-8")
+    manager = Mock()
+    context = Mock()
+
+    async def run_inline(function, *args, **kwargs):
+        return function(*args)
+
+    monkeypatch.setattr(transcribe_api, "task_manager", manager)
+    monkeypatch.setattr(transcribe_api, "run_blocking", run_inline)
+    monkeypatch.setattr(transcribe_api, "create_pipeline_context", lambda _task_id: context)
+    monkeypatch.setattr(transcribe_api, "_build_transcribe_config", lambda *_a: TranscribeConfig())
+    monkeypatch.setattr(transcribe_api, "grant_path", lambda _path: None)
+    monkeypatch.setattr(config_module, "get_config_value", lambda _key, default=None: default)
+    monkeypatch.setattr(transcribe_module, "transcribe", lambda *_a, **_kw: data)
+    monkeypatch.setattr("subforge.core.utils.video_utils.video2audio", lambda *_a: True)
+
+    asyncio.run(transcribe_api._run_transcription(
+        "review-task", transcribe_api.TranscribeRequest(file_path=str(source), model="whisperx", language="ko"),
+    ))
+
+    if blocking_reason:
+        manager.complete_task.assert_not_called()
+        manager.fail_task.assert_called_once()
+        assert destination.read_text(encoding="utf-8") == "existing subtitle"
+        recovery = Path(manager.fail_task.call_args.args[2]["recovery_file"])
+        assert recovery.name == "source_recovery.srt"
+        assert original.strip() in recovery.read_text(encoding="utf-8-sig")
+    else:
+        manager.fail_task.assert_not_called()
+        manager.complete_task.assert_called_once()
+        result = manager.complete_task.call_args.args[1]
+        assert result["subtitle_file"] == str(destination)
+        assert original.strip() in destination.read_text(encoding="utf-8-sig")
+        assert "可继续翻译" in result["warning"]
+        assert "短字幕" not in result["warning"]
+        assert result["coverage_issues"] == data.coverage_issues
+        assert not (tmp_path / "source_recovery.srt").exists()
 
 
 def test_whisper_cpp_download_urls_are_pinned_to_an_immutable_revision():

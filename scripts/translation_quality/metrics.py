@@ -11,15 +11,18 @@ from pathlib import Path
 from statistics import mean, median
 from typing import Any, Iterable
 
+from subforge.core.translate.language_text import compact_similarity_text
 from subforge.core.translate.quality import (
     contains_reasoning_leak,
     is_source_copy,
+    is_untranslated_output,
 )
+from subforge.core.translate.types import BING_LANG_MAP, GOOGLE_LANG_MAP, TargetLanguage
 
 from .manifest import CorpusManifest, CorpusSample
 from .srt import SrtCue, SrtDocument, parse_srt
 
-_HAN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+METRICS_REVISION = "multilingual-text-v2"
 
 
 def _is_placeholder(text: str) -> bool:
@@ -55,7 +58,7 @@ def _is_placeholder(text: str) -> bool:
 
 
 def _compact(text: str) -> str:
-    return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", str(text or "").casefold())
+    return compact_similarity_text(text)
 
 
 def _similarity(left: str, right: str) -> float:
@@ -72,10 +75,35 @@ def _is_source_copy(cue: SrtCue) -> bool:
     return is_source_copy(cue.target, cue.source)
 
 
-def _is_untranslated(cue: SrtCue) -> bool:
+def _is_untranslated(
+    cue: SrtCue,
+    target_language: TargetLanguage | None = TargetLanguage.SIMPLIFIED_CHINESE,
+    source_language: str = "",
+) -> bool:
     if not cue.target.strip():
         return False
-    return not _HAN.search(cue.target) and bool(re.search(r"[A-Za-z]{2}", cue.source))
+    if target_language is None:
+        return False
+    if not source_language:
+        if re.search(r"[\u3040-\u30ff\u31f0-\u31ff]", cue.source):
+            source_language = "ja"
+        elif re.search(r"[\uac00-\ud7af]", cue.source):
+            source_language = "ko"
+    return is_untranslated_output(cue.target, cue.source, target_language, source_language)
+
+
+def _target_language(value: str) -> TargetLanguage | None:
+    normalized = str(value).strip().casefold().replace("_", "-")
+    if normalized == "zh":
+        return TargetLanguage.SIMPLIFIED_CHINESE
+    for mapping in (GOOGLE_LANG_MAP, BING_LANG_MAP):
+        for language, code in mapping.items():
+            if normalized == code.casefold():
+                return language
+    return next(
+        (language for language in TargetLanguage if normalized == language.value.casefold()),
+        None,
+    )
 
 
 def _indices(cues: Iterable[SrtCue], predicate: Any) -> list[int]:
@@ -85,6 +113,9 @@ def _indices(cues: Iterable[SrtCue], predicate: Any) -> list[int]:
 def _adjacent_duplicate_risks(cues: tuple[SrtCue, ...]) -> list[dict[str, Any]]:
     risks: list[dict[str, Any]] = []
     for left, right in zip(cues, cues[1:]):
+        # Missing linguistic evidence is not evidence of unrelated source text.
+        if not _compact(left.source) or not _compact(right.source):
+            continue
         if len(_compact(left.target)) < 8 or len(_compact(right.target)) < 8:
             continue
         target_similarity = _similarity(left.target, right.target)
@@ -101,7 +132,11 @@ def _adjacent_duplicate_risks(cues: tuple[SrtCue, ...]) -> list[dict[str, Any]]:
     return risks
 
 
-def _document_quality(document: SrtDocument) -> dict[str, Any]:
+def _document_quality(
+    document: SrtDocument,
+    target_language: TargetLanguage | None = TargetLanguage.SIMPLIFIED_CHINESE,
+    source_language: str = "",
+) -> dict[str, Any]:
     cues = document.cues
     return {
         "cue_count": len(cues),
@@ -109,7 +144,9 @@ def _document_quality(document: SrtDocument) -> dict[str, Any]:
         "placeholder_targets": _indices(cues, lambda cue: _is_placeholder(cue.target)),
         "reasoning_leaks": _indices(cues, lambda cue: contains_reasoning_leak(cue.target)),
         "source_copy_targets": _indices(cues, _is_source_copy),
-        "untranslated_targets": _indices(cues, _is_untranslated),
+        "untranslated_targets": _indices(
+            cues, lambda cue: _is_untranslated(cue, target_language, source_language)
+        ),
         "adjacent_duplicate_risks": _adjacent_duplicate_risks(cues),
         "encoding": document.encoding,
         "newline": document.newline,
@@ -222,6 +259,7 @@ class EvaluationReport:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "metrics_revision": METRICS_REVISION,
             "corpus_id": self.corpus_id,
             "manifest_hash": self.manifest_hash,
             "comparison_identity": self.comparison_identity,
@@ -284,8 +322,12 @@ def evaluate_sample(sample: CorpusSample, root: Path) -> SampleEvaluation:
         "newline": source_doc.newline,
         "has_bom": source_doc.has_bom,
     }
-    machine_quality = _document_quality(machine_doc)
-    gold_quality = _document_quality(gold_doc)
+    source_language = (
+        sample.source_languages[0] if len(sample.source_languages) == 1 else "mixed"
+    )
+    target_language = _target_language(sample.target_language)
+    machine_quality = _document_quality(machine_doc, target_language, source_language)
+    gold_quality = _document_quality(gold_doc, target_language, source_language)
     structure = _structure(machine_doc, gold_doc)
     declared_structure = str(sample.alignment.get("cue_structure", "exact"))
     structure["declared_cue_structure"] = declared_structure

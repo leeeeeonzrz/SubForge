@@ -37,6 +37,7 @@ from subforge.core.translate.guidance import (
     repair_mode_guidance,
     target_language_style_rules,
 )
+from subforge.core.translate.language_text import HANGUL_RE, source_tokens
 from subforge.core.translate.quality import (
     ORDERED_CHINESE_BOUNDARY_DETECTORS,
     CanonicalEvidenceSummary,
@@ -1211,7 +1212,7 @@ class LLMTranslator(BaseTranslator):
     @staticmethod
     def _is_disfluent_alignment_fragment(source: str) -> bool:
         """Avoid rewriting short ASR fragments dominated by repeated words."""
-        tokens = re.findall(r"[A-Za-z0-9']+", source.lower())
+        tokens = source_tokens(source)
         if len(tokens) < 3 or len(tokens) > 6:
             return False
         repeated_bigram = any(
@@ -4164,6 +4165,22 @@ Return exactly one JSON object with all and only the current_subtitles keys:
             )
 
         def source_repeats_meaning(left_key: str, right_key: str) -> bool:
+            left_source = subtitle_dict[left_key]
+            right_source = subtitle_dict[right_key]
+            if HANGUL_RE.search(left_source) or HANGUL_RE.search(right_source):
+                # One shared Korean name, pronoun, or topic word does not prove
+                # that the speaker repeated the neighboring proposition.
+                left_words = source_tokens(left_source)
+                right_words = source_tokens(right_source)
+                left_unique_runs = [
+                    word for index, word in enumerate(left_words)
+                    if not index or word != left_words[index - 1]
+                ]
+                right_unique_runs = [
+                    word for index, word in enumerate(right_words)
+                    if not index or word != right_words[index - 1]
+                ]
+                return bool(left_unique_runs and left_unique_runs == right_unique_runs)
             stopwords = {
                 "a",
                 "an",
@@ -4789,7 +4806,7 @@ Return exactly one JSON object with all and only the current_subtitles keys:
 
     @staticmethod
     def _normalized_source_text(text: str) -> str:
-        return " ".join(re.findall(r"[A-Za-z0-9']+", str(text or "").lower()))
+        return " ".join(source_tokens(text))
 
     def _validate_unexpected_latin_residue(
         self,
@@ -7807,9 +7824,9 @@ Rewrite only the provided translations. Keep every key, timestamp boundary, fact
                     data.index: self._all_speaker_by_index.get(data.index, "") for data in chunk
                 },
                 "prompt_version": (
-                    "context-v42-terminology-boundary-review"
+                    "context-v43-multilingual-conversation-review"
                     if self._is_multispeaker_document()
-                    else "context-v36-terminology-boundary-review"
+                    else "context-v37-multilingual-conversation-review"
                 ),
             }
         )

@@ -169,7 +169,8 @@ def coverage_issue_message(issues: list[dict]) -> str:
     ranges = coverage_review_ranges(issues)
     label = (
         "Subtitle audio evidence"
-        if any(i.get("reason") == "suspected_non_speech_text" for i in issues)
+        if any(i.get("reason") in {"suspected_non_speech_text", "suspected_repetition"}
+               for i in issues)
         else "Speech coverage"
     )
     return f"{label} needs review ({len(issues)} region(s)): {ranges}. Partial subtitles have been preserved."
