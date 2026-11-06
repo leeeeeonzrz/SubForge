@@ -9,7 +9,7 @@
 - 本次使用保留双方历史的 merge，合并提交为 `61abcae126609b6427b6c4960ea136723a620260`。
 - 恢复分支：`codex/backup-before-upstream-20261106` 和 `codex/backup-with-korean-before-v1.3.9-20261106`。
 - 本地 `master` 快进至上游提交；开发继续使用 `codex/windows-main`。
-- 旧工作区程序目录保留在 `artifacts/SubForge-before-v1.3.9-20261106`；旧安装包保留。
+- 旧工作区程序目录曾备份到 `artifacts/SubForge-before-v1.3.9-20261106`；完成安装包验证后按用户要求清理重复展开目录，旧安装包和源码恢复分支保留。
 
 ## 合入和保留
 
@@ -60,3 +60,9 @@ Inno Setup 6.7.3 编译成功，耗时 421.843 秒；安装器产品版本正确
 Windows 默认未包含 TEN-VAD 原生库。上游通用循环自动替换要求 TEN 与 Silero 的独立证据，因此缺少 TEN 时保留原文并提示复核；不宣称该路径已在 Windows 自动修复所有循环。原有韩语 Silero 与独立词对齐路径保留。
 
 离线回归和短音频运行检查不代表整场直播准确率保证；没有付费在线翻译或整片人工语义验收。
+
+## 打包后清理
+
+按用户要求完成精确白名单清理：123 个目标、79,943 个文件，逻辑删除约 16.30 GiB，0 失败。清理新旧程序重复展开目录、构建和测试缓存，以及 C/D 盘已确认的五个专属临时目录；全部安装包、必要环境、模型、用户数据和正式构建工具均保留。D 盘可用空间实测增加约 16.34 GiB；两盘同期净增加约 16.22 GiB，逻辑删除量与磁盘净变化分别记录。
+
+清理删除完成后，保护目录指纹、源码和安装包 SHA-256、Git 引用及工作区状态全部与删除前一致；随后仅更新本文说明。Python 环境、FFmpeg/FFprobe 和 Node 版本检查正常。详细记录：`artifacts/cleanup-20261106/cleanup-report.md`，逐项证据：`execution.json` 和 `protection-verification.json`。
