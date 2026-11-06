@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.3.9-windows.1 - 2026-11-06
+
+- Merge upstream v1.3.8-v1.3.9 subtitle structure, terminology and recovery improvements while preserving Windows CUDA/CPU, multilingual supplementation, Korean conversation safeguards, three subtitle outputs and preview protection.
+- Retain the free-model panel, hardware status and model recommendation controls alongside the upstream local request protections.
+
 ## v1.3.7-windows.2 - 2026-10-18
 
 ### Windows audio decoding and upstream integration
@@ -14,6 +19,59 @@
 - Verified full-length denoising/chunking of the reported input, real 24-second WhisperX CUDA transcription with Korean alignment, and overwrite installation preserving settings and model files. This does not claim full-video transcription or paid translation validation.
 - Python regression coverage totals 3116 passing cases across the main run and six environment-corrected reruns; 17 skipped and 35 external integration tests deselected. Ruff passed and targeted Pyright reported no errors.
 - Windows Start search may still omit the application on the tested machine; use the desktop shortcut or installed executable. This release does not claim to repair Windows search indexing.
+## v1.3.9 - 2026-10-29
+
+### Opening presentations and complete vehicle identifiers
+
+- Separate a greeting/channel introduction from the following vehicle presentation using original word timings. Allow the short opening to change cue count, so the complete vehicle can occupy one cue and its generation/flagship description can follow separately.
+- Protect brand/model identifiers, spaced letter/number identifiers and drive labels from being split. Recognize complete vehicle appositions and scoped channel introductions as valid boundaries, so later normalization retains the intended layout.
+- Feed the configured CJK reading budget into LLM translation. Try one compact rewrite of an overlong opening, retaining confirmed terminology and accepting it only after ownership, identifier, numeric and independent fidelity checks. Preserve faithful overflow with a review notice rather than truncate facts.
+- Recognize a number before sentence-final punctuation as owned by that source cue. Repeated model/calendar years no longer trigger a false cross-key duplication error; genuine borrowing and decimal-prefix protection remain covered.
+- Replay the reported Lexus opening from four source layouts, with exact word/timing retention, idempotence, speaker/language/pause guards, multilingual identifiers, rejected rewrite and cancellation regressions. A bounded 38-second official `deepseek-flash` production run preserves every opening source token and keeps `2026 Lexus ES350H Premium All-Wheel Drive` in one cue. The opening becomes four cues; the model translation is 17 reading units against a soft target of 16, with facts preserved.
+
+### Syntax units, Chinese structure and reliable recovery
+
+- Plan a variable number of cues around evidenced source phrase breaks. Keep conditional complements, modal/adverb/action groups, engine specifications, nominal heads and vehicle identifiers together, using unchanged raw words and timestamps. Preserve speaker, language, pause and provenance guards.
+- Make source-backed Chinese structure defects mandatory review candidates, including stranded modifiers, conditions, qualification phrases, split engine terms and duplicated clause frames. Exclude complete disposal predicates, compound words and independently timed spoken hesitations from hard error rules. Move an adversative across a pause only with explicit source support and independent ownership/fidelity validation.
+- Resolve physical up/down pronouns from nearby lift, window or roof context. Reject an event-happening translation when that source evidence instead establishes a physical lowering or raising action.
+- Accept an exact, ordered enumeration of model identifiers without requiring invented Chinese filler; reject changed/reordered names and ordinary English prose.
+- Review intact recovery regions independently when a genuinely missing cue prevents whole-document completion. Preserve the last usable checkpoint if finalization fails, propagate cancellation, avoid further review calls after provider failure, and expose missing, reviewed, unchecked and unresolved items in task results and the desktop UI.
+- Validation: 3309 local Python tests and 77 frontend tests passed; 35 external integration tests were deselected. Ruff, frontend lint/build and Pyright (0 errors, 29 existing warnings) passed. Official `deepseek-flash` production replays cover the full 5691-word Porsche transcript and 11 reported/additional windows. The final replay bypassed local response caches and produced 623 bilingual cues; after correcting the last numeric-rule false positive, the unchanged output passes all 622 mandatory boundary checks. Preserve 130 cues over the soft CJK reading target rather than remove facts.
+- Distribute the locally built Apple Silicon DMG and the standard Windows x64 EXE built by GitHub Actions. Validate both the packaged and installed runtime before publication. Model weights remain separate; macOS uses ad-hoc signing without Apple notarization.
+
+## v1.3.8 - 2026-10-27
+
+### Transcription hallucination review
+
+- Detect repeated phrases across word-level cues before WhisperX transcription is exported. Review suspect spans against original audio using two different local decoding contexts and independent speech detectors. Preserve genuine repetitions and short replies; uncertain spans retain their text in a recovery file and require review.
+- Bound acoustic review, bypass ASR cache, propagate cancellation, and protect verified non-speech holes from gap recovery while retaining nearby voices.
+- Add the human-confirmed Roush Mustang regression: 20 invented “Are we recording now?” phrases are replaced by the corroborated “Oh yeah.” reply, with every word outside that interval unchanged. The final speech coverage audit passes on the full recording.
+
+### Processing and local API reliability
+
+- Block transcription and translation before they can replace unsaved subtitle edits, preserving the document and undo history.
+- Validate loopback Host and browser Origin for HTTP and WebSocket requests. Reject cross-site requests, preserve same-origin access on dynamic desktop ports, and allow the port 3000 development frontend only in source builds.
+- Keep loopback health and access-protection checks independent of system proxies. Packaged runtime checks verify that rejected writes leave a disposable subtitle unchanged and normal writes still work.
+- Validate the selected managed alignment model and let custom alignment models load without requiring the language's default model.
+- Enforce the web-research deadline during connection and response streaming. Close active transports on timeout or cancellation, and reject late responses before caching.
+
+### Automatic web terminology verification
+
+- Automatically verify terminology through DeepSeek Search/Fetch before LLM translation on authenticated official DeepSeek clients, without a separate switch. Keep source citations, a separate seven-day evidence cache, and a maximum of three searches plus two fetches per task. Reuse returned page content; tool failures fall back to ordinary translation.
+- Apply verified names only to the subtitle that owns the observed phrase. Evidence cannot change spoken numbers, model years or specifications and does not rewrite original subtitle text. Preserve sources, accepted terms and request counts in task results; other providers never send credentials to these tools.
+- Default new DeepSeek profiles to the official `deepseek-flash` model name while preserving existing selections and third-party provider IDs. Add a bounded, opt-in live A/B evaluation command using the production translation pipeline.
+
+### Settings cleanup
+
+- Fix the additional-language transcription switch's pill shape and click target while preserving on/off and unsupported-device behavior.
+- Remove the unnecessary model recommendation button and the transcription hardware-status panel.
+- Remove the free-model module, including web/native navigation, frontend API types, backend routes, scanner service and its unused profile-status helper.
+
+### Validation and distribution
+
+- 3153 local Python tests passed; 35 external integration tests were deselected. All 72 frontend tests, frontend lint, production build and Ruff passed; Pyright reported 0 errors and 29 existing warnings. Regression coverage includes repetitions, original audio, genuine replies, conflicting evidence, cancellation, budgets, cache bypass, recovery handoff, unsaved edits, local request protection, custom alignment and interrupted web responses.
+- Original-audio decoding and the full-recording final speech coverage audit passed for the reported repetition. Native UI checks cover preserved edits and corrected bilingual subtitle import. These checks do not establish universal transcription or translation accuracy.
+- Distribute the Apple Silicon DMG built locally and the standard Windows x64 EXE built by GitHub Actions. Both packaged and installed runtime checks are required before publication. Model weights remain separate; macOS signing is ad hoc, without Apple notarization.
 
 ## v1.3.7 - 2026-10-17
 

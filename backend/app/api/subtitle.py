@@ -355,6 +355,7 @@ def _recovery_result(
     recovery_path: Path | None,
     warnings: list[str],
     pipeline_identity: TranslationPipelineIdentity,
+    translator: object = None,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {}
     if recovery_path is not None:
@@ -363,6 +364,7 @@ def _recovery_result(
         result["warnings"] = list(warnings)
     if pipeline_identity.is_candidate:
         result["pipeline"] = pipeline_identity.result_metadata()
+    result.update(_translation_quality_metadata(translator))
     return result
 
 
@@ -408,6 +410,41 @@ async def _refine_subtitle_timing(req, asr_data, timing_speech_segments, timing_
     )
 
 
+def _translation_quality_metadata(translator: object) -> dict[str, Any]:
+    review = {
+        name: value for name, value in (
+            ("recovery", getattr(translator, "recovery_review", None)),
+            ("structure", getattr(translator, "structure_review", None)),
+        ) if isinstance(value, dict) and value
+    }
+    return {"quality_review": review} if review else {}
+
+
+def _web_research_metadata(report: dict, warnings: list[str]) -> dict:
+    if report.get("status") in {"unavailable", "unsupported_provider"}:
+        warnings.append("联网术语核实未完成，已继续使用原文上下文翻译。")
+    return {"web_research": report} if report else {}
+
+
+def _readability_warnings(translator: object) -> list[str]:
+    issues = getattr(translator, "readability_issues", [])
+    return (
+        [
+            f"{len(issues)} translated cue(s) exceed the configured CJK reading budget; "
+            "names and facts were preserved for review."
+        ]
+        if issues
+        else []
+    )
+
+
+def _structure_warnings(translator: object) -> list[str]:
+    review = getattr(translator, "structure_review", {})
+    if not isinstance(review, dict) or not review.get("unresolved_boundaries"):
+        return []
+    indices = review["unresolved_boundaries"]
+    return ["字幕结构仍需复核：第 " + "、".join(map(str, indices[:20])) + ("…" if len(indices) > 20 else "") + " 条附近。"]
+
 
 async def _run_subtitle(
     task_id: str,
@@ -426,6 +463,7 @@ async def _run_subtitle(
     timing_speech_segments: list[tuple[int, int]] = []
     timing_media_duration_ms: int | None = None
     pipeline_warnings: list[str] = []
+    web_research_report: dict[str, Any] = {}
     identity_supplied = pipeline_identity is not None
     pipeline_identity = pipeline_identity or LEGACY_TRANSLATION_PIPELINE
     context = create_pipeline_context(task_id)
@@ -763,6 +801,7 @@ async def _run_subtitle(
                     ),
                 )
                 context.checkpoint()
+                web_research_report = translation_context.research_report
                 context.report(65, "Translating subtitles...")
             source_lock = lock_source_segments(asr_data)
             translator = TranslatorFactory.create_translator(
@@ -778,6 +817,7 @@ async def _run_subtitle(
                 cache_namespace=pipeline_identity.cache_namespace,
                 pipeline_identity=pipeline_identity,
                 translation_context=translation_context,
+                max_word_count_cjk=max_word_count_cjk,
                 llm_client=llm_client,
                 azure_translator_key=get_config_value("azure_translator_key", ""),
                 azure_translator_region=get_config_value("azure_translator_region", ""),
@@ -787,6 +827,8 @@ async def _run_subtitle(
                 ),
             )
             asr_data = await _run_stage(translator, translator.translate_subtitle, asr_data)
+            pipeline_warnings.extend(_readability_warnings(translator))
+            pipeline_warnings.extend(_structure_warnings(translator))
             context.checkpoint()
             context.report(90, "Translation complete")
 
@@ -852,6 +894,7 @@ async def _run_subtitle(
             message="Subtitle files saved",
         )
         final_preview_revision = task_manager.get_preview_revision(task_id)
+        web_metadata = _web_research_metadata(web_research_report, pipeline_warnings)
         completion_message = "Done with processing warnings" if pipeline_warnings else "Done"
         context.report(100, completion_message)
         completion_result: dict[str, Any] = {
@@ -861,6 +904,8 @@ async def _run_subtitle(
             "segments": final_preview,
             "warnings": pipeline_warnings,
         }
+        completion_result.update(web_metadata)
+        completion_result.update(_translation_quality_metadata(translator))
         if pipeline_identity.is_candidate:
             completion_result["pipeline"] = pipeline_identity.result_metadata()
             telemetry_path = _write_candidate_telemetry(
@@ -884,7 +929,7 @@ async def _run_subtitle(
         if recovery_path:
             task_manager.finalize_cancelled_task(
                 task_id,
-                _recovery_result(recovery_path, pipeline_warnings, pipeline_identity),
+                _recovery_result(recovery_path, pipeline_warnings, pipeline_identity, translator),
                 preview_segments=subtitle_preview_segments(asr_data),
             )
         else:
@@ -904,7 +949,7 @@ async def _run_subtitle(
                 subtitle_file=str(recovery_path),
                 message="Translation failed; partial result saved",
             )
-        failure_result = _recovery_result(recovery_path, pipeline_warnings, pipeline_identity)
+        failure_result = _recovery_result(recovery_path, pipeline_warnings, pipeline_identity, translator)
         if pipeline_identity.is_candidate:
             if recovery_path is not None:
                 telemetry_path = _write_candidate_telemetry(

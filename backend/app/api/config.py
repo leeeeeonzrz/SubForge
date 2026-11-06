@@ -29,6 +29,7 @@ from subforge.settings.credentials import (
     restore_secret_value,
     usable_secret_value,
 )
+from subforge.settings.llm import LLM_RECOMMENDED_MODELS
 
 router = APIRouter()
 
@@ -169,6 +170,8 @@ def _repair_llm_profile(provider: str, profile: dict[str, str]) -> dict[str, str
         )
     except ValueError:
         repaired["model"] = ""
+    if not repaired["model"]:
+        repaired["model"] = LLM_RECOMMENDED_MODELS.get(provider, "")
     return repaired
 
 

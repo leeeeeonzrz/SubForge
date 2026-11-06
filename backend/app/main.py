@@ -22,6 +22,7 @@ from app.api import (  # noqa: E402
     transcribe,
     websocket,
 )
+from app.local_access import LocalRequestGuard  # noqa: E402
 from subforge.config import VERSION  # noqa: E402
 
 
@@ -59,6 +60,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(LocalRequestGuard, allow_dev_frontend=not getattr(sys, "frozen", False))
 
 # API routes
 app.include_router(tasks.router, prefix="/api/tasks", tags=["tasks"])

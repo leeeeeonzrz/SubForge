@@ -1,155 +1,288 @@
-"""Nominate severe Korean decoder loops without deleting repeated speech.
-
-Text patterns are review triggers only. Automatic recovery additionally needs
-the original audio, agreeing local decodes and the surrounding lexical anchors.
-"""
+"""Review decoder loops against unmodified audio before exporting word timelines."""
 
 from __future__ import annotations
 
-import math
-import re
-import unicodedata
+import copy
+import logging
+import tempfile
 from dataclasses import dataclass
+from pathlib import Path
+
+from subforge.core.translate.language_text import HANGUL_RE
 
 from .asr_data import ASRData
+from .final_coverage import _checkpoint, _corroborates_repair, _save_evidence, _words
+from .speech_gap_repair import keys, word_key
 
-# A dozen cycles excludes ordinary replies, emphasis and Korean reduplication.
-# Match syllables, not laughter jamo (ㅋㅋ/ㅎㅎ), and tolerate ASR spacing.
-_LOOP = re.compile(r"([가-힣]{1,4}?)\1{11,}")
-_SEMANTIC_SHORT_EXPRESSIONS = {"네", "예", "응", "안", "못"}
-
-
-def _key(text: str) -> str:
-    return "".join(re.findall(r"\w+", unicodedata.normalize("NFC", text).casefold()))
+logger = logging.getLogger(__name__)
+MAX_REVIEWS = 3
+MAX_DECODE_SECONDS = 180
+MAX_LOOP_MS = 45_000
 
 
 @dataclass(frozen=True)
-class RepetitionRange:
-    start: float
-    end: float
-    reason: str = "suspected_repetition"
+class Repetition:
+    first: int
+    stop: int
+    phrase: tuple[str, ...]
+    repeats: int
 
 
-def repetition_ranges(data: ASRData) -> list[RepetitionRange]:
-    """Find local syllable loops even when timestamps already cover the audio."""
-    groups: list[list] = []
-    for segment in data.segments:
-        if not groups or segment.start_time - groups[-1][-1].end_time > 1200:
-            groups.append([])
-        groups[-1].append(segment)
-    result: list[RepetitionRange] = []
-    for group in groups:
-        text, owners = [], []
-        for index, segment in enumerate(group):
-            key = _key(segment.text)
-            text.append(key)
-            owners.extend([index] * len(key))
-        for match in _LOOP.finditer("".join(text)):
-            first, last = group[owners[match.start()]], group[owners[match.end() - 1]]
-            start, end = first.start_time / 1000, last.end_time / 1000
-            if end <= start:
-                continue
-            if result and start <= result[-1].end:
-                result[-1] = RepetitionRange(result[-1].start, max(end, result[-1].end))
-            else:
-                result.append(RepetitionRange(start, end))
-    return result
+def candidates(data: ASRData) -> list[Repetition]:
+    """Nominate multiword loops, including loops split into atomic word cues.
 
-
-def mark_repetitions_for_review(data: ASRData) -> ASRData:
-    """Keep original text for engines without safe local acoustic recovery."""
-    for region in repetition_ranges(data):
-        issue = {"start": region.start, "end": region.end, "reason": region.reason}
-        if issue not in data.coverage_issues:
-            data.coverage_issues.append(issue)
-    return data
-
-
-def _overlap(start: int, end: int, ranges: list[tuple[int, int]]) -> int:
-    total, last = 0, start
-    for left, right in sorted(ranges):
-        left, right = max(start, left), min(end, right)
-        if right > left:
-            total += max(0, right - max(last, left))
-            last = max(last, right)
-    return total
-
-
-def validate_repetition_replacement(original, replacement, region, context) -> dict:
-    """Reject speculative cleanup, lost context, silence and weak alignment.
-
-    Two identical ASR answers alone cannot prove a loop is false. Require diverse
-    new Korean speech aligned by the separate forced-alignment model and
-    supported by Silero VAD. Check TEN-VAD too when the platform provides it.
-    Never replace a long loop with an empty span or merely fewer filler tokens.
+    Text alone never authorizes removal. Short emphatic repeats and stutters do
+    not spend the acoustic review budget. No particular phrase is blacklisted.
     """
-    old_text = _key(" ".join(segment.text for segment in original))
-    new_text = _key(" ".join(segment.text for segment in replacement))
-    if not _LOOP.search(old_text) or _LOOP.search(new_text):
-        raise ValueError("Local recognition still contains repeated speech")
-    cursor = 0
-    # Everything outside the suspect cycles must survive, including short
-    # answers, names, numbers and emphasis in the same subtitle cue.
-    for piece in _LOOP.split(old_text)[::2]:
-        if piece:
-            cursor = new_text.find(piece, cursor)
-            if cursor < 0:
-                raise ValueError("Repetition recovery would lose original content")
-            cursor += len(piece)
-    disputed = [
-        segment for segment in replacement
-        if segment.start_time < region.end * 1000 and segment.end_time > region.start * 1000
-    ]
-    keys = [_key(segment.text) for segment in disputed]
-    # Keep meaningful repeated expressions within the disputed audio itself.
-    # A neighboring reply, or the 네 inside 동네, cannot preserve a lost "yes".
-    for match in _LOOP.finditer(old_text):
-        expression = match[1]
-        if expression in _SEMANTIC_SHORT_EXPRESSIONS:
-            preserved = expression in keys
-        elif len(expression) > 1:
-            preserved = any(expression in key for key in keys)
+    if not data.is_word_timestamp():
+        return []
+    segments = data.segments
+    tokens = [word_key({"text": s.text}) for s in segments]
+    found = []
+    index = 0
+    while index < len(tokens):
+        best = None
+        for width in range(1, 13):
+            phrase = tokens[index : index + width]
+            if len(phrase) < width or not all(phrase):
+                break
+            if any(
+                not 0 <= segments[j].start_time - segments[j - 1].end_time <= 10_000
+                for j in range(index + 1, index + width)
+            ):
+                break
+            stop = index + width
+            while (
+                tokens[stop : stop + width] == phrase
+                and all(
+                    0 <= segments[j].start_time - segments[j - 1].end_time <= 10_000
+                    for j in range(max(index + 1, stop), stop + width)
+                )
+            ):
+                stop += width
+            repeats = (stop - index) // width
+            if (
+                repeats >= (8 if width == 1 else 4)
+                and stop - index >= 12
+                and segments[stop - 1].end_time - segments[index].start_time >= 5000
+                and (best is None or stop > best.stop)
+            ):
+                best = Repetition(index, stop, tuple(phrase), repeats)
+        if best is None:
+            index += 1
         else:
-            continue
-        if not preserved:
-            raise ValueError("Repetition recovery would lose a repeated expression")
-    lexical = [key for key in keys if re.search(r"[가-힣]", key)]
-    if len(set(lexical)) < 3 or sum(len(key) for key in lexical) < 6:
-        raise ValueError("Repeated speech has no substantial corroborated replacement")
-    scores = []
-    for segment in disputed:
-        if not segment.words:
-            raise ValueError("Repetition recovery lacks word alignment evidence")
-        for word in segment.words:
-            score = word.alignment_score
-            if score is None or not math.isfinite(score) or score < 0.45:
-                raise ValueError("Repetition recovery has weak word alignment")
-            scores.append(score)
-    if not scores or sum(scores) / len(scores) < 0.65:
-        raise ValueError("Repetition recovery has weak aggregate alignment")
+            found.append(best)
+            index = best.stop
+    return found
 
+
+def _speech_ranges(context, start, end):
     from . import silero_vad, ten_vad
 
-    if not silero_vad.is_available():
-        raise ValueError("Speech detector unavailable for repetition recovery")
-    backends = [(silero_vad, 0.35, "silero")]
-    if ten_vad.is_available():
-        backends.append((ten_vad, 0.5, "ten"))
-    left = max(0, round(region.start * 1000) - 500)
-    right = min(len(context.samples()) // 16, round(region.end * 1000) + 500)
-    samples = context.samples()[left * 16:right * 16]
-    for backend, threshold, _name in backends:
-        ranges = backend.run_vad_inference(
-            samples, sample_rate=16000, threshold=threshold,
-            min_speech_ms=100, min_silence_ms=180, speech_pad_ms=0,
-        )
-        ranges = [(a + left, b + left) for a, b in ranges]
-        for segment in disputed:
-            start, end = max(left, segment.start_time), min(right, segment.end_time)
-            if end <= start or _overlap(start, end, ranges) < (end - start) * 0.3:
-                raise ValueError("Repetition replacement lacks speech support")
-    return {
-        "vad_backends": [name for _backend, _threshold, name in backends],
-        "minimum_alignment_score": min(scores),
-        "mean_alignment_score": sum(scores) / len(scores),
-    }
+    if not ten_vad.is_available() or not silero_vad.is_available():
+        raise RuntimeError("Independent speech detectors unavailable")
+    left, right = max(0, start - 1000), min(len(context.samples()) // 16, end + 1000)
+    samples = context.samples()[left * 16 : right * 16]
+    results = {}
+    for name, backend, threshold in (
+        ("strict", ten_vad, 0.75),
+        ("independent", silero_vad, 0.35),
+    ):
+        results[name] = [
+            (a + left, b + left)
+            for a, b in backend.run_vad_inference(
+                samples,
+                sample_rate=16000,
+                threshold=threshold,
+                min_speech_ms=100,
+                min_silence_ms=180,
+                speech_pad_ms=0,
+            )
+        ]
+    return results
+
+
+def _decode(context, left, right, config, factory):
+    """Decode original audio in an isolated worker; never denoise or reuse ASR cache."""
+    _checkpoint(config)
+    with tempfile.TemporaryDirectory(prefix="subforge-repetition-") as temp:
+        path = Path(temp) / "original.wav"
+        context.audio_segment()[left:right].export(str(path), format="wav").close()
+        asr = factory(str(path), config)
+        asr.use_cache = False
+        if getattr(asr, "uses_mlx", False):
+            from .whisperx_asr import _prepare_mlx_model_path
+
+            model = _prepare_mlx_model_path(asr.mlx_model, Path(temp))
+            result = asr._transcribe_mlx_in_worker(str(path), model, lambda *a: _checkpoint(config))
+            if result.get("coverage_issues"):
+                raise ValueError("Original-audio recognition still needs review")
+            decoded = ASRData(asr._make_segments(result))
+        else:
+            decoded = asr.run(callback=lambda *a: _checkpoint(config))
+    _checkpoint(config)
+    if decoded.coverage_issues or (decoded.segments and not decoded.is_word_timestamp()):
+        raise ValueError("Original-audio recognition did not return a verified word timeline")
+    decoded.clip_to_media_duration(right - left)
+    decoded.fix_boundary_overlaps()
+    for segment in decoded.segments:
+        segment.start_time += left
+        segment.end_time += left
+        for word in segment.words:
+            word.start_time += left
+            word.end_time += left
+    return decoded
+
+
+def _uncovered(start, end, covered):
+    pieces = [(start, end)]
+    for left, right in sorted(covered):
+        pieces = [
+            (a, b)
+            for lo, hi in pieces
+            for a, b in ((lo, min(hi, left)), (max(lo, right), hi))
+            if b > a
+        ]
+    return pieces
+
+
+def _validate_replacement(old, first, second, speech, neighbors):
+    if first.segments or second.segments:
+        if not _corroborates_repair(_words(first), _words(second)):
+            raise ValueError("Original-audio context decodes disagree")
+    old_keys, new_keys = keys(_words(old)), keys(_words(first))
+    if old_keys != new_keys and len(new_keys) > len(old_keys) // 2:
+        raise ValueError("Context decodes did not resolve the repetition loop")
+
+    # A speech detector cannot tell which words were spoken. Conversely, two
+    # identical empty decodes cannot authorize deleting a quieter real voice.
+    # Every detected voice must remain covered, and every retained word group
+    # needs acoustic support. The short margin tolerates VAD onset/offset drift.
+    voiced = [r for ranges in speech.values() for r in ranges]
+    groups = []
+    for segment in first.segments:
+        if not groups or segment.start_time - groups[-1][-1].end_time > 900:
+            groups.append([])
+        groups[-1].append(segment)
+    for group in groups:
+        left, right = group[0].start_time - 350, group[-1].end_time + 350
+        if not any(min(right, b) - max(left, a) >= 80 for a, b in voiced):
+            raise ValueError("Replacement words have no independent speech support")
+    covered = [(s.start_time - 350, s.end_time + 350) for s in [*first.segments, *neighbors]]
+    start, end = old.segments[0].start_time, old.segments[-1].end_time
+    for a, b in voiced:
+        left, right = max(start, a), min(end, b)
+        if right > left and sum(y - x for x, y in _uncovered(left, right, covered)) >= 100:
+            raise ValueError("Replacement would discard detected speech")
+    return old_keys != new_keys
+
+
+def review_repetitions(
+    data, audio_path, config, callback, factory, analysis_context=None,
+    *, max_reviews=None, max_decode_seconds=None,
+):
+    """Repair corroborated loops; retain and flag anything acoustically uncertain."""
+    from .audio_analysis import AudioAnalysisContext
+
+    suspects = candidates(data)
+    if not suspects:
+        return data
+    records, decoded_seconds = [], 0
+    review_limit = MAX_REVIEWS if max_reviews is None else min(MAX_REVIEWS, max_reviews)
+    decode_limit = MAX_DECODE_SECONDS if max_decode_seconds is None else min(MAX_DECODE_SECONDS, max_decode_seconds)
+    attempts = 0
+    original = list(data.segments)
+    context = analysis_context
+    for suspect in suspects:
+        _checkpoint(config)
+        group = original[suspect.first : suspect.stop]
+        start, end = group[0].start_time, group[-1].end_time
+        record = {
+            "stage": "repetition_review",
+            "start": start / 1000,
+            "end": end / 1000,
+            "phrase": list(suspect.phrase),
+            "repeats": suspect.repeats,
+            "status": "needs_review",
+        }
+        records.append(record)
+        try:
+            if any(HANGUL_RE.search(segment.text) for segment in group):
+                # Korean short replies, negation and repeated emphasis require
+                # the stricter aligned-word checks in final_coverage. Never
+                # erase them through generic empty/short context decodes.
+                raise ValueError("Korean repeated speech requires strict semantic and alignment review")
+            if attempts >= review_limit or end - start > MAX_LOOP_MS:
+                raise ValueError("Repetition review budget exhausted")
+            if context is None or context.audio_path != audio_path:
+                context = AudioAnalysisContext(audio_path)
+            duration = len(context.samples()) // 16
+            # Millisecond differences in forced alignment should not shift the
+            # decoder's entire audio window. Use stable whole-second boundaries
+            # while keeping the complete suspect interval in both contexts.
+            anchor_start, anchor_end = ((value + 999) // 1000 * 1000 for value in (start, end))
+            windows = [
+                (max(0, anchor_start - pad), min(duration, anchor_end + pad))
+                for pad in (6000, 10000)
+            ]
+            cost = sum(right - left for left, right in windows) / 1000
+            if windows[0] == windows[1] or decoded_seconds + cost > decode_limit:
+                raise ValueError("Independent repetition review windows unavailable")
+            attempts += 1
+            decoded_seconds += cost
+            speech = _speech_ranges(context, start, end)
+            _checkpoint(config)
+            callback(95, "Checking repeated subtitles against original audio...")
+            decodes = []
+            for left, right in windows:
+                decoded = _decode(context, left, right, config, factory)
+                _checkpoint(config)
+                if any(
+                    s.start_time < start < s.end_time or s.start_time < end < s.end_time
+                    for s in decoded.segments
+                ):
+                    raise ValueError("A decoded word crosses the repetition repair boundary")
+                # Do not rewrite neighboring phrases merely because a local
+                # decoder chose a different pronoun or punctuation there.
+                decoded.segments = [
+                    s for s in decoded.segments if s.start_time >= start and s.end_time <= end
+                ]
+                decodes.append(decoded)
+            record.update(
+                windows=[[a / 1000, b / 1000] for a, b in windows],
+                speech=speech,
+                decodes=[_words(d) for d in decodes],
+            )
+            old = ASRData(group)
+            neighbors = original[max(0, suspect.first - 2) : suspect.first] + original[
+                suspect.stop : suspect.stop + 2
+            ]
+            changed = _validate_replacement(old, *decodes, speech, neighbors)
+            if changed:
+                removed_ids = {id(s) for s in group}
+                data.segments = [s for s in data.segments if id(s) not in removed_ids]
+                replacement = copy.deepcopy(decodes[0].segments)
+                data.segments.extend(replacement)
+                data.segments.sort(key=lambda s: s.start_time)
+                # Protect only non-speech holes. Resumed speech and genuine short
+                # replies must remain eligible for the final coverage repair.
+                protected = [(a - 500, b + 500) for ranges in speech.values() for a, b in ranges]
+                protected += [(s.start_time - 500, s.end_time + 500) for s in [*replacement, *neighbors]]
+                data.confirmed_non_speech_ranges.extend(
+                    {"start": a / 1000, "end": b / 1000}
+                    for a, b in _uncovered(start, end, protected)
+                )
+                logger.warning("Repaired ASR repetition %.3f-%.3fs (%d repeats)", start / 1000, end / 1000, suspect.repeats)
+            record["status"] = "repaired" if changed else "confirmed_speech"
+        except Exception as exc:
+            _checkpoint(config)
+            record["error"] = str(exc)
+            issue = {"start": start / 1000, "end": end / 1000, "reason": "suspected_repetition"}
+            if issue not in data.coverage_issues:
+                data.coverage_issues.append(issue)
+            logger.warning("ASR repetition needs review %.3f-%.3fs: %s", start / 1000, end / 1000, exc)
+    try:
+        _save_evidence(records)
+    except Exception:
+        logger.warning("Unable to save repetition review evidence", exc_info=True)
+    return data

@@ -12,7 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .asr_data import ASRData, reasonable_word_duration_ms
-from .repetition_review import (
+from .korean_repetition_review import (
     RepetitionRange,
     mark_repetitions_for_review,
     repetition_ranges,
@@ -344,7 +344,9 @@ def repair_final_coverage(data, audio_path, config, callback, factory, analysis_
     # Preserve the established missing-speech budget priority. A long recording
     # may contain many review-only chants before a genuinely missing sentence.
     targets = [*gaps, *repetitions]
-    if not targets:
+    from .repetition_review import candidates, review_repetitions
+
+    if not targets and not candidates(data):
         return data
     duration_ms = round(len(samples) / 16)
     decoded_seconds = 0
@@ -463,6 +465,14 @@ def repair_final_coverage(data, audio_path, config, callback, factory, analysis_
             _checkpoint(config)
             record.update(status="needs_review", error=str(exc))
             logger.warning("Final speech recovery %.3f-%.3fs: %s", gap.start, gap.end, exc)
+    # Genuine missing speech and Korean loops use the established strict path
+    # first. Generic loops may spend only its remaining budget, so adding the
+    # upstream review cannot double work or bypass Korean semantic safeguards.
+    data = review_repetitions(
+        data, audio_path, config, callback, factory, analysis_context=context,
+        max_reviews=max(0, MAX_WINDOWS - attempts),
+        max_decode_seconds=max(0, MAX_DECODE_SECONDS - decoded_seconds),
+    )
     # No timeline mutation may follow this check (speaker labels are safe).
     try:
         remaining = _audit(data, samples)
@@ -474,7 +484,11 @@ def repair_final_coverage(data, audio_path, config, callback, factory, analysis_
         )
         remaining = current
     for gap in remaining:
-        if not any(i["start"] <= gap.start and i["end"] >= gap.end for i in data.coverage_issues):
+        if not any(
+            i["start"] <= gap.start and i["end"] >= gap.end
+            and i.get("reason") not in {"suspected_non_speech_text", "suspected_repetition"}
+            for i in data.coverage_issues
+        ):
             data.coverage_issues.append({**asdict(gap), "reason": "final_export_gap"})
     mark_repetitions_for_review(data)
     try:

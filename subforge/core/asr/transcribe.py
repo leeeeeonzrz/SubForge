@@ -344,7 +344,7 @@ def transcribe(
                 analysis_context=analysis_context,
             )
         else:
-            from subforge.core.asr.repetition_review import mark_repetitions_for_review
+            from subforge.core.asr.korean_repetition_review import mark_repetitions_for_review
 
             asr_data = mark_repetitions_for_review(asr_data)
 

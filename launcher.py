@@ -285,16 +285,74 @@ def _begin_desktop_shutdown(
 def wait_for_server(url: str, server_errors: list[str], timeout_seconds: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout_seconds
     health_url = f"{url}/api/health"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     while time.monotonic() < deadline:
         if server_errors:
             return False
         try:
-            with urllib.request.urlopen(health_url, timeout=0.5) as response:
+            with opener.open(health_url, timeout=0.5) as response:
                 if response.status == 200:
                     return True
         except (OSError, urllib.error.URLError):
             time.sleep(0.1)
     return False
+
+
+def _check_local_api_protection(url: str) -> None:
+    """Exercise write protection using an isolated, disposable subtitle."""
+    import json
+
+    # A system proxy may route a deliberately invalid Host away from loopback.
+    # Local health and protection checks must never leave this computer.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with tempfile.TemporaryDirectory(prefix="subforge-api-access-check-") as folder:
+        path = Path(folder) / "sample.srt"
+        original = b"1\n00:00:00,000 --> 00:00:01,000\nOriginal\n"
+        path.write_bytes(original)
+        # The fork also authorizes exact native file selections. Grant only
+        # this disposable fixture so same-origin checks exercise both guards.
+        from app.security import grant_path
+
+        grant_path(path)
+        payload = json.dumps({
+            "file_path": str(path),
+            "segments": [{"id": 1, "start": "00:00:00.000", "end": "00:00:01.000", "text": "Edited"}],
+        }).encode()
+        blocked_requests = [
+            ({"Host": "attacker.example", "Origin": "http://attacker.example"}, 400),
+            ({"Origin": "https://attacker.example"}, 403),
+            ({"Sec-Fetch-Site": "cross-site"}, 403),
+        ]
+        if getattr(sys, "frozen", False):
+            blocked_requests.append(({"Origin": "http://localhost:3000"}, 403))
+        for headers, expected in blocked_requests:
+            request = urllib.request.Request(
+                f"{url}/api/subtitles/save", data=payload,
+                headers={"Content-Type": "application/json", **headers}, method="POST",
+            )
+            try:
+                with opener.open(request, timeout=5):
+                    raise RuntimeError("Untrusted API write was accepted")
+            except urllib.error.HTTPError as error:
+                if error.code != expected:
+                    raise RuntimeError(f"Unexpected API protection status: {error.code}") from error
+            if path.read_bytes() != original:
+                raise RuntimeError("Rejected API write modified the subtitle")
+        request = urllib.request.Request(
+            f"{url}/api/subtitles/save", data=payload,
+            headers={"Content-Type": "application/json", "Origin": url}, method="POST",
+        )
+        with opener.open(request, timeout=5) as response:
+            saved = json.load(response)
+            files = saved.get("files", {})
+            if (
+                response.status != 200
+                or set(files) != {"original", "translated", "bilingual"}
+                or any("Edited" not in Path(value).read_text(encoding="utf-8-sig") for value in files.values())
+                or path.read_bytes() != original
+            ):
+                raise RuntimeError("Same-origin API write failed")
+    print("Packaged local API access protection: ok")
 
 
 def check_backend_runtime(timeout_seconds: float = 30.0) -> None:
@@ -309,11 +367,14 @@ def check_backend_runtime(timeout_seconds: float = 30.0) -> None:
         daemon=True,
     )
     server_thread.start()
-    if not wait_for_server(url, server_errors, timeout_seconds):
-        detail = server_errors[-1] if server_errors else f"Timed out waiting for backend at {url}"
-        raise RuntimeError(f"SubForge backend failed to start: {detail}")
-    _cleanup_desktop_session(server_holder[0] if server_holder else None)
-    server_thread.join(timeout=5.0)
+    try:
+        if not wait_for_server(url, server_errors, timeout_seconds):
+            detail = server_errors[-1] if server_errors else f"Timed out waiting for backend at {url}"
+            raise RuntimeError(f"SubForge backend failed to start: {detail}")
+        _check_local_api_protection(url)
+    finally:
+        _cleanup_desktop_session(server_holder[0] if server_holder else None)
+        server_thread.join(timeout=5.0)
 
 
 class Api:

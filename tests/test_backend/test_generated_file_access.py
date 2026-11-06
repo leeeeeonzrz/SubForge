@@ -92,7 +92,7 @@ def test_subtitle_output_and_recovery_remain_accessible(external_input, monkeypa
         security.validate_path(str(external_input.with_name("private.txt")))
 
 
-@pytest.mark.parametrize("issue_reason", [None, "context_disagreement", "suspected_non_speech_text", "mixed"])
+@pytest.mark.parametrize("issue_reason", [None, "context_disagreement", "suspected_non_speech_text", "suspected_repetition", "mixed"])
 def test_transcription_output_can_be_loaded_from_external_drive(external_input, monkeypatch, issue_reason):
     video = external_input.with_suffix(".mp4")
     video.touch()
@@ -131,7 +131,7 @@ def test_transcription_output_can_be_loaded_from_external_drive(external_input, 
         assert completed.preview_segments[0]["text"] == "New transcription."
         assert "00:00:10.000 - 00:00:14.200" in completed.error
         assert output.endswith("_recovery.srt")
-    if issue_reason == "suspected_non_speech_text":
+    if issue_reason in {"suspected_non_speech_text", "suspected_repetition"}:
         assert completed.error is None
         assert completed.result["coverage_issues"] == result.coverage_issues
         assert "00:00:10.000 - 00:00:14.200" in completed.result["warning"]

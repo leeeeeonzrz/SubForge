@@ -1,266 +1,351 @@
 import copy
+import json
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from subforge.core.asr import final_coverage as fc
-from subforge.core.asr import repetition_review as rr
+from subforge.core.asr import repetition_review as review
 from subforge.core.asr.asr_data import ASRData, ASRDataSeg
 
 
-def words(items, score=0.9):
-    result = ASRData([
-        ASRDataSeg(text, start, end, timestamp_granularity="word", language_code="ko")
-        for text, start, end in items
-    ])
-    for segment in result.segments:
-        segment.words[0].alignment_score = score
-    return result
+def words(items):
+    return ASRData([ASRDataSeg(t, a, b, timestamp_granularity="word") for t, a, b in items])
 
 
-@pytest.mark.parametrize("text", [
-    "어 " * 12, "어" * 20, "아니 " * 12,
-    "그러니까" * 12, "오늘은 " + "아" * 20 + " 집에 가요",
-    "중국어로 우우라고 " + "삐" * 50,
-    "띠요 띠요띠요 " + "삐" * 50,
-])
-def test_severe_korean_loops_are_candidates_even_without_timestamp_holes(text):
-    data = words([(text, 1000, 6000)])
-    assert rr.repetition_ranges(data) == [rr.RepetitionRange(1, 6)]
-    assert data.segments[0].text == text
+def state(segments):
+    return copy.deepcopy([s.__dict__ for s in segments])
 
 
-@pytest.mark.parametrize("text", [
-    "네", "응", "아", "어", "네 네 네", "아니 아니 아니", "진짜 진짜 좋아요",
-    "아니요 싫어요 그렇게 하면 안 돼요", "반짝반짝 두근두근 소곤소곤",
-    "삐용삐용 구급차 소리", "띠요 띠요띠요 삐삐삐",
-    "ㅋㅋㅋㅋㅋㅋㅋㅋㅋㅋㅋㅋㅋㅋㅋㅋ", "ㅎㅎㅎㅎㅎㅎㅎㅎㅎㅎㅎㅎㅎㅎㅎㅎ",
-    "yes " * 20, "um " * 30, "はい " * 20, "そうそうそうそう", "ありがとうございます",
-])
-def test_short_replies_emphasis_reduplication_laughter_english_japanese_unchanged(text):
-    assert not rr.repetition_ranges(words([(text, 0, 6000)]))
+def loop(phrase="Are we recording now?", repeats=20):
+    tokens = phrase.split()
+    middle = [
+        (text, 10000 + i * 1500 + j * 120, 10100 + i * 1500 + j * 120)
+        for i in range(repeats)
+        for j, text in enumerate(tokens)
+    ]
+    return words([("Second.", 8000, 8500), *middle, ("Well.", 42000, 42400)])
 
 
-def test_separate_replies_do_not_accumulate_into_loop():
-    assert not rr.repetition_ranges(words([
-        ("네", index * 2000, index * 2000 + 300) for index in range(20)
-    ]))
+class Context:
+    audio_path = "original.wav"
 
-
-def test_cross_segment_loop_and_unicode_normalization():
-    import unicodedata
-
-    data = words([(unicodedata.normalize("NFD", "어"), i * 500, i * 500 + 400)
-                  for i in range(20)])
-    assert rr.repetition_ranges(data) == [rr.RepetitionRange(0, 9.9)]
-
-
-def test_marking_does_not_delete_a_real_long_chant_and_is_idempotent():
-    data = words([("사랑해 " * 20, 1000, 15000)])
-    before = copy.deepcopy(data.segments)
-    rr.mark_repetitions_for_review(data)
-    rr.mark_repetitions_for_review(data)
-    assert [s.__dict__ for s in data.segments] == [s.__dict__ for s in before]
-    assert len(data.coverage_issues) == 1
-    assert data.coverage_issues[0]["reason"] == "suspected_repetition"
-
-
-def original():
-    return words([
-        *[(f"앞부분{i}", i * 500, i * 500 + 350) for i in range(20)],
-        *[("어", 10000 + i * 500, 10400 + i * 500) for i in range(12)],
-        *[(f"뒷부분{i}", 16000 + i * 500, 16350 + i * 500) for i in range(24)],
-    ])
-
-
-def repaired():
-    data = original()
-    data.segments = [s for s in data.segments if not 10000 <= s.start_time < 16000]
-    data.segments.extend(words([
-        (text, 10000 + i * 900, 10800 + i * 900)
-        for i, text in enumerate(["오늘은", "여러분이", "보고", "싶어서", "방송을", "켰어요"])
-    ]).segments)
-    data.segments.sort(key=lambda s: s.start_time)
-    return data
+    def samples(self):
+        return np.zeros(50 * 16000, dtype=np.float32)
 
 
 @pytest.fixture
 def setup(monkeypatch):
-    from subforge.core.asr import silero_vad, ten_vad
+    context = Context()
+    config = SimpleNamespace(cancel_event=None)
+    records, windows = [], []
+    monkeypatch.setattr(review, "_save_evidence", lambda r: records.extend(r))
+    monkeypatch.setattr(review, "_speech_ranges", lambda *a: {"strict": [], "independent": []})
 
-    for backend in (silero_vad, ten_vad):
-        monkeypatch.setattr(backend, "is_available", lambda: True)
-        monkeypatch.setattr(backend, "run_vad_inference",
-                            lambda samples, **kwargs: [(0, len(samples) // 16)])
-    samples = np.zeros(40 * 16000, dtype=np.float32)
-    context = SimpleNamespace(audio_path="original.wav", samples=lambda: samples)
-    config = SimpleNamespace(cancel_event=None, whisperx_model="existing-model")
-    records = []
-    monkeypatch.setattr(fc, "_audit", lambda *a: [])
-    monkeypatch.setattr(fc, "_save_evidence", lambda r: records.extend(r))
-    return context, config, records
+    def decode(ctx, left, right, *_):
+        assert ctx is context
+        windows.append((left, right))
+        return words([])
+
+    monkeypatch.setattr(review, "_decode", decode)
+    return SimpleNamespace(context=context, config=config, records=records, windows=windows)
 
 
 def run(data, setup):
-    context, config, _ = setup
-    return fc.repair_final_coverage(data, "original.wav", config, lambda *a: None, None, context)
+    return review.review_repetitions(
+        data, "original.wav", setup.config, lambda *a: None, None, setup.context
+    )
 
 
-def test_same_language_loop_recovers_with_two_different_windows_and_preserves_context(monkeypatch, setup):
-    calls = []
-
-    def decode(*args):
-        calls.append((args[1], args[2]))
-        return repaired()
-
-    monkeypatch.setattr(fc, "_decode", decode)
-    before = original()
-    result = run(original(), setup)
-    assert len(calls) == 2 and calls[0] != calls[1]
-    assert fc._words(result) == fc._words(repaired())
-    assert not result.coverage_issues
-    assert result.segments[0].__dict__ == before.segments[0].__dict__
-    assert result.segments[-1].__dict__ == before.segments[-1].__dict__
-    assert setup[2][0]["status"] == "recovered"
-    assert setup[2][0]["gap"]["reason"] == "suspected_repetition"
+@pytest.mark.parametrize("phrase", ["Are we recording now?", "Keep this rolling", "the"])
+def test_repetition_split_across_word_cues_is_reviewed_without_a_blacklist(phrase):
+    data = loop(phrase)
+    suspects = review.candidates(data)
+    assert len(suspects) == 1
+    assert suspects[0].repeats == 20
+    assert suspects[0].first == 1
+    assert suspects[0].stop == len(data.segments) - 1
 
 
-@pytest.mark.parametrize("failure", ["disagreement", "repeat", "weak_alignment", "missing_anchors", "silence", "no_silero", "lost_reply"])
-def test_unsafe_repetition_repair_keeps_every_original_word(monkeypatch, setup, failure):
-    from subforge.core.asr import silero_vad
+@pytest.mark.parametrize("repeats", [1, 2, 3])
+def test_ordinary_emphasis_does_not_trigger_redecoding(repeats, setup):
+    data = loop(repeats=repeats)
+    before = state(data.segments)
+    assert state(run(data, setup).segments) == before
+    assert not setup.windows
 
-    calls = []
-    data = original()
-    if failure == "lost_reply":
-        # A genuine short response shares the same suspect subtitle region.
-        data.segments[20].text = "네 어"
-    if failure == "silence":
-        monkeypatch.setattr(silero_vad, "run_vad_inference", lambda *a, **k: [])
-    if failure == "no_silero":
-        monkeypatch.setattr(silero_vad, "is_available", lambda: False)
 
-    def decode(*args):
-        calls.append(1)
-        candidate = original() if failure == "repeat" else repaired()
-        if failure == "disagreement" and len(calls) == 2:
-            candidate.segments[22].text = "달라졌어요"
-        if failure == "weak_alignment":
-            candidate.segments[22].words[0].alignment_score = 0.2
-        if failure == "missing_anchors":
-            candidate.segments = [s for s in candidate.segments if 10000 <= s.start_time < 16000]
-        return candidate
+def test_phrase_repeated_at_distant_times_is_not_a_loop(setup):
+    data = loop()
+    for i, s in enumerate(data.segments[1:-1]):
+        s.start_time += i // 4 * 20000
+        s.end_time += i // 4 * 20000
+    assert not review.candidates(data)
 
-    monkeypatch.setattr(fc, "_decode", decode)
-    before = fc._words(data)
+
+def test_rejected_loop_is_removed_only_after_two_original_context_decodes(setup):
+    data = loop()
+    edges = state([data.segments[i] for i in [0, -1]])
     result = run(data, setup)
-    assert fc._words(result) == before
-    assert result.coverage_issues[0]["reason"] == "suspected_repetition"
-    assert len(calls) <= 2
-
-
-def test_windows_without_ten_can_use_silero_plus_separate_alignment(monkeypatch, setup):
-    from subforge.core.asr import ten_vad
-
-    monkeypatch.setattr(ten_vad, "is_available", lambda: False)
-    monkeypatch.setattr(ten_vad, "run_vad_inference", lambda *a, **k: pytest.fail("TEN unavailable"))
-    monkeypatch.setattr(fc, "_decode", lambda *a: repaired())
-    result = run(original(), setup)
-    assert fc._words(result) == fc._words(repaired())
+    assert state(result.segments) == edges
+    assert len(set(setup.windows)) == 2
     assert not result.coverage_issues
-    assert setup[2][0]["repetition_evidence"]["vad_backends"] == ["silero"]
+    assert setup.records[0]["status"] == "repaired"
+    assert result.confirmed_non_speech_ranges
 
 
-def test_shortening_filler_only_is_not_a_valid_replacement(setup):
-    context = setup[0]
-    with pytest.raises(ValueError, match="substantial"):
-        rr.validate_repetition_replacement(
-            words([("어" * 20, 1000, 5000)]).segments,
-            words([("어", 1000, 1100), ("아", 1500, 1600), ("음", 1800, 1900)]).segments,
-            rr.RepetitionRange(1, 5), context,
-        )
+def test_small_alignment_jitter_does_not_change_audio_contexts(setup):
+    first = loop()
+    for segment in first.segments[1:-1]:
+        segment.start_time += 20
+        segment.end_time += 20
+    run(first, setup)
+    initial = list(setup.windows)
+    setup.windows.clear()
+    # Compare two alignments away from the second boundary, not two documents
+    # whose windows legitimately round to different seconds.
+    shifted = loop()
+    for segment in shifted.segments[1:-1]:
+        segment.start_time += 40
+        segment.end_time += 40
+    run(shifted, setup)
+    assert initial == setup.windows
 
 
-@pytest.mark.parametrize("expression", ["아니", "네", "응", "안", "못"])
-def test_repeated_negation_or_confirmation_cannot_disappear_from_recovery(setup, expression):
-    with pytest.raises(ValueError, match="repeated expression"):
-        rr.validate_repetition_replacement(
-            words([(f"{expression} " * 12, 10000, 15900)]).segments,
-            [s for s in repaired().segments if 10000 <= s.start_time < 16000],
-            rr.RepetitionRange(10, 15.9), setup[0],
-        )
+def test_real_short_voice_is_recovered_without_rewriting_neighbors(monkeypatch, setup):
+    data = loop()
+    before, after = state([data.segments[0], data.segments[-1]])
+    voiced = {"strict": [(13120, 13248)], "independent": [(13120, 13312)]}
+    monkeypatch.setattr(review, "_speech_ranges", lambda *a: voiced)
+    replies = [words([("Oh", 12560, 12900), ("yeah.", 12900, 13200)]),
+               words([("Oh", 12560, 12920), ("yeah.", 12920, 13200)])]
+    monkeypatch.setattr(review, "_decode", lambda *a: replies.pop(0))
+    result = run(data, setup)
+    assert [s.text for s in result.segments] == ["Second.", "Oh", "yeah.", "Well."]
+    assert state([result.segments[0], result.segments[-1]]) == [before, after]
+    assert not any(r["start"] <= 13.2 <= r["end"] for r in result.confirmed_non_speech_ranges)
+    assert not result.coverage_issues
 
 
-@pytest.mark.parametrize("false_support", ["inside_word", "neighboring_reply"])
-def test_semantic_reply_requires_a_whole_word_within_disputed_audio(setup, false_support):
-    source = words([("네 " * 12, 10000, 15900)]).segments
-    replacement = [s for s in repaired().segments if 10000 <= s.start_time < 16000]
-    if false_support == "inside_word":
-        replacement[0].text = "동네에서"
+def test_genuine_repeated_speech_is_preserved_when_decodes_and_acoustics_agree(monkeypatch, setup):
+    data = loop()
+    middle = data.segments[1:-1]
+    speech = [(s.start_time, s.end_time) for s in middle]
+    monkeypatch.setattr(review, "_speech_ranges", lambda *a: {"strict": speech, "independent": speech})
+    monkeypatch.setattr(review, "_decode", lambda *a: ASRData(copy.deepcopy(middle)))
+    before = state(data.segments)
+    result = run(data, setup)
+    assert state(result.segments) == before
+    assert not result.coverage_issues
+    assert setup.records[0]["status"] == "confirmed_speech"
+
+
+@pytest.mark.parametrize("failure", ["speech", "disagreement", "unsupported", "boundary"])
+def test_uncertain_repair_keeps_document_and_flags_blocking_review(monkeypatch, setup, failure):
+    data = loop()
+    before = state(data.segments)
+    if failure == "speech":
+        monkeypatch.setattr(review, "_speech_ranges", lambda *a: {"strict": [(15000, 16000)], "independent": []})
     else:
-        prefix = words([("네", 8000, 8200), ("오늘", 8500, 8900)]).segments
-        source = prefix + source
-        replacement = copy.deepcopy(prefix) + replacement
-    with pytest.raises(ValueError, match="repeated expression"):
-        rr.validate_repetition_replacement(
-            source, replacement, rr.RepetitionRange(10, 15.9), setup[0],
-        )
-
-
-def test_real_speech_gap_keeps_budget_priority_over_earlier_repetition(monkeypatch, setup):
-    from subforge.core.asr.whisperx_asr import _SpeechBackedGap
-
-    gap = _SpeechBackedGap(20, 23, 2.5, 0.83, True)
-    monkeypatch.setattr(fc, "_audit", lambda *args: [gap])
-    monkeypatch.setattr(fc, "MAX_WINDOWS", 1)
-    calls = []
-
-    def decode(_context, left, right, *args):
-        calls.append((left, right))
-        raise ValueError("Evidence unavailable in this test")
-
-    monkeypatch.setattr(fc, "_decode", decode)
-    data = words([("어 " * 20, 2000, 4000), ("마지막", 30000, 30500)])
-    run(data, setup)
-    assert calls == [(10000, 33000)]
-    assert setup[2][0]["gap"]["start"] == 20
-    assert setup[2][1]["gap"]["reason"] == "suspected_repetition"
-    assert setup[2][1]["status"] == "budget_exhausted"
-
-
-def test_loop_budget_is_shared_with_existing_speech_recovery(monkeypatch, setup):
-    monkeypatch.setattr(fc, "MAX_DECODE_SECONDS", 1)
-    monkeypatch.setattr(fc, "_decode", lambda *a: pytest.fail("budget ignored"))
-    before = fc._words(original())
-    result = run(original(), setup)
-    assert fc._words(result) == before
+        replies = [words([("Oh", 14000, 14300)]), words([("yeah", 14000, 14300)])]
+        if failure == "unsupported":
+            replies = [words([("Oh", 14000, 14300)]) for _ in range(2)]
+        if failure == "boundary":
+            replies = [words([("Oh", 9900, 10100)]) for _ in range(2)]
+        monkeypatch.setattr(review, "_decode", lambda *a: replies.pop(0))
+    result = run(data, setup)
+    assert state(result.segments) == before
     assert result.coverage_issues[0]["reason"] == "suspected_repetition"
-    assert setup[2][0]["status"] == "budget_exhausted"
+    assert not result.confirmed_non_speech_ranges
 
 
-def test_loop_cancellation_is_not_swallowed(monkeypatch, setup):
-    event = threading.Event()
-    setup[1].cancel_event = event
+@pytest.mark.parametrize("budget", ["MAX_REVIEWS", "MAX_DECODE_SECONDS", "MAX_LOOP_MS"])
+def test_budget_exhaustion_retains_and_flags_suspect_loop(monkeypatch, setup, budget):
+    monkeypatch.setattr(review, budget, 0)
+    result = run(loop(), setup)
+    assert len(result.segments) == 82
+    assert result.coverage_issues
+    assert not setup.windows
 
-    def decode(*args):
-        event.set()
-        raise RuntimeError("stopped")
 
-    monkeypatch.setattr(fc, "_decode", decode)
+def test_review_always_uses_original_signal_even_when_timing_used_enhanced(monkeypatch, setup):
+    setup.context.audio_path = "enhanced.wav"
+    from subforge.core.asr import audio_analysis
+
+    def original(path):
+        assert path == "original.wav"
+        setup.context.audio_path = path
+        return setup.context
+
+    monkeypatch.setattr(audio_analysis, "AudioAnalysisContext", original)
+    assert len(run(loop(), setup).segments) == 2
+
+
+def test_unavailable_detector_does_not_silently_accept_or_delete_loop(monkeypatch, setup):
+    def unavailable(*a):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(review, "_speech_ranges", unavailable)
+    result = run(loop(), setup)
+    assert len(result.segments) == 82
+    assert result.coverage_issues
+    assert not setup.windows
+
+
+def test_cancellation_during_decode_propagates_without_mutation(monkeypatch, setup):
+    data = loop()
+    before = state(data.segments)
+    setup.config.cancel_event = threading.Event()
+
+    def cancel(*a):
+        setup.config.cancel_event.set()
+        raise RuntimeError("interrupted")
+
+    monkeypatch.setattr(review, "_decode", cancel)
     with pytest.raises(RuntimeError, match="cancelled"):
-        run(original(), setup)
+        run(data, setup)
+    assert state(data.segments) == before
 
 
-def test_sentence_timestamps_flag_instead_of_inventing_word_alignment(monkeypatch, setup):
-    data = ASRData([ASRDataSeg("어" * 20, 1000, 6000, timestamp_granularity="sentence")])
-    monkeypatch.setattr(fc, "_decode", lambda *a: pytest.fail("sentence decode"))
-    assert run(data, setup).coverage_issues[0]["reason"] == "suspected_repetition"
-
-
-def test_repetition_message_describes_audio_review():
+def test_repetition_failure_message_identifies_problem_and_time_range():
     from subforge.core.asr.speech_gap_repair import coverage_issue_message
 
-    assert "Subtitle audio evidence" in coverage_issue_message([
-        {"start": 1, "end": 5, "reason": "suspected_repetition"}
-    ])
+    message = coverage_issue_message([{"start": 575.97, "end": 605.14, "reason": "suspected_repetition"}])
+    assert "Repeated subtitles" in message
+    assert "00:09:35.970" in message
+
+
+def test_recorded_roush_loop_preserves_real_reply_and_splice_edges(monkeypatch, setup):
+    fixture = json.loads((Path(__file__).parents[1] / "fixtures/asr/roush_repetition.json").read_text())
+    data = words(fixture["words"])
+    setup.context.samples = lambda: range(630 * 16000)
+    monkeypatch.setattr(review, "_speech_ranges", lambda *a: fixture["speech"])
+    decodes = [words(items) for items in fixture["original_decodes"]]
+    monkeypatch.setattr(review, "_decode", lambda *a: decodes.pop(0))
+    edges = state([data.segments[0], data.segments[-1]])
+    result = run(data, setup)
+    assert [s.text for s in result.segments] == ["second.", "Oh", "yeah.", "well"]
+    assert state([result.segments[0], result.segments[-1]]) == edges
+    assert setup.records[0]["repeats"] == 20
+    assert not result.coverage_issues
+    assert not review.candidates(result)
+    assert all(not (r["start"] < 579.2 and r["end"] > 578.56) for r in result.confirmed_non_speech_ranges)
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_local_decode_bypasses_cache_offsets_words_and_cleans_audio(tmp_path, empty):
+    from pydub import AudioSegment
+
+    context = SimpleNamespace(audio_segment=lambda: AudioSegment.silent(duration=2000, frame_rate=16000))
+    local = words([] if empty else [("real", 50, 200)])
+    exported = []
+    asr = SimpleNamespace(use_cache=True, uses_mlx=False)
+
+    def factory(path, config):
+        exported.append(Path(path))
+        assert Path(path).is_file()
+        assert len(AudioSegment.from_wav(path)) == 400
+        return asr
+
+    def run(**kwargs):
+        assert not asr.use_cache
+        return local
+
+    asr.run = run
+    result = review._decode(context, 100, 500, SimpleNamespace(cancel_event=None), factory)
+    assert not any(p.exists() for p in exported)
+    assert [(s.text, s.start_time, s.end_time) for s in result.segments] == ([] if empty else [("real", 150, 300)])
+
+
+@pytest.mark.parametrize("phrase", ["네", "응", "안", "못", "아니", "진짜 좋아요"])
+def test_generic_review_cannot_bypass_korean_semantic_evidence(phrase, setup):
+    data = loop(phrase=phrase)
+    before = state(data.segments)
+    result = run(data, setup)
+    assert state(result.segments) == before
+    assert not setup.windows
+    assert result.coverage_issues[0]["reason"] == "suspected_repetition"
+
+
+def test_final_coverage_repairs_generic_loop_without_missing_timestamp_gap(monkeypatch, setup):
+    from subforge.core.asr import final_coverage as fc
+
+    monkeypatch.setattr(fc, "_audit", lambda *a: [])
+    monkeypatch.setattr(fc, "_save_evidence", lambda *a: None)
+    data = loop()
+    edges = state([data.segments[0], data.segments[-1]])
+    result = fc.repair_final_coverage(
+        data, "original.wav", setup.config, lambda *a: None, None, setup.context,
+    )
+    assert state(result.segments) == edges
+    assert len(setup.windows) == 2
+    assert not result.coverage_issues
+
+
+def test_real_gap_has_priority_over_earlier_generic_loop(monkeypatch, setup):
+    from subforge.core.asr import final_coverage as fc
+    from subforge.core.asr.whisperx_asr import _SpeechBackedGap
+
+    setup.context.samples = lambda: np.zeros(80 * 16000, dtype=np.float32)
+    gap = _SpeechBackedGap(55, 58, 2.5, 0.83, True)
+    monkeypatch.setattr(fc, "_audit", lambda *a: [gap])
+    monkeypatch.setattr(fc, "_save_evidence", lambda *a: None)
+    monkeypatch.setattr(fc, "MAX_WINDOWS", 1)
+    gap_windows = []
+
+    def decode(_context, left, right, *a):
+        gap_windows.append((left, right))
+        raise ValueError("No safe gap evidence")
+
+    monkeypatch.setattr(fc, "_decode", decode)
+    data = loop()
+    before = state(data.segments)
+    result = fc.repair_final_coverage(
+        data, "original.wav", setup.config, lambda *a: None, None, setup.context,
+    )
+    assert gap_windows == [(45000, 68000)]
+    assert not setup.windows
+    assert state(result.segments) == before
+    assert {i["reason"] for i in result.coverage_issues} == {"final_export_gap", "suspected_repetition"}
+
+
+def test_generic_loop_uses_only_remaining_decode_seconds(monkeypatch, setup):
+    from subforge.core.asr import final_coverage as fc
+    from subforge.core.asr.whisperx_asr import _SpeechBackedGap
+
+    setup.context.samples = lambda: np.zeros(80 * 16000, dtype=np.float32)
+    monkeypatch.setattr(fc, "_audit", lambda *a: [_SpeechBackedGap(55, 58, 2.5, 0.83, True)])
+    monkeypatch.setattr(fc, "_save_evidence", lambda *a: None)
+    # Gap reserves 50 seconds; a standalone generic review costs 92 seconds.
+    # Each fits individually, but together they exceed the shared limit.
+    monkeypatch.setattr(fc, "MAX_DECODE_SECONDS", 120)
+    gap_calls = []
+
+    def decode(*a):
+        gap_calls.append(1)
+        raise ValueError("Uncertain gap")
+
+    monkeypatch.setattr(fc, "_decode", decode)
+    result = fc.repair_final_coverage(
+        loop(), "original.wav", setup.config, lambda *a: None, None, setup.context,
+    )
+    assert gap_calls == [1]
+    assert not setup.windows
+    assert any(i["reason"] == "suspected_repetition" for i in result.coverage_issues)
+
+
+def test_review_warning_cannot_hide_a_real_overlapping_coverage_gap(monkeypatch, setup):
+    from subforge.core.asr import final_coverage as fc
+    from subforge.core.asr.whisperx_asr import _SpeechBackedGap
+
+    gap = _SpeechBackedGap(15, 17, 2, 1, True)
+    monkeypatch.setattr(fc, "_audit", lambda *a: [gap])
+    monkeypatch.setattr(fc, "_save_evidence", lambda *a: None)
+    monkeypatch.setattr(fc, "MAX_WINDOWS", 0)
+    result = fc.repair_final_coverage(
+        loop(), "original.wav", setup.config, lambda *a: None, None, setup.context,
+    )
+    assert {i["reason"] for i in result.coverage_issues} == {"final_export_gap", "suspected_repetition"}
+    assert not setup.windows
